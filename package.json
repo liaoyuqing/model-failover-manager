@@ -1,0 +1,38 @@
+{
+  "name": "model-failover-manager",
+  "version": "2.4.0",
+  "description": "DSH 插件：会话模型选择弹窗 + 路由分组，模型彻底失败后自动切换到组内下一个可用模型",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liaoyuqing/model-failover-manager.git"
+  },
+  "main": "./host.v6.mjs",
+  "exports": {
+    ".": "./host.v6.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.v6.mjs",
+    "host.v5.mjs",
+    "host.v4.mjs",
+    "host.v3.mjs",
+    "host.v2.mjs",
+    "host.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

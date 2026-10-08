@@ -1,0 +1,13 @@
+# model-failover-manager bundle patch.
+#
+# `name` must resolve to this package's own name, since the Loader imports the
+# row by that specifier after `dsh plugin add` installs the package.
+#
+# Optional row config (all keys omitted here on purpose — the plugin's defaults
+# work with no configuration):
+#   dataDir: where groups/bindings/failure state is stored
+#            (default: $DSH_HOME/model-failover-manager)
+
+- insert:
+    - id: model-failover-manager
+      name: 'model-failover-manager'
