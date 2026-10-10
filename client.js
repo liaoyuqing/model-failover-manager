@@ -292,6 +292,15 @@ window.__ModuleLoader__.load({
       return group.id === 'deepseek-account' ? 'DeepSeek 账号' : (group.name || group.id)
     }
     function keyOf(provider, model) { return provider + '/' + model }
+    /**
+     * 日界线文案：Host 的 failResetHour 决定「当日失败」几点重置（北京时间）。
+     * Host 未返回该字段时（旧版）不提具体时间，只说按日重置——写死 8 点会
+     * 与实际行为不符。
+     */
+    function dayBoundaryText(status) {
+      var h = status && typeof status.failResetHour === 'number' ? status.failResetHour : null
+      return h === null ? '每天自动重置' : '每天北京时间 ' + h + ':00 自动重置'
+    }
 
     /**
      * 可选模型池：优先用完整模型目录（与内置选择器同源），
@@ -542,7 +551,7 @@ window.__ModuleLoader__.load({
       function failedTab() {
         var reasonLimit = 90
         return e('div', { style: S.pane },
-          e('div', { style: S.hint }, '当日（按北京时间）彻底失败（所有重试耗尽）的模型不会参与路由；每天北京时间零点自动重置，或点「恢复」立即重新启用。下面记录最近一次失败的原因（重启后保留，仅当日可见）。'),
+          e('div', { style: S.hint }, '当日（按北京时间）彻底失败（所有重试耗尽）的模型不会参与路由；每天 ' + dayBoundaryText(status) + ' 自动重置，或点「恢复」立即重新启用。下面记录最近一次失败的原因（重启后保留，仅当日可见）。'),
           failedList.length === 0 && e('div', { style: S.hint }, '当日暂无失败模型。'),
           failedList.length > 0 && e('button', {
             style: Object.assign({}, S.btn, { marginBottom: '8px' }),
@@ -1093,7 +1102,7 @@ window.__ModuleLoader__.load({
               e('span', { style: { flex: 1, fontSize: '12px' } }, f.provider + '/' + f.model + '（失败 ' + (f.count || 1) + ' 次）'),
               e('button', { style: S.btn, onClick: function () { apiSend(API + '/failed/reset', 'POST', { provider: f.provider, model: f.model }).then(refresh) } }, '恢复'))
           }),
-        e('div', { style: { fontSize: '11px', opacity: .5, marginTop: '16px' } }, '失败状态按天（北京时间）自动过期；会话成功完成一轮也会立即恢复对应模型。'),
+        e('div', { style: { fontSize: '11px', opacity: .5, marginTop: '16px' } }, '失败状态每天 ' + dayBoundaryText(status) + ' 自动重置（日界线可在 cordis.yml 的 failResetHour 调）；会话成功完成一轮也会立即恢复对应模型。'),
         editing && e(GroupEditor, {
           key: 'editor',
           editing: editing,

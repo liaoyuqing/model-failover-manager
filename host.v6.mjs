@@ -35,7 +35,7 @@ const API_PATH = '/api/model-failover'
 
 function failKey(provider, model) { return `${provider}/${model}` }
 /**
- * 北京时间（Asia/Shanghai，UTC+8）的日期部件。
+ * 北京时间（Asia/Shanghai，UTC+8）的日期部件；可传偏移后的时刻。
  *
  * 插件所有“当日/截止日/时段”口径统一走这里，**与宿主机器的时区、TZ、LANG
  * 环境变量无关**：以前用 `new Date().toISOString().slice(0,10)`（UTC）与
@@ -45,14 +45,14 @@ function failKey(provider, model) { return `${provider}/${model}` }
  * 用 Intl 的 formatToParts 而非 `new Date().getHours()`：显式指定 timeZone 才
  * 能保证换机器/改时区后仍是北京时间；`hourCycle:'h23'` 避免 ICU 输出 24 点。
  */
-function beijingParts() {
+function beijingParts(atMs) {
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Shanghai', hourCycle: 'h23',
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit',
   })
   const out = {}
-  for (const p of fmt.formatToParts(new Date())) {
+  for (const p of fmt.formatToParts(atMs === undefined ? new Date() : new Date(atMs))) {
     if (p.type !== 'literal' && p.type !== 'timeZoneName' && p.type !== 'dayPeriod') out[p.type] = Number(p.value)
   }
   return out
@@ -64,14 +64,53 @@ function beijingDayKey() {
 }
 /** 北京时间的当前小时 0..23 */
 function beijingHour() { return beijingParts().hour }
-/** 「当日」= 北京时间当天：失败标记、当日计数、截止日比较都用它 */
-function todayKey() { return beijingDayKey() }
+
+/**
+ * 「当日失败」的日界线小时（北京时间），默认 8 点。
+ *
+ * 为什么挪到早上 8 点而不是零点：上游额度多按 UTC+8 自然日在 00:00 结算，
+ * 深夜失败（额度耗尽、账号全受限）在零点一过就被放行，但那时用户已经睡了
+ * ——放行毫无意义，只是让模型在凌晨低谷里被反复重试。挪到 8 点后，一个使
+ * 用夜里的失败会一直挡到早上，正好交给用户醒来时决定换谁。
+ *
+ * 这不是「让惩罚时长恒定」：无论日界线在 8 点还是 0 点，失败时刻距下次重置
+ * 都从几分钟到近 24 小时不等（8 点口径下 08:01 失败挡 23.98h、次日 07:54
+ * 失败只挡 0.1h）。
+ *
+ * 改这个值只需改 cordis.yml，Loader 会带新 config 重新 apply，无需重启。
+ */
+const DEFAULT_FAIL_RESET_HOUR = 8
+
+/**
+ * 「当日」= 北京时间以 failResetHour 为日界线的日期。
+ *
+ * 实现：先减去 failResetHour 小时，再按北京时间取日期。Asia/Shanghai 无
+ * 夏令时，减固定小时数不会跨 DST 跳变，因此结果恰是「日界线平移后的日期」；
+ * 用 `Date.UTC` 拼时间戳会引入本机时区误差，故不这么做。
+ * 失败标记、当日计数、`/status` 的当日过滤都用它；截止日 `until` 仍按自然日。
+ */
+function failDayKey(failResetHour) {
+  const p = beijingParts(Date.now() - failResetHour * 3600_000)
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`
+}
 
 export function apply(ctx, config = {}) {
   const dataDir = typeof config.dataDir === 'string' && config.dataDir.trim()
     ? config.dataDir
     : join(process.env['DSH_HOME'] || join(homedir(), '.dsh'), DATA_DIR_DEFAULT)
   try { mkdirSync(dataDir, { recursive: true }) } catch {}
+
+  // 「当日失败」日界线小时（北京时间）：缺省 8 点。非法值回退默认值——
+  // 这个值只影响重置时刻，配错不该让插件起不来。
+  const failResetHourRaw = config.failResetHour
+  const failResetHour = (typeof failResetHourRaw === 'number' && Number.isInteger(failResetHourRaw) && failResetHourRaw >= 0 && failResetHourRaw <= 23)
+    ? failResetHourRaw
+    : DEFAULT_FAIL_RESET_HOUR
+  if (failResetHourRaw !== undefined && failResetHour === DEFAULT_FAIL_RESET_HOUR && failResetHourRaw !== DEFAULT_FAIL_RESET_HOUR) {
+    ctx.logger.warn(`[model-failover] config.failResetHour=${JSON.stringify(failResetHourRaw)} 非法（需 0..23 整数），回退 ${DEFAULT_FAIL_RESET_HOUR}`)
+  }
+  /** 「当日」键：以 failResetHour 为日界线、按北京时间取日期 */
+  const todayKey = () => failDayKey(failResetHour)
 
   const groupsFile = join(dataDir, 'groups.json')
   const failedFile = join(dataDir, 'failed.json')
@@ -746,6 +785,7 @@ export function apply(ctx, config = {}) {
         defaultBinding: defaultBinding ? { groupId: defaultBinding.groupId, mode: defaultBinding.groupId ? defaultBinding.mode : null } : null,
         activeModels: [...overrides.entries()].map(([sessionId, m]) => ({ sessionId, provider: m.provider, model: m.model, effort: m.effort ?? null })),
         settings,
+        failResetHour,
         failureLog: failureLog.slice(-10).reverse(),
       })
       return

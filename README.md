@@ -23,7 +23,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - **每轮重新路由**：每轮开始（`pre-step`、`step === 0`）重新计算，所以时段、截止日、失败状态随时间变化都会生效。
 - **子代理继承**：子代理沿 `session.header.parentSession` 向上继承父会话的分组与模式。
 - **默认分组**：新会话（startup/clear）自动沿用上次的选择（分组 + 模式）；`resume` / `compact` 不动，尊重旧会话既有选择。
-- **失败模型记录**：按天记录失败模型，同时保存失败原因（错误码 + 最近一次错误信息）。在弹窗的「失败模型」页签里可展开查看原因，也可逐个或一键全部恢复。失败状态按天过期；会话成功完成一轮也会立即恢复对应模型。
+- **失败模型记录**：按「使用日」记录失败模型（北京时间，日界线默认早上 8:00，见 `failResetHour`），同时保存失败原因（错误码 + 最近一次错误信息）。在弹窗的「失败模型」页签里可展开查看原因，也可逐个或一键全部恢复。到日界线自动过期；会话成功完成一轮也会立即恢复对应模型。所有时间口径固定按北京时间计算，与宿主机时区无关。
 - **交还控制权**：你手选模型、解绑分组或删除分组后，插件即不再接管该会话的模型。
 
 ## 与 Our Free Model 的配合
@@ -64,7 +64,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
    - `route`：取组内下一个可用模型；
    - `failover`：同样取组内下一个可用模型作为兜底；
    - 组内没有可用模型（都失败 / 不在时段 / 已过期）时不切换，只记录。
-5. 切换成功即让同一轮继续；失败状态在当天结束或该会话成功完成一轮后清除。
+5. 切换成功即让同一轮继续；失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
 
 ## HTTP 接口
 
@@ -72,7 +72,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置 |
+| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour` |
 | POST | `/settings` | 保存界面设置（`dialogMode`） |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
@@ -89,16 +89,19 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | `groups.json` | 路由分组（模型、优先级、时段、截止日） |
 | `session-bindings.json` | 会话 → 分组 + 模式的绑定 |
 | `default-binding.json` | 新会话沿用的默认绑定 |
-| `failed.json` | 按天的失败模型记录（含错误码与原因） |
+| `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
 | `settings.json` | 界面设置 |
 
 ## 配置
 
 `cordis.patch.yml` 中该行可选配置：
 
-| 键 | 说明 |
-| --- | --- |
-| `dataDir` | 上述数据文件的目录，默认 `$DSH_HOME/model-failover-manager` |
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `dataDir` | `$DSH_HOME/model-failover-manager` | 上述数据文件的目录 |
+| `failResetHour` | `8` | 「当日失败」的日界线小时（北京时间整点，0..23）；到点自动清除失败标记。改值后配置变化会让 Loader 重新应用，无需重启 |
+
+所有时间口径固定按**北京时间**计算，与宿主机时区、`TZ`、`LANG` 无关。路由时段（`windows` 的 `from`/`to`）的小时也按北京时间解释；截止日 `until` 按自然日比较。
 
 不配置即可正常工作。
 
@@ -116,7 +119,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ## 已知限制
 
 - 依赖 DSH 的 `slots`、`modelDirectories`、`sessions`、`remote`、`remote.session` 服务与 `agent/request-error` 事件；宿主接口变动时需同步跟进。
-- 失败状态按「天」过期，没有更细粒度的退避或熔断。
+- 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。
 
 ## English
@@ -126,9 +129,10 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector (dialog mode or a compact dropdown).
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
-- On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the day and continues the same turn on the next routable model.
+- On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model.
 - For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
+- Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`.
 
 ## License
 
