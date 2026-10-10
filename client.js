@@ -542,7 +542,7 @@ window.__ModuleLoader__.load({
       function failedTab() {
         var reasonLimit = 90
         return e('div', { style: S.pane },
-          e('div', { style: S.hint }, '当日彻底失败（所有重试耗尽）的模型不会参与路由；每日自动重置，或点「恢复」立即重新启用。下面记录最近一次失败的原因（重启后保留，仅当日可见）。'),
+          e('div', { style: S.hint }, '当日（按北京时间）彻底失败（所有重试耗尽）的模型不会参与路由；每天北京时间零点自动重置，或点「恢复」立即重新启用。下面记录最近一次失败的原因（重启后保留，仅当日可见）。'),
           failedList.length === 0 && e('div', { style: S.hint }, '当日暂无失败模型。'),
           failedList.length > 0 && e('button', {
             style: Object.assign({}, S.btn, { marginBottom: '8px' }),
@@ -1044,7 +1044,7 @@ window.__ModuleLoader__.load({
 
       return e('div', { style: S.settingsRoot },
         e('div', { style: S.settingsTitle }, '模型故障转移'),
-        e('div', { style: S.settingsSub }, '按优先级路由模型：会话绑定分组后，每次请求使用组内优先级最高（数字最小）的可用模型；模型在所有重试后彻底失败会被标记为当日失败并自动跳到下一个。会话成功跑完一轮会自动恢复该模型。'),
+        e('div', { style: S.settingsSub }, '按优先级路由模型：会话绑定分组后，每次请求使用组内优先级最高（数字最小）的可用模型；模型在所有重试后彻底失败会被标记为当日（按北京时间）失败并自动跳到下一个。会话成功跑完一轮会自动恢复该模型。'),
 
         e('div', { style: S.toggleRow },
           e('button', {
@@ -1093,7 +1093,7 @@ window.__ModuleLoader__.load({
               e('span', { style: { flex: 1, fontSize: '12px' } }, f.provider + '/' + f.model + '（失败 ' + (f.count || 1) + ' 次）'),
               e('button', { style: S.btn, onClick: function () { apiSend(API + '/failed/reset', 'POST', { provider: f.provider, model: f.model }).then(refresh) } }, '恢复'))
           }),
-        e('div', { style: { fontSize: '11px', opacity: .5, marginTop: '16px' } }, '失败状态按天自动过期；会话成功完成一轮也会立即恢复对应模型。'),
+        e('div', { style: { fontSize: '11px', opacity: .5, marginTop: '16px' } }, '失败状态按天（北京时间）自动过期；会话成功完成一轮也会立即恢复对应模型。'),
         editing && e(GroupEditor, {
           key: 'editor',
           editing: editing,

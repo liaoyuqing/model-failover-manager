@@ -34,12 +34,38 @@ const DATA_DIR_DEFAULT = 'model-failover-manager'
 const API_PATH = '/api/model-failover'
 
 function failKey(provider, model) { return `${provider}/${model}` }
-function todayKey() { return new Date().toISOString().slice(0, 10) }
-/** 本地日期的 YYYY-MM-DD：截止日比较不能用 UTC（东八区晚 8 点后 UTC 已是次日） */
-function localTodayKey() {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+/**
+ * 北京时间（Asia/Shanghai，UTC+8）的日期部件。
+ *
+ * 插件所有“当日/截止日/时段”口径统一走这里，**与宿主机器的时区、TZ、LANG
+ * 环境变量无关**：以前用 `new Date().toISOString().slice(0,10)`（UTC）与
+ * `getFullYear/getHours`（机器本地），二者在东八区晚 20:00 后会分叉——UTC 已
+ * 是次日，导致“当日失败”的模型在早上 8 点前失效、上午 8 点前失败又只活 1 小时。
+ *
+ * 用 Intl 的 formatToParts 而非 `new Date().getHours()`：显式指定 timeZone 才
+ * 能保证换机器/改时区后仍是北京时间；`hourCycle:'h23'` 避免 ICU 输出 24 点。
+ */
+function beijingParts() {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  })
+  const out = {}
+  for (const p of fmt.formatToParts(new Date())) {
+    if (p.type !== 'literal' && p.type !== 'timeZoneName' && p.type !== 'dayPeriod') out[p.type] = Number(p.value)
+  }
+  return out
 }
+/** 北京时间的 YYYY-MM-DD */
+function beijingDayKey() {
+  const p = beijingParts()
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`
+}
+/** 北京时间的当前小时 0..23 */
+function beijingHour() { return beijingParts().hour }
+/** 「当日」= 北京时间当天：失败标记、当日计数、截止日比较都用它 */
+function todayKey() { return beijingDayKey() }
 
 export function apply(ctx, config = {}) {
   const dataDir = typeof config.dataDir === 'string' && config.dataDir.trim()
@@ -203,16 +229,17 @@ export function apply(ctx, config = {}) {
    *
    * 时间窗 from/to 为 0..23 的整点、两端包含；from > to 表示跨午夜窗口
    * （如 22–6 = 22:00 到次日 6:59）；任一缺省 = 全天。
-   * 截止日 until 为 YYYY-MM-DD，本地日期超过它即失效（当天仍有效）。
+   * 截止日 until 为 YYYY-MM-DD，北京时间当天超过它即失效（当天仍有效）。
+   * from/to 的小时按**北京时间**解释。
    *
    * 只在“挑选”时过滤：正在使用的模型过窗后不主动切走，等它失败时
    * 自然会被排除出候选——避免到点就抖动换模型。
    */
   function routable(m) {
     if (isFailed(m.provider, m.model)) return false
-    if (m.until && localTodayKey() > String(m.until)) return false
+    if (m.until && beijingDayKey() > String(m.until)) return false
     if (Array.isArray(m.windows) && m.windows.length > 0) {
-      const h = new Date().getHours()
+      const h = beijingHour()
       const hit = m.windows.some(w => {
         const from = Number(w.from); const to = Number(w.to)
         if (!Number.isInteger(from) || !Number.isInteger(to)) return false
@@ -697,7 +724,7 @@ export function apply(ctx, config = {}) {
         if (from !== null && to !== null) windows = [{ from, to }]
       }
       if (windows.length > 0) entry.windows = windows.slice(0, 12)
-      // 截止日 YYYY-MM-DD：本地日期超过它即不再参与路由；空 = 不过期
+      // 截止日 YYYY-MM-DD：北京时间当天超过它即不再参与路由；空 = 不过期
       if (typeof m.until === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(m.until)) entry.until = m.until
       return entry
     }).filter(m => m.provider && m.model)
