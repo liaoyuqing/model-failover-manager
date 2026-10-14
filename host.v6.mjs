@@ -207,7 +207,7 @@ export function apply(ctx, config = {}) {
         if (!groups.some(g => g.id === b.groupId)) continue
         sessionBindings.set(id, { groupId: b.groupId, mode: b.mode === 'route' ? 'route' : 'failover' })
       }
-      if (sessionBindings.size > 0) ctx.logger.info(`[model-failover] 已从 ${sessionBindingsFile} 恢复 ${sessionBindings.size} 个会话分组绑定`)
+      if (sessionBindings.size > 0) ctx.logger.info(`[model-failover] 已从 ${bindingsFile} 恢复 ${sessionBindings.size} 个会话分组绑定`)
     }
   } catch (e) { ctx.logger.warn(`[model-failover] 读取会话分组绑定失败：${e?.message || e}`) }
 
@@ -298,6 +298,18 @@ export function apply(ctx, config = {}) {
     return null
   }
 
+  /** 组内该 provider/model 的条目此刻仍可路由时返回它，否则 null */
+  function routableInGroup(groupId, provider, model) {
+    if (!provider || !model) return null
+    const entry = groups.find(g => g.id === groupId)
+    if (!entry) return null
+    for (const m of entry.models) {
+      if (m.provider !== provider || m.model !== model) continue
+      return routable(m) ? candidateOf(m) : null
+    }
+    return null
+  }
+
   /** 组内除 exclude 外的下一个可路由模型（按优先级顺序） */
   function nextInGroup(groupId, exclude) {
     for (const m of sortedModels(groupId)) {
@@ -347,22 +359,41 @@ export function apply(ctx, config = {}) {
     } catch { return undefined }
   }
 
+  /** 子代理会话：origin === 'subagent'（fork 出来的会话也带 parentSession，但不是这个 origin） */
+  function isSubagentSession(session) {
+    return session?.header?.origin === 'subagent'
+  }
+
   /**
-   * 会话的有效绑定：先看自己，再沿 parentSession 向上找。
-   * 子代理（session.header.origin === 'subagent'，带 parentSession）因此继承
-   * 父会话的分组与模式；链上取不到绑定就返回 undefined。
+   * 会话的有效绑定：普通会话只看自己；子代理沿 parentSession 继承父会话的。
+   *
+   * 子代理**忽略自己那条绑定**。它多半是历史 bug 写上去的：宿主给子代理派发的
+   * agent/created 来源同样是 'startup'，旧版 applyDefaultBinding 因此给每个子
+   * 代理都写了一条「默认分组」，把整条继承链挡在深度 0——子代理一律跑默认组，
+   * 永远到不了父会话。
+   *
+   * 向上查找按 id 查绑定表，不要求父会话此刻还活着：子代理的父会话结束后，绑定
+   * 表里那条记录仍是权威值；顺着 live session 一层层走反而会中途断掉。
+   *
+   * 只在子代理上向上走。fork 出来的分支会话也带 parentSession，但那是用户主动
+   * 开的新对话，仍按普通会话处理（有自己绑定用自己，没有就是没有）。
    */
   function effectiveBinding(session) {
-    let cur = session
-    const seen = new Set()
-    for (let depth = 0; depth < 16 && cur; depth++) {
-      const id = String(cur.id)
-      if (seen.has(id)) break
-      seen.add(id)
+    const id = String(session.id)
+    if (!isSubagentSession(session)) {
       const own = sessionBindings.get(id)
-      if (own) return { binding: own, viaSessionId: id, inherited: id !== String(session.id) }
-      const parentId = cur.header?.parentSession
-      if (parentId === undefined) return undefined
+      return own ? { binding: own, viaSessionId: id, inherited: false } : undefined
+    }
+    let cur = session
+    const seen = new Set([id])
+    for (let depth = 0; depth < 16; depth++) {
+      const parentId = cur?.header?.parentSession
+      if (parentId === undefined) break
+      const pid = String(parentId)
+      if (seen.has(pid)) break
+      seen.add(pid)
+      const parentBinding = sessionBindings.get(pid)
+      if (parentBinding) return { binding: parentBinding, viaSessionId: pid, inherited: true }
       cur = sessionOf(parentId)
     }
     return undefined
@@ -373,8 +404,14 @@ export function apply(ctx, config = {}) {
    *
    * 只在这两种来源上生效：resume（重开旧会话）与 compact 保持原样——
    * 它们代表「回到既有会话」，不该被默认值改写用户以前的选择。
+   *
+   * 子代理必须排除：宿主给子代理派发的 agent/created 来源同样是 'startup'
+   * （packages/core/agent-loop/src/index.ts 的 createAgent 硬编码），若不排除，
+   * 每个子代理都会被写上一条「默认分组」绑定，既挡住它继承父会话的分组，
+   * 又把它钉死在默认组里第一个可路由的模型上。
    */
   async function applyDefaultBinding(session, source) {
+    if (isSubagentSession(session)) return
     if (!defaultBinding || !defaultBinding.groupId) return
     if (source !== 'startup' && source !== 'clear') return
     const id = String(session.id)
@@ -391,8 +428,13 @@ export function apply(ctx, config = {}) {
    * 让绑定为 route 的会话立即被本插件接管。
    * 重启后 overrides 是空的，靠这条在会话创建时补上接管，
    * 免得用户重启后要等到下一次请求才看到分组生效。
+   *
+   * 子代理不接管：它的模型选项由宿主在创建时从父会话的 requestHeader 继承而来
+   * （packages/subagent/subagent/src/child-agent.ts 的 resolveChildAgentOptions），
+   * 这里再挑一次会把它从父会话当前实际生效的模型上拽走。
    */
   async function adoptRoute(session) {
+    if (isSubagentSession(session)) return
     const own = sessionBindings.get(String(session.id))
     if (!own || own.mode !== 'route') return
     if (overrides.has(String(session.id))) return
@@ -456,7 +498,13 @@ export function apply(ctx, config = {}) {
     if (!overrides.has(id)) return decision // 未接管（用户手选过）就不插手
     const group = groups.find(g => g.id === binding.binding.groupId && g.enabled)
     if (!group) return decision
-    const pick = firstAvailableInGroup(group.id)
+    // 子代理沿用它继承下来的模型（agent.options 就是父会话当前生效的路由），
+    // 与 agent/request 里的同一套判据；否则它会被拽回组内优先级第一的模型，
+    // 跟父会话当前实际用的那个脱节。
+    const kept = isSubagentSession(agent.session)
+      ? routableInGroup(group.id, agent.options?.provider, agent.options?.model)
+      : null
+    const pick = kept ?? firstAvailableInGroup(group.id)
     if (!pick) return decision
     const cur = overrides.get(id)
     if (cur && cur.provider === pick.provider && cur.model === pick.model
@@ -482,11 +530,18 @@ export function apply(ctx, config = {}) {
     if (!override) {
       const inherited = effectiveBinding(agent.session)
       if (inherited && inherited.binding.mode === 'route') {
-        const pick = firstAvailableInGroup(inherited.binding.groupId)
+        // 子代理先用宿主继承下来的那个模型（= 父会话此刻实际生效的模型）。
+        // 它多半正是父会话分组内的某个条目；只有它不再可路由（失败、过时段、
+        // 过截止日）时，才按组内优先级另挑一个——这样父会话切到组内第 3 个时，
+        // 子代理不会又被打回第 1 个。
+        const kept = isSubagentSession(agent.session)
+          ? routableInGroup(inherited.binding.groupId, proposed.provider, proposed.model)
+          : null
+        const pick = kept ?? firstAvailableInGroup(inherited.binding.groupId)
         if (pick) {
           override = pick
           overrides.set(id, pick)
-          ctx.logger.info(`[model-failover] 子代理 ${id} 继承分组 ${inherited.binding.groupId}（来自 ${inherited.viaSessionId}）→ ${pick.provider}/${pick.model}`)
+          ctx.logger.info(`[model-failover] 子代理 ${id} 继承分组 ${inherited.binding.groupId}（来自 ${inherited.viaSessionId}）→ ${pick.provider}/${pick.model}${kept ? '（沿用父会话当前模型）' : ''}`)
         }
       }
     }
@@ -494,12 +549,14 @@ export function apply(ctx, config = {}) {
     if (!override) return proposed
     if (override.provider === proposed.provider && override.model === proposed.model
       && (override.effort ?? undefined) === (proposed.reasoningEffort ?? undefined)) return proposed
-    return {
-      ...proposed,
-      provider: override.provider,
-      model: override.model,
-      ...(override.effort ? { reasoningEffort: override.effort } : { reasoningEffort: undefined }),
-    }
+    const applied = { ...proposed, provider: override.provider, model: override.model }
+    // 思考强度只在覆盖条目明确声明时设置；否则必须**删除**该键——绝不能铺
+    // `reasoningEffort: undefined`（session 的 JSON 守卫会拒收整个 request/header，
+    // 本轮直接报 error），也不能保留 seed 里上一个模型残留的 effort（新模型可能
+    // 不支持，prepareCall 会抛 UNSUPPORTED_REASONING_EFFORT）。
+    if (override.effort) applied.reasoningEffort = override.effort
+    else delete applied.reasoningEffort
+    return applied
   })
 
   /* ============ 用户手动选择模型 → 交还控制权，避免覆盖用户意图 ============ */
