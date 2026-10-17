@@ -848,6 +848,30 @@ export function apply(ctx, config = {}) {
       return
     }
 
+    if (path === `${API_PATH}/debug/sessions` && req.method === 'GET') {
+      const agentsService = ctx.get('agents')
+      const live = agentsService?.list?.() ?? []
+      sendJson(res, 200, {
+        liveAgents: live.map(a => ({
+          id: String(a.id),
+          origin: a.session?.header?.origin ?? null,
+          parentSession: a.session?.header?.parentSession ? String(a.session.header.parentSession) : null,
+          provider: a.options?.provider ?? null,
+          model: a.options?.model ?? null,
+          override: overrides.has(String(a.id)) ? overrides.get(String(a.id)) : null,
+          ownBinding: sessionBindings.get(String(a.id)) ?? null,
+          effectiveBinding: (() => {
+            const eff = effectiveBinding(a.session)
+            return eff ? { groupId: eff.binding.groupId, mode: eff.binding.mode, viaSessionId: eff.viaSessionId, inherited: eff.inherited } : null
+          })(),
+          headerKeys: Object.keys(a.session?.header ?? {}),
+        })),
+        bindingsCount: sessionBindings.size,
+        overridesCount: overrides.size,
+      })
+      return
+    }
+
     if (path === `${API_PATH}/settings` && req.method === 'POST') {
       try {
         const body = JSON.parse((await readBody(req)) || '{}')
