@@ -123,7 +123,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v6.mjs` | 历史版本，仅作回溯保留；运行时只加载 `host.v7.mjs` |
+| `host.mjs`、`host.v2.mjs` … `host.v6.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v7.mjs` |
 
 ## 已知限制
 

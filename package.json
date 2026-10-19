@@ -19,12 +19,6 @@
   },
   "files": [
     "host.v7.mjs",
-    "host.v6.mjs",
-    "host.v5.mjs",
-    "host.v4.mjs",
-    "host.v3.mjs",
-    "host.v2.mjs",
-    "host.mjs",
     "client.js",
     "cordis.patch.yml",
     "locale/en.json",
