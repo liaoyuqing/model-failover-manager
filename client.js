@@ -22,7 +22,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v4'
+    var VERSION = 'v5'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -288,6 +288,9 @@ window.__ModuleLoader__.load({
         body: JSON.stringify(body || {}),
       }).then(function (r) { return r.json() })
     }
+    function apiGet(path) {
+      return fetch(path, { credentials: 'same-origin' }).then(function (r) { return r.json() })
+    }
     function providerName(group) {
       return group.id === 'deepseek-account' ? 'DeepSeek 账号' : (group.name || group.id)
     }
@@ -328,6 +331,8 @@ window.__ModuleLoader__.load({
       var openFailPair = React.useState({}); var openFailures = openFailPair[0]; var setOpenFailures = openFailPair[1]
       var addPair = React.useState(null); var addMenu = addPair[0]; var setAddMenu = addPair[1]
       var catPair = React.useState(catalogCache); var catalog = catPair[0]; var setCatalog = catPair[1]
+      // 子代理会话：有效分组与当前模型由 Host 算出（继承父会话），本地拿不到
+      var infoPair = React.useState(null); var subInfo = infoPair[0]; var setSubInfo = infoPair[1]
 
       React.useEffect(function () {
         function sync() { setSnap(props.store.getSnapshot()) }
@@ -345,7 +350,21 @@ window.__ModuleLoader__.load({
         loadCatalog().then(function (c) { if (c) setCatalog(c) })
       }, [open, tab])
 
-      if (!props.available || !snap) return null
+      // 子代理会话的有效分组/当前模型由 Host 解析（继承父会话），这里按需取回
+      React.useEffect(function () {
+        if (!props.subagent) { setSubInfo(null); return }
+        apiGet(API + '/session-info?sessionId=' + encodeURIComponent(props.sessionId))
+          .then(function (d) { if (d && d.ok) setSubInfo(d) })
+          .catch(function () { })
+      }, [props.sessionId, props.subagent, status, open])
+
+      if (!props.available) return null
+      // 内置模型目录对有归属的子代理会话不给快照；子代理位改用 Host 的
+      // /session-info + status 渲染，这里给一个空壳顶住后续对 snap 的读取。
+      if (!snap) {
+        if (!props.subagent) return null
+        snap = { groups: [], current: null, status: 'ready' }
+      }
 
       var groups = (snap.groups || []).slice().sort(function (a, b) {
         var rank = function (g) { return g.id === 'deepseek-account' ? 0 : g.id === 'deepseek-official' ? 1 : 2 }
@@ -353,6 +372,22 @@ window.__ModuleLoader__.load({
       })
       var dialogMode = !!(status && status.settings && status.settings.dialogMode)
       var current = snap.current
+      var binding = null
+      var bindingMode = 'route'
+      if (props.subagent) {
+        // 子代理：分组继承自父会话，当前模型看 Host 的覆盖值；
+        // 覆盖还没建立时回落到会话自身的 provider/model 选项。
+        if (subInfo) {
+          var effB = subInfo.effectiveBinding
+          if (effB) { binding = effB.groupId; bindingMode = effB.mode || 'route' }
+          var ownSel = subInfo.override || subInfo.agentModel
+          if (ownSel && ownSel.provider && ownSel.model) current = { provider: ownSel.provider, model: ownSel.model }
+        }
+      } else if (status && status.sessionGroups) {
+        for (var i = 0; i < status.sessionGroups.length; i++) {
+          if (String(status.sessionGroups[i].sessionId) === String(props.sessionId)) { binding = status.sessionGroups[i].groupId; bindingMode = status.sessionGroups[i].mode || 'route'; break }
+        }
+      }
       var currentKey = current ? keyOf(current.provider, current.model) : null
       var currentGroup = current ? groups.find(function (g) { return g.id === current.provider }) : undefined
       var currentModel = currentGroup ? currentGroup.models.find(function (m) { return m.id === current.model }) : undefined
@@ -360,30 +395,32 @@ window.__ModuleLoader__.load({
       var failedMap = {}
       var failedList = (status && status.failed) || []
       failedList.forEach(function (f) { failedMap[keyOf(f.provider, f.model)] = true })
-
-      var binding = null
-      var bindingMode = 'route'
-      if (status && status.sessionGroups) {
-        for (var i = 0; i < status.sessionGroups.length; i++) {
-          if (String(status.sessionGroups[i].sessionId) === String(props.sessionId)) { binding = status.sessionGroups[i].groupId; bindingMode = status.sessionGroups[i].mode || 'route'; break }
-        }
-      }
       var routeGroups = (status && status.groups) || []
       var boundGroup = binding ? routeGroups.find(function (g) { return g.id === binding }) : undefined
       // 默认分组：新会话自动沿用；null = 用户从未选过（不给新会话硬塞分组）
       var defaultBinding = (status && status.defaultBinding) || null
-      var isDefault = !!(binding && defaultBinding && defaultBinding.groupId === binding
+      var isDefault = !props.subagent && !!(binding && defaultBinding && defaultBinding.groupId === binding
         && (defaultBinding.mode || 'route') === bindingMode)
+
+      /** 子代理重新取一次 Host 解析结果（继承分组 + 当前覆盖模型） */
+      function refreshInfo() {
+        if (!props.subagent) return
+        apiGet(API + '/session-info?sessionId=' + encodeURIComponent(props.sessionId))
+          .then(function (d) { if (d && d.ok) setSubInfo(d) })
+          .catch(function () { })
+      }
 
       function choose(providerId, modelId, reasoningEffort) {
         var selection = { provider: providerId, model: modelId }
         if (reasoningEffort !== undefined) selection.reasoningEffort = reasoningEffort
-        Promise.resolve(props.select(selection))
+        Promise.resolve(props.select(selection)).then(refreshInfo, refreshInfo)
         setOpen(false)
       }
       function bindGroup(groupId, mode) {
         var body = { sessionId: props.sessionId, groupId: groupId }
         if (groupId) body.mode = mode || 'route'
+        // 子代理的绑定只作用于它自己，不参与「新会话默认分组」
+        if (props.subagent) body.asDefault = false
         apiSend(API + '/session-group', 'POST', body)
           .then(function (r) {
             // route 模式绑定后 Host 已把会话切到组内模型；同步 UI 选择
@@ -394,6 +431,7 @@ window.__ModuleLoader__.load({
             return loadStatus()
           })
           .then(function (d) { if (d) setStatus(d) })
+          .then(refreshInfo)
       }
       /** 把一个模型快捷加入分组（已存在则忽略） */
       function addToGroup(groupId, providerId, modelId) {
@@ -608,6 +646,10 @@ window.__ModuleLoader__.load({
                   g.name + '（' + (g.models || []).length + ' 个模型' + (g.enabled ? '' : '，已停用') + '）')
               })
             )),
+          props.subagent && e('span', {
+            style: S.badge,
+            title: '子代理会话默认继承父会话的路由分组；在这里单独选择只影响本子代理',
+          }, '继承'),
           binding && e('select', {
             style: Object.assign({}, S.select, { flex: '0 0 auto', maxWidth: '168px' }),
             title: '绑定模式',
@@ -617,7 +659,7 @@ window.__ModuleLoader__.load({
             return e('option', { key: m.id, value: m.id, title: m.tip }, m.name)
           })),
           boundGroup && e('span', { style: S.badge }, bindingMode === 'failover' ? '兜底中' : '路由中'),
-          binding && e('button', {
+          binding && !props.subagent && e('button', {
             style: Object.assign({}, S.btn, {
               padding: '1px 7px', fontSize: '11px', flex: '0 0 auto',
               ...(isDefault ? { borderColor: 'var(--dsw-alias-state-business-primary)', color: 'var(--dsw-alias-state-business-primary)' } : {}),
@@ -1135,13 +1177,28 @@ window.__ModuleLoader__.load({
             priority: -1,
             inject: function (sessionId) {
               var directory = ctx.modelDirectories.directoryFor(sessionId)
-              var available = ctx.sessions.subagentAddress(sessionId) === undefined
+              // 子代理会话也支持选模型：宿主的 sessionController.selectModel 对
+              // origin === 'subagent' 的会话一律硬拒绝（session/agent-busy，
+              // "owned by subagent routing"），因此这类会话改走本插件自己的
+              // /session-model —— Host 记下 overrides，由 agent/request 覆写生效。
+              var subagent = ctx.sessions.subagentAddress(sessionId) !== undefined
               return {
                 sessionId: sessionId,
-                available: available,
+                available: true,
+                subagent: subagent,
                 store: directory.store,
-                load: function () { if (available) directory.load().catch(function () { }) },
-                select: function (selection) { return available ? directory.select(selection) : Promise.resolve(undefined) },
+                load: function () {
+                  if (subagent) { loadStatus(); return }
+                  directory.load().catch(function () { })
+                },
+                select: function (selection) {
+                  if (!subagent) return directory.select(selection)
+                  var body = { sessionId: sessionId, provider: selection.provider, model: selection.model }
+                  if (selection.reasoningEffort !== undefined) body.reasoningEffort = selection.reasoningEffort
+                  return apiSend(API + '/session-model', 'POST', body).then(function () {
+                    return loadStatus().then(function () { return undefined })
+                  })
+                },
               }
             },
           }, ModelSeat)

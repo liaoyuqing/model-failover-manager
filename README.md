@@ -21,7 +21,8 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
   - `failover`：保持会话当前模型，只有它彻底失败后才兜底切到组内下一个。
 - **失败后同轮续跑**：监听 `agent/request-error`，以 prepend 注册并先 `await next()`，因此**一定是在所有重试策略都表态放弃之后**才接手（包括 `llm-error-retry` 预算耗尽后直接短路整条链的情况）。接手后标记失败、选定新模型，并让**同一轮**用新模型继续，不用你重发。
 - **每轮重新路由**：每轮开始（`pre-step`、`step === 0`）重新计算，所以时段、截止日、失败状态随时间变化都会生效。
-- **子代理继承**：子代理沿 `session.header.parentSession` 向上继承父会话的分组与模式。
+- **子代理继承**：子代理沿 `session.header.parentSession` 向上继承父会话的分组与模式；子代理优先沿用父会话当前实际在用的那个模型，只有在它不可路由（已失败/不在时段/过截止日）时才回落到组内优先级最高的可用模型。
+- **子代理可单独选模型**：子代理会话也有模型选择位，选中即只作用于该子代理；它的分组选择不参与「新会话默认分组」。
 - **默认分组**：新会话（startup/clear）自动沿用上次的选择（分组 + 模式）；`resume` / `compact` 不动，尊重旧会话既有选择。
 - **失败模型记录**：按「使用日」记录失败模型（北京时间，日界线默认早上 8:00，见 `failResetHour`），同时保存失败原因（错误码 + 最近一次错误信息）。在弹窗的「失败模型」页签里可展开查看原因，也可逐个或一键全部恢复。到日界线自动过期；会话成功完成一轮也会立即恢复对应模型。所有时间口径固定按北京时间计算，与宿主机时区无关。
 - **交还控制权**：你手选模型、解绑分组或删除分组后，插件即不再接管该会话的模型。
@@ -46,7 +47,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```yaml
 - insert:
     - id: model-failover-manager
-      name: ./plugins/model-failover-manager/host.v6.mjs
+      name: ./plugins/model-failover-manager/host.v7.mjs
 ```
 
 ### DSH 版本要求
@@ -84,6 +85,9 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
 | GET / POST | `/default-group` | 读取 / 设置新会话默认分组 |
 | POST | `/failed/reset` | 恢复一个模型的失败状态 |
+| GET | `/session-info?sessionId=` | 单个会话解析后的有效分组、是否继承、当前模型覆盖 |
+| POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
+| GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
 
 ## 数据文件
 
@@ -114,12 +118,12 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v6.mjs` | 宿主半，也是 `package.json` 的 `main` |
+| `host.v7.mjs` | 宿主半，也是 `package.json` 的 `main` |
 | `client.js` | 浏览器半（DSH dynamic client bundle） |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v5.mjs` | 历史版本，仅作回溯保留；运行时只加载 `host.v6.mjs` |
+| `host.mjs`、`host.v2.mjs` … `host.v6.mjs` | 历史版本，仅作回溯保留；运行时只加载 `host.v7.mjs` |
 
 ## 已知限制
 
