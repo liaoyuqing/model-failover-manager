@@ -286,6 +286,7 @@ export function apply(ctx, config = {}) {
    * 自然会被排除出候选——避免到点就抖动换模型。
    */
   function routable(m) {
+    if (m.disabled === true) return false
     if (isFailed(m.provider, m.model)) return false
     if (m.until && beijingDayKey() > String(m.until)) return false
     if (Array.isArray(m.windows) && m.windows.length > 0) {
@@ -879,6 +880,9 @@ export function apply(ctx, config = {}) {
       if (windows.length > 0) entry.windows = windows.slice(0, 12)
       // 截止日 YYYY-MM-DD：北京时间当天超过它即不再参与路由；空 = 不过期
       if (typeof m.until === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(m.until)) entry.until = m.until
+      // 禁用：用户显式把这个模型挡在路由之外，与「当日失败」互不覆盖——
+      // 失败是运行时结论（到点自动过期、成功一轮自动恢复），禁用是用户决定（只由用户解除）。
+      if (m.disabled === true) entry.disabled = true
       return entry
     }).filter(m => m.provider && m.model)
   }
@@ -891,7 +895,7 @@ export function apply(ctx, config = {}) {
       sendJson(res, 200, {
         groups: groups.map(g => ({
           id: g.id, name: g.name, enabled: g.enabled,
-          models: g.models.map(m => ({ provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null, windows: m.windows ?? null, from: m.from ?? null, to: m.to ?? null, until: m.until ?? null, failed: isFailed(m.provider, m.model) })),
+          models: g.models.map(m => ({ provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null, windows: m.windows ?? null, from: m.from ?? null, to: m.to ?? null, until: m.until ?? null, disabled: m.disabled === true, failed: isFailed(m.provider, m.model) })),
         })),
         failed: failedList.filter(f => f.day === todayKey()).map(f => ({ provider: f.provider, model: f.model, count: f.count, code: f.code ?? null, reason: f.reason ?? null, at: f.at ?? null })),
         allModels: getAllModels(),
@@ -1102,6 +1106,42 @@ export function apply(ctx, config = {}) {
         }
         saveDefault()
         sendJson(res, 200, { ok: true, defaultBinding })
+      } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
+      return
+    }
+
+    /* ----- 手动把某个模型标成当日失败（与自动失败同一份数据，走同一套恢复路径） ----- */
+    if (path === `${API_PATH}/failed/mark` && req.method === 'POST') {
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        if (!body.provider || !body.model) { sendJson(res, 400, { ok: false, error: 'provider / model 必填' }); return }
+        markFailed(String(body.provider), String(body.model), {
+          code: 'MANUAL',
+          message: '由用户在路由分组里手动标记为失败',
+        })
+        sendJson(res, 200, { ok: true, provider: body.provider, model: body.model })
+      } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
+      return
+    }
+
+    /* ----- 禁用/启用某个模型参与路由（写进分组条目的 disabled 字段） ----- */
+    if (path === `${API_PATH}/groups/model-disabled` && req.method === 'POST') {
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        if (!body.provider || !body.model) { sendJson(res, 400, { ok: false, error: 'provider / model 必填' }); return }
+        const want = body.disabled !== false
+        let touched = 0
+        for (const g of groups) {
+          for (const m of g.models || []) {
+            if (m.provider !== body.provider || m.model !== body.model) continue
+            if (want) m.disabled = true
+            else delete m.disabled
+            touched++
+          }
+        }
+        if (touched === 0) { sendJson(res, 404, { ok: false, error: '该模型不在任何分组里' }); return }
+        saveGroups()
+        sendJson(res, 200, { ok: true, provider: body.provider, model: body.model, disabled: want, groups: touched })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
       return
     }

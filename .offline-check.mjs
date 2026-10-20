@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from './host.v9.mjs'
+import { apply } from './host.v11.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'mfm-offline-'))
 // 与宿主同一套判据：北京时间当前小时，造一个「此刻必然不在窗内」的时段
@@ -104,6 +104,9 @@ const ctx = {
             return Promise.reject(new Error(`session "${sessionId}" is owned by subagent routing`))
           }
           agent.session.state.model = model
+          // 真实 selectForNextRequest 会 append 一条 model/selection 事件
+          agent.session.append('model/selection', { provider: 'p', model })
+          handlers.get('session/event')?.(agent.session, { type: 'model/selection', data: { provider: 'p', model } })
           return Promise.resolve()
         },
       }
@@ -138,6 +141,19 @@ function call(method, url, body) {
 const api = (method, path, body) => call(method, `/api/model-failover${path}`, body)
 const sessionInfo = async (id) => (await api('GET', `/session-info?sessionId=${id}`)).body
 const switchOf = (id) => appended.filter(a => a.id === id && a.type === 'model/selection').at(-1)?.data?.model ?? null
+
+/**
+ * 让一个会话此刻「打算用」某个模型。
+ *
+ * 真实宿主里这段状态的来源是本插件的三级解析（覆盖 → 最近一次 model/selection
+ * 事件 → Agent.options），所以这里必须同时改 session.state 与投一条
+ * model/selection 事件——只改前者的话，pre-step 仍会读到最后一次事件里的旧模型。
+ */
+function useModel(id, model) {
+  const agent = agents.find(a => a.id === id)
+  agent.session.state.model = model
+  handlers.get('session/event')?.(agent.session, { type: 'model/selection', data: { provider: 'p', model } })
+}
 
 /** 跑一次「新一轮第一步」，返回这轮结束后该会话的模型 */
 async function runPreStep(id) {
@@ -207,6 +223,39 @@ const defBefore = JSON.stringify((await api('GET', '/status')).body.defaultBindi
 await api('POST', '/session-group', { sessionId: 'sub-legacy', groupId: 'g1', mode: 'route' })
 const defAfter = JSON.stringify((await api('GET', '/status')).body.defaultBinding)
 ok('⑥ 子代理绑分组不改变「新会话默认分组」', defBefore === defAfter, `${defBefore} → ${defAfter}`)
+
+// ⑦ 手动把分组里的模型标记为失败（分组页签模型块上的「失败」按钮）
+const markAgent = makeAgent('mark-1', {}, 'm2')
+agents.push(markAgent)
+await api('POST', '/session-group', { sessionId: 'mark-1', groupId: 'g2', mode: 'route' })
+await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+useModel('mark-1', 'm2')
+ok('⑦ 前置：m2 可用时新一轮保留 m2', (await runPreStep('mark-1')) === 'm2')
+const marked = await api('POST', '/failed/mark', { provider: 'p', model: 'm2' })
+ok('⑦ 手动标记接口返回 ok', marked.body.ok === true)
+const markRow = (await api('GET', '/status')).body.failed.find(f => f.provider === 'p' && f.model === 'm2')
+ok('⑦ 复用同一份当日失败记录（code=MANUAL）',
+  !!markRow && markRow.code === 'MANUAL', markRow && `code=${markRow.code} count=${markRow.count}`)
+ok('⑦ 标记后下一轮换成组内其它可用模型', (await runPreStep('mark-1')) === 'm1')
+await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+ok('⑦ 恢复失败后：仍不可用则保持替换结果（m1）', (await runPreStep('mark-1')) === 'm1')
+useModel('mark-1', 'm2')
+ok('⑦ 换回 m2 后新一轮仍保留它（恢复生效）', (await runPreStep('mark-1')) === 'm2')
+
+// ⑧ 禁用参与路由：与失败分开的持久状态
+const dis = await api('POST', '/groups/model-disabled', { provider: 'p', model: 'm2', disabled: true })
+ok('⑧ 禁用接口成功，且覆盖所有含该模型的分组',
+  dis.body.ok === true && dis.body.disabled === true, `groups=${dis.body.groups}`)
+const m2Of = async () => (await api('GET', '/status')).body.groups.find(g => g.id === 'g2').models.find(m => m.model === 'm2')
+ok('⑧ /status 回传 disabled=true', (await m2Of()).disabled === true)
+ok('⑧ 禁用后下一轮不再选它（m2 是当前模型也会被换掉）', (await runPreStep('mark-1')) === 'm1')
+ok('⑧ 禁用不受「恢复失败」影响（不是同一条状态）',
+  (await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })).body.ok === true
+  && (await m2Of()).disabled === true)
+const en = await api('POST', '/groups/model-disabled', { provider: 'p', model: 'm2', disabled: false })
+ok('⑧ 解除禁用后字段被移除', en.body.disabled === false && !(await m2Of()).disabled)
+useModel('mark-1', 'm2')
+ok('⑧ 解除禁用后重新可被选中', (await runPreStep('mark-1')) === 'm2')
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)

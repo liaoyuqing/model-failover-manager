@@ -149,6 +149,19 @@ window.__ModuleLoader__.load({
         color: 'var(--dsw-alias-label-secondary)',
       },
       chipFailed: { opacity: .5, textDecoration: 'line-through' },
+      /** 用户显式禁用的模型块：不做删除线（那不是失败），只压暗 + 虚线边 */
+      chipDisabled: {
+        opacity: .55,
+        borderStyle: 'dashed',
+        textDecoration: 'none',
+      },
+      /** 模型块上的操作按钮（失败 / 禁用 / 恢复） */
+      chipBtn: {
+        background: 'none', border: 'none', padding: '0 2px', cursor: 'pointer',
+        fontSize: '10px', lineHeight: '14px', color: 'var(--dsw-alias-label-tertiary)',
+        borderRadius: '3px',
+      },
+      chipBtnOn: { color: 'var(--dsw-alias-state-warn-primary, var(--dsw-alias-label-primary))', fontWeight: 600 },
       modalBg: {
         position: 'fixed', inset: 0, zIndex: 1300, display: 'flex',
         alignItems: 'center', justifyContent: 'center',
@@ -568,9 +581,50 @@ window.__ModuleLoader__.load({
                     : e('button', { style: S.btnPrimary, onClick: function () { bindGroup(g.id) } }, '绑定到本会话'),
                   e('button', { style: S.btn, onClick: function () { setEditing({ action: 'edit', id: g.id, name: g.name, models: (g.models || []).slice() }) } }, '编辑'))),
               e('div', null, sorted.map(function (m) {
-                var f = failedMap[keyOf(m.provider, m.model)] === true
-                return e('span', { key: keyOf(m.provider, m.model), style: Object.assign({}, S.chip, f ? S.chipFailed : {}) },
-                  'P' + (m.priority ?? 99) + (m.effort ? ' · ' + m.effort : '') + ' ' + m.provider + '/' + m.model + (f ? ' ✕' : ''))
+                var k = keyOf(m.provider, m.model)
+                var f = failedMap[k] === true
+                var off = m.disabled === true
+                // 已失效的块整体压暗；两类原因分别标注，便于分辨
+                var chipStyle = Object.assign({}, S.chip, f ? S.chipFailed : {}, off ? S.chipDisabled : {})
+                return e('span', {
+                  key: k,
+                  style: Object.assign({}, chipStyle, { gap: '3px' }),
+                  title: [f ? '当日失败（不参与路由）' : '', off ? '已手动禁用（不参与路由）' : '']
+                    .filter(Boolean).join('；') || '点击右侧按钮可标记失败或禁用',
+                },
+                  'P' + (m.priority ?? 99) + (m.effort ? ' · ' + m.effort : '') + ' ' + m.provider + '/' + m.model,
+                  f && e('span', { style: { fontSize: '10px', opacity: .8 } }, '✕'),
+                  // 失败：已失败则提供恢复，否则提供手动标记
+                  f
+                    ? e('button', {
+                      style: S.chipBtn,
+                      title: '恢复这个模型的失败状态（立即重新参与路由）',
+                      onClick: function (ev) {
+                        ev.stopPropagation()
+                        apiSend(API + '/failed/reset', 'POST', { provider: m.provider, model: m.model }).then(refreshStatus)
+                      },
+                    }, '恢复')
+                    : e('button', {
+                      style: S.chipBtn,
+                      title: '手动标记为当日失败（与自动失败同一份记录，可随时恢复）',
+                      onClick: function (ev) {
+                        ev.stopPropagation()
+                        apiSend(API + '/failed/mark', 'POST', { provider: m.provider, model: m.model }).then(refreshStatus)
+                      },
+                    }, '失败'),
+                  // 禁用：开/关写入分组条目的 disabled 字段（持久化，不随日期过期）
+                  e('button', {
+                    style: off ? Object.assign({}, S.chipBtn, S.chipBtnOn) : S.chipBtn,
+                    title: off
+                      ? '已禁用：在所有分组里都不参与路由。点击恢复参与路由'
+                      : '禁用：在所有分组里都不再参与路由（持久，不像失败那样每天自动恢复）',
+                    onClick: function (ev) {
+                      ev.stopPropagation()
+                      apiSend(API + '/groups/model-disabled', 'POST', {
+                        provider: m.provider, model: m.model, disabled: !off,
+                      }).then(refreshStatus)
+                    },
+                  }, off ? '启用' : '禁用'))
               })))
           }))
       }
