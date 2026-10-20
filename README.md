@@ -20,7 +20,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
   - `route`：用绑定分组里的模型（会实际改变会话当前模型）。
   - `failover`：保持会话当前模型，只有它彻底失败后才兜底切到组内下一个。
 - **失败后同轮续跑**：监听 `agent/request-error`，以 prepend 注册并先 `await next()`，因此**一定是在所有重试策略都表态放弃之后**才接手（包括 `llm-error-retry` 预算耗尽后直接短路整条链的情况）。接手后标记失败、选定新模型，并让**同一轮**用新模型继续，不用你重发。
-- **每轮重新路由**：每轮开始（`pre-step`、`step === 0`）重新计算，所以时段、截止日、失败状态随时间变化都会生效。
+- **每轮健康检查**：每次发消息（一轮的第一步 `pre-step`、`step === 0`）都判定一次「这个会话此刻要用的模型现在还能不能用」——仍可用就保留（不覆盖你手选的模型），只有它此刻在分组内不可用（被标记当日失败、超出北京时间时段、过了截止日）才切到组内下一个可用模型；当前模型压根不在分组里时不插手。判据都是「此刻」的，时段与截止日随时间变化、失败标记会被重置或过期。
 - **子代理继承**：子代理沿 `session.header.parentSession` 向上继承父会话的分组与模式；子代理优先沿用父会话当前实际在用的那个模型，只有在它不可路由（已失败/不在时段/过截止日）时才回落到组内优先级最高的可用模型。
 - **子代理可单独选模型**：子代理会话也有模型选择位，选中即只作用于该子代理；它的分组选择不参与「新会话默认分组」。
 - **默认分组**：新会话（startup/clear）自动沿用上次的选择（分组 + 模式）；`resume` / `compact` 不动，尊重旧会话既有选择。
@@ -118,12 +118,12 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v7.mjs` | 宿主半，也是 `package.json` 的 `main` |
+| `host.v9.mjs` | 宿主半，也是 `package.json` 的 `main` |
 | `client.js` | 浏览器半（DSH dynamic client bundle） |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v6.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v7.mjs` |
+| `host.mjs`、`host.v2.mjs` … `host.v7.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v9.mjs` |
 
 ## 已知限制
 
