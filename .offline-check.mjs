@@ -2,19 +2,26 @@
  * 离线自检：用假的 ctx 直接跑宿主半的监听器与 HTTP 处理器，不重启宿主即可验证行为。
  * 只在临时 dataDir 里读写，不碰真实的分组/绑定文件。
  *
+ * 对齐新版宿主的契约：
+ *   · 模型切换只经 `agent.model.select()`（写 durable model/selection）；
+ *     `agent/request` 已废弃，改 provider/model 会让整轮崩掉 —— 本插件绝不注册它。
+ *   · 健康检查挂在 `agent/status` 的 running 边沿（pre-step 之前的窗口）。
+ *   · 失败切换在 `agent/request-error` 里 select + followup 排队续跑，不再返回 retry。
+ *
  * 覆盖：
  *   ① 子代理沿 parentSession 继承分组（旧 bug 写进去的无 explicit 绑定必须被忽略）
- *   ② 子代理换模型不调用 sessionController.selectModel（宿主对子代理一律拒绝）
- *   ③ 子代理彻底失败后仍返回 {kind:'retry'} 并切到组内下一个模型
- *   ④ agent/request 用覆盖值改写请求；新子代理沿用父会话当前模型
- *   ⑤ 每次发消息（step 0）的健康检查：可用即保留，失败/出窗/过期才切
+ *   ② 子代理换模型走 agent.model.select()，不经 sessionController
+ *   ③ 子代理彻底失败 → 切到组内下一个 + 排队续跑（不返回 retry）
+ *   ④ 新子代理沿用宿主继承来的模型，不被拽回组内第一名
+ *   ⑤ 每次发消息的健康检查：可用即保留，失败/出窗/过期才切
  *   ⑥ 给子代理绑分组不改变「新会话默认分组」
+ *   ⑦ 手动标记失败 / ⑧ 禁用参与路由
  */
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from './host.v11.mjs'
+import { apply } from './host.v12.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'mfm-offline-'))
 // 与宿主同一套判据：北京时间当前小时，造一个「此刻必然不在窗内」的时段
@@ -62,6 +69,7 @@ writeFileSync(join(dir, 'session-bindings.json'), JSON.stringify([
 ]))
 
 const appended = []
+const followups = []
 function makeSession(id, header, model) {
   const state = { model }
   return {
@@ -72,8 +80,36 @@ function makeSession(id, header, model) {
     requestHeader() { return { config: { provider: 'p', model: state.model } } },
   }
 }
+/**
+ * 假 Agent，按宿主新契约提供 `model.select/current` 与 `followup`。
+ *
+ * `selection` 模拟宿主的 durable model/selection 投影：select() 写它并抛一条
+ * model/selection 事件（真实宿主由 AgentModel 完成），current() 读它 ——
+ * 正是 preStep 取本步 selection 的那条路径。
+ */
 function makeAgent(id, header, model) {
-  return { id, session: makeSession(id, header, model), options: { provider: 'p', model } }
+  const session = makeSession(id, header, model)
+  let selection
+  const agent = {
+    id,
+    session,
+    options: { provider: 'p', model },
+    model: {
+      current() { return selection ?? { provider: 'p', model: session.state.model } },
+      select(next) {
+        selection = { ...next }
+        session.state.model = next.model
+        appended.push({ id, type: 'model/selection', data: { ...next } })
+        for (const fn of handlers.getAll('session/event')) fn(session, { type: 'model/selection', data: { ...next } })
+      },
+    },
+    followup(message) {
+      if (agent.status !== 'idle') throw new Error(`agent "${id}" cannot followup while ${agent.status}`)
+      followups.push({ id, message })
+    },
+    status: 'idle',
+  }
+  return agent
 }
 const agents = [
   makeAgent('parent-1', {}, 'm1'),
@@ -88,6 +124,10 @@ const agents = [
 ]
 
 const handlers = new Map()
+/** 取某事件的监听器数组（不存在时为空数组，不写入）。 */
+handlers.getAll = event => handlers.get(event) ?? []
+/** 取单监听器事件的唯一监听器；多监听器事件返回最后一个。 */
+handlers.one = event => handlers.getAll(event).at(-1)
 let routeHandler = null
 let selectModelCalls = 0
 const ctx = {
@@ -96,24 +136,28 @@ const ctx = {
     if (name === 'agents') return { list: () => agents, get: (id) => agents.find(a => a.id === id) }
     if (name === 'sessionController') {
       return {
-        // 与宿主同一条规则：子代理会话一律拒绝（session/agent-busy）
+        // 与宿主同一条规则：子代理会话一律拒绝（session/agent-busy）。
+        // 新版插件根本不该走这条路——调用次数必须保持 0。
         selectModel({ sessionId, model }) {
           selectModelCalls++
           const agent = agents.find(a => a.id === sessionId)
           if (agent?.session?.header?.origin === 'subagent') {
             return Promise.reject(new Error(`session "${sessionId}" is owned by subagent routing`))
           }
-          agent.session.state.model = model
-          // 真实 selectForNextRequest 会 append 一条 model/selection 事件
-          agent.session.append('model/selection', { provider: 'p', model })
-          handlers.get('session/event')?.(agent.session, { type: 'model/selection', data: { provider: 'p', model } })
+          agent.model.select({ provider: 'p', model })
           return Promise.resolve()
         },
       }
     }
     return undefined
   },
-  on(event, fn) { handlers.set(event, fn); return () => handlers.delete(event) },
+  /** 同一事件的多个监听器都要保留：agent/status 上可能还挂着别的观察者。 */
+  on(event, fn) {
+    const list = handlers.getAll(event)
+    list.push(fn)
+    handlers.set(event, list)
+    return () => { handlers.set(event, handlers.getAll(event).filter(f => f !== fn)) }
+  },
   inject(_names, cb) {
     cb({
       webServer: { register(spec) { routeHandler = spec.handler; return () => {} } },
@@ -145,22 +189,24 @@ const switchOf = (id) => appended.filter(a => a.id === id && a.type === 'model/s
 /**
  * 让一个会话此刻「打算用」某个模型。
  *
- * 真实宿主里这段状态的来源是本插件的三级解析（覆盖 → 最近一次 model/selection
- * 事件 → Agent.options），所以这里必须同时改 session.state 与投一条
- * model/selection 事件——只改前者的话，pre-step 仍会读到最后一次事件里的旧模型。
+ * 真实宿主里这段状态由 AgentModel 从 durable model/selection 投影读出来，
+ * 所以这里走 agent.model.select() —— 与本插件自己的切换同一条路径。
  */
 function useModel(id, model) {
-  const agent = agents.find(a => a.id === id)
-  agent.session.state.model = model
-  handlers.get('session/event')?.(agent.session, { type: 'model/selection', data: { provider: 'p', model } })
+  agents.find(a => a.id === id).model.select({ provider: 'p', model })
 }
 
-/** 跑一次「新一轮第一步」，返回这轮结束后该会话的模型 */
+/**
+ * 跑一次「新一轮开始」：先发 status running（插件的挂钩），再看这一轮
+ * pre-step 会读到哪个模型。宿主 preStep 先 emoji model.current() 取 selection，
+ * 所以两者必须分别是「切换前窗口」与「切换后生效值」。
+ */
 async function runPreStep(id) {
   const agent = agents.find(a => a.id === id)
-  const handler = handlers.get('agent/pre-step')
-  await handler({ agent, step: 0 }, () => Promise.resolve({ kind: 'enter', messages: [] }))
-  return agent.session.state.model
+  for (const fn of handlers.getAll('agent/status')) fn({ agent, status: 'running' })
+  // 插件的 reroute 是 void 的异步任务，让微任务跑完再读 selection。
+  await new Promise(resolve => setTimeout(resolve, 0))
+  return agent.model.current().model
 }
 
 const checks = []
@@ -183,29 +229,32 @@ const set = await api('POST', '/session-model', { sessionId: 'sub-legacy', provi
 ok('② 子代理设模型成功且不经 sessionController',
   set.body.ok === true && selectModelCalls === 0 && set.body.model?.model === 'm2',
   `selectModelCalls=${selectModelCalls}`)
-ok('② 子代理仍写 durable model/selection 事件', switchOf('sub-legacy') === 'm2')
+ok('② 子代理切换经 agent.model.select() 写 durable model/selection', switchOf('sub-legacy') === 'm2')
 
-// ③ agent/request 覆写 + 失败续跑
-const requestHandler = handlers.get('agent/request')
-const rewritten = await requestHandler(
-  { agent: agents.find(a => a.id === 'sub-legacy') },
-  () => Promise.resolve({ provider: 'p', model: 'm1', maxTokens: 5 }),
-)
-ok('③ agent/request 用覆盖值改写请求模型',
-  rewritten.model === 'm2' && rewritten.maxTokens === 5, `${rewritten.provider}/${rewritten.model}`)
+// ③ 失败续跑：select 新模型 + 排队续跑，不再返回 retry
+ok('③ 插件不再注册已废弃的 agent/request', !handlers.has('agent/request'))
 
-const errHandler = handlers.get('agent/request-error')
+const errHandler = handlers.one('agent/request-error')
+const failedAgent = agents.find(a => a.id === 'sub-explicit')
+// 真实时序：request-error 运行在失败步骤收尾阶段，驱动器仍在跑（status=running）。
+failedAgent.status = 'running'
 const action = await errHandler(
-  { agent: agents.find(a => a.id === 'sub-explicit'), turn: 1, provider: 'p', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 } },
+  { agent: failedAgent, turn: 1, provider: 'p', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 } },
   () => Promise.resolve(undefined),
 )
-ok('③ 子代理彻底失败后返回 retry（旧版在这里直接结束本轮）', action?.kind === 'retry', JSON.stringify(action))
+ok('③ 彻底失败不返回 retry（本步 selection 已冻结，retry 也换不了模型）', action === undefined, JSON.stringify(action))
 ok('③ 失败后切到组内下一个而不是被拽回第一个', switchOf('sub-explicit') === 'm2')
+ok('③ 失败当下不投递续跑（驱动器还在跑，排队会被搁浅）',
+  !followups.some(f => f.id === 'sub-explicit'))
+failedAgent.status = 'idle'
+for (const fn of handlers.getAll('agent/status')) fn({ agent: failedAgent, status: 'idle' })
+ok('③ 本轮收尾（idle）后才投递续跑', followups.some(f => f.id === 'sub-explicit'))
+ok('③ 续跑消息不会伪装成 user 发言',
+  followups.find(f => f.id === 'sub-explicit')?.message?.source?.kind === 'model-failover')
 
 const fresh = makeAgent('sub-fresh', { origin: 'subagent', parentSession: 'parent-1' }, 'm3')
 agents.push(fresh)
-const kept = await requestHandler({ agent: fresh }, () => Promise.resolve({ provider: 'p', model: 'm3' }))
-ok('③ 新子代理沿用父会话当前模型 m3（组内第一是 m1）', kept.model === 'm3')
+ok('③ 新子代理沿用宿主继承来的 m3（组内第一是 m1）', (await runPreStep('sub-fresh')) === 'm3')
 
 // ④ 每轮健康检查
 ok('④ 当前模型可用 → 保留，不切换', (await runPreStep('keep-1')) === 'm2')

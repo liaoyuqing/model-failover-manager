@@ -1234,7 +1234,7 @@ window.__ModuleLoader__.load({
               // 子代理会话也支持选模型：宿主的 sessionController.selectModel 对
               // origin === 'subagent' 的会话一律硬拒绝（session/agent-busy，
               // "owned by subagent routing"），因此这类会话改走本插件自己的
-              // /session-model —— Host 记下 overrides，由 agent/request 覆写生效。
+              // /session-model —— Host 调 agent.model.select() 写入本会话的模型选择。
               var subagent = ctx.sessions.subagentAddress(sessionId) !== undefined
               return {
                 sessionId: sessionId,
