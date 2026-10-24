@@ -1,6 +1,6 @@
 {
   "name": "model-failover-manager",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "description": "DSH 插件：会话模型选择弹窗 + 路由分组，模型彻底失败后自动切换到组内下一个可用模型",
   "license": "Apache-2.0",
   "type": "module",
@@ -23,7 +23,8 @@
     "cordis.patch.yml",
     "locale/en.json",
     "locale/zh.json",
-    "icon.svg"
+    "icon.svg",
+    "docs/preview-model-selection.png"
   ],
   "dsh": {
     "bundle": {
