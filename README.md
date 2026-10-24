@@ -6,6 +6,8 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ![模型选择界面：左侧供应商列表，右侧「模型 / 路由分组 / 失败模型」三个页签与路由分组选择](docs/preview-model-selection.png)
 
+![路由分组界面：已绑定「免费」分组、37 个模型按优先级排列，每个模型带失败与禁用开关](docs/preview-routing-groups.png)
+
 ---
 
 ## 它做什么
