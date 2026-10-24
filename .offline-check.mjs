@@ -21,7 +21,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from './host.v12.mjs'
+import { apply } from './host.v13.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'mfm-offline-'))
 // 与宿主同一套判据：北京时间当前小时，造一个「此刻必然不在窗内」的时段
@@ -248,7 +248,10 @@ ok('③ 失败当下不投递续跑（驱动器还在跑，排队会被搁浅）
   !followups.some(f => f.id === 'sub-explicit'))
 failedAgent.status = 'idle'
 for (const fn of handlers.getAll('agent/status')) fn({ agent: failedAgent, status: 'idle' })
-ok('③ 本轮收尾（idle）后才投递续跑', followups.some(f => f.id === 'sub-explicit'))
+ok('③ idle 边沿不同步投递（followup 会同步唤醒驱动器再发一次 running，嵌在 idle dispatch 里会让 GUI 收到倒序）',
+  !followups.some(f => f.id === 'sub-explicit'))
+await Promise.resolve()
+ok('③ 本轮收尾（idle）后一个微任务内完成投递', followups.some(f => f.id === 'sub-explicit'))
 ok('③ 续跑消息不会伪装成 user 发言',
   followups.find(f => f.id === 'sub-explicit')?.message?.source?.kind === 'model-failover')
 
@@ -305,6 +308,25 @@ const en = await api('POST', '/groups/model-disabled', { provider: 'p', model: '
 ok('⑧ 解除禁用后字段被移除', en.body.disabled === false && !(await m2Of()).disabled)
 useModel('mark-1', 'm2')
 ok('⑧ 解除禁用后重新可被选中', (await runPreStep('mark-1')) === 'm2')
+
+// ⑨ 状态序列诊断：续跑投递必须落在 idle 与下一次 running 之间
+for (const fn of handlers.getAll('agent/status')) fn({ agent: failedAgent, status: 'running' })
+const logResp = await api('GET', '/debug/status-log?sessionId=sub-explicit&limit=200')
+const entries = logResp.body.entries ?? []
+const lastSeq = (predicate) => [...entries].reverse().find(predicate)?.seq ?? -1
+const idleSeq = lastSeq(e => e.kind === 'agent/status' && e.running === false)
+const schedSeq = lastSeq(e => e.kind === 'continuation/scheduled')
+const delivSeq = lastSeq(e => e.kind === 'continuation/delivered')
+const runSeq = lastSeq(e => e.kind === 'agent/status' && e.running === true)
+ok('⑨ 诊断接口可按会话取回状态事件序列', entries.length > 0, `entries=${entries.length}`)
+ok('⑨ 顺序：idle → 排队续跑 → 投递 → running（running 不会嵌在 idle 之前）',
+  idleSeq > 0 && idleSeq < schedSeq && schedSeq <= delivSeq && delivSeq < runSeq,
+  `idle=${idleSeq} sched=${schedSeq} deliv=${delivSeq} running=${runSeq}`)
+for (const fn of handlers.getAll('api-session/status')) fn('sub-explicit', true)
+const logResp2 = await api('GET', '/debug/status-log?sessionId=sub-explicit&limit=5')
+ok('⑨ 诊断同时记录转发给 GUI 的 api-session/status',
+  (logResp2.body.entries ?? []).some(e => e.kind === 'api-session/status' && e.running === true),
+  JSON.stringify((logResp2.body.entries ?? []).at(-1)))
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
