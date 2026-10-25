@@ -353,6 +353,14 @@ ok('⑨ 诊断同时记录转发给 GUI 的 api-session/status',
   (logResp2.body.entries ?? []).some(e => e.kind === 'api-session/status' && e.running === true),
   JSON.stringify((logResp2.body.entries ?? []).at(-1)))
 
+// 离线自检不碰线上：任何 codearts 状态查询都返回空池、无签名证据。
+// ⑪ 会按用例改写这个桩。
+const realFetch = globalThis.fetch
+globalThis.fetch = async (url) => {
+  if (String(url).includes('/api/codearts/status')) return { ok: true, async json() { return { usage: { slots: [] } } } }
+  return { ok: false, async json() { return {} } }
+}
+
 // ⑩ Our Free Model 换账号的 provider 归属：名单内的 provider 不参与换号
 const caAgent = makeAgent('codearts-1', {}, 'm1')
 agents.push(caAgent)
@@ -388,9 +396,11 @@ ok('⑩ 名单外的 provider 仍先换账号重试（非限流失败也写冷�
 ok('⑩ /status 回传生效的排除名单',
   JSON.stringify((await api('GET', '/status')).body.ofmHandoffExcludeProviders) === JSON.stringify(['codearts']))
 
-// ⑪ dsh-codearts 全池被永久停用后的自救（假 429 → 重启它的 Loader 条目 → 重试）
+// ⑪ dsh-codearts：分辨「可以重建账号池」与「billion-context 拒绝转发签名请求」
 let restartCalls = 0
 let codeartsRegistered = true
+/** 假的 /api/codearts/status 应答；每个用例改写它 */
+let codeartsStatus = { usage: { slots: [] } }
 const fakeLoader = {
   *entries() {
     yield { options: { id: 'llm-codearts', name: 'dsh-codearts' }, fiber: { uid: 7, async restart() { restartCalls += 1 } } }
@@ -398,67 +408,80 @@ const fakeLoader = {
   },
 }
 const baseGet = ctx.get.bind(ctx)
+const baseFetch = globalThis.fetch   // 即 ⑩ 之前装的桩
 ctx.get = (name) => {
   if (name === 'loader') return fakeLoader
   if (name === 'llm') return { listProviders: () => codeartsRegistered ? [{ id: 'p', name: 'P' }, { id: 'codearts', name: 'CodeArts' }] : [{ id: 'p', name: 'P' }] }
   return baseGet(name)
 }
+// 插件用 fetch 读 codearts 状态接口；离线自检里换成可控应答，绝不发真实请求。
+globalThis.fetch = async (url) => {
+  if (String(url).includes('/api/codearts/status')) {
+    return { ok: true, async json() { return codeartsStatus } }
+  }
+  return { ok: false, async json() { return {} } }
+}
 
 const poolEmptyMsg = 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试'
 // ⑩ 已把 codearts 标成当日失败（那是它对真实上游错误的正确处置）；清掉再验 ⑪。
 await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
-const caPoolAgent = makeAgent('codearts-pool-1', {}, 'm1')
-agents.push(caPoolAgent)
-await api('POST', '/session-group', { sessionId: 'codearts-pool-1', groupId: 'g2', mode: 'route' })
-caPoolAgent.status = 'running'
-const reviveAction = await errHandler(
-  { agent: caPoolAgent, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } },
-  () => Promise.resolve(undefined),
-)
-caPoolAgent.status = 'idle'
-ok('⑪ 假 429 触发重启 dsh-codearts 条目', restartCalls === 1, `restartCalls=${restartCalls}`)
-ok('⑪ 重启后返回 retry（同一步重试，不换模型）', reviveAction?.kind === 'retry', JSON.stringify(reviveAction))
-const reviveLog = (await api('GET', '/status')).body.failureLog.find(f => f.sessionId === 'codearts-pool-1')
-ok('⑪ 诊断记录 codearts-pool-revived', reviveLog?.outcome === 'codearts-pool-revived', JSON.stringify(reviveLog))
+
+/** 跑一次 codearts 失败，返回插件给宿主的动作 */
+async function failOnCodearts(sessionId, failure) {
+  const a = makeAgent(sessionId, {}, 'm1')
+  agents.push(a)
+  await api('POST', '/session-group', { sessionId, groupId: 'g2', mode: 'route' })
+  a.status = 'running'
+  const act = await errHandler({ agent: a, turn: 1, provider: 'codearts', failure }, () => Promise.resolve(undefined))
+  a.status = 'idle'
+  return act
+}
+const lastLogFor = async (sessionId) => (await api('GET', '/status')).body.failureLog.find(f => f.sessionId === sessionId)
+
+// B 类：池里账号被停用，但不是签名问题 → 重启条目即可
+codeartsStatus = { usage: { slots: [
+  { id: 'a1', state: 'disabled', detail: 'upstream 401' },
+  { id: 'a2', state: 'disabled', detail: 'upstream 401' },
+] } }
+const reviveAction = await failOnCodearts('codearts-pool-1', { code: 'RATE_LIMIT', status: 429, message: poolEmptyMsg })
+ok('⑪ 池被停用（非签名）时重启 dsh-codearts 条目', restartCalls === 1, `restartCalls=${restartCalls}`)
+ok('⑪ 重建账号池成功后返回 retry（同一步重试，不换模型）', reviveAction?.kind === 'retry', JSON.stringify(reviveAction))
+ok('⑪ 诊断记录 codearts-retry', (await lastLogFor('codearts-pool-1'))?.outcome === 'codearts-retry', JSON.stringify(await lastLogFor('codearts-pool-1')))
 ok('⑪ 未把可自愈的池状态写成「模型当日失败」',
   !(await api('GET', '/status')).body.failed.some(f => f.provider === 'codearts'))
 
-// 冷却期内不重复重启（重启是重操作）
-caPoolAgent.status = 'running'
-const secondAction = await errHandler(
-  { agent: caPoolAgent, turn: 2, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } },
-  () => Promise.resolve(undefined),
-)
-caPoolAgent.status = 'idle'
-ok('⑪ 冷却期内不重复重启', restartCalls === 1 && secondAction?.kind !== 'retry',
-  `restartCalls=${restartCalls} action=${JSON.stringify(secondAction) ?? 'undefined'}`)
+// A 类：billion-context 拒绝转发签名请求 → 重启没有任何用，也不能重试
+const resignDetail = JSON.stringify({ error: { type: 'signed_request_requires_resign', code: 'bili_resign_unavailable' } })
+codeartsStatus = { usage: { slots: [
+  { id: 'a1', state: 'disabled', detail: resignDetail },
+  { id: 'a2', state: 'disabled', detail: resignDetail },
+] } }
+const blockedAction = await failOnCodearts('codearts-signature-1', { code: 'RATE_LIMIT', status: 429, message: poolEmptyMsg })
+ok('⑪ 签名中间层拒绝时不重启（重启救不了）', restartCalls === 1, `restartCalls=${restartCalls}`)
+ok('⑪ 签名中间层拒绝时不返回 retry（避免对注定失败的链路反复重试）', blockedAction?.kind !== 'retry', JSON.stringify(blockedAction))
+const blockedLog = await lastLogFor('codearts-signature-1')
+ok('⑪ 诊断记录 codearts-signature-blocked 并给出修法',
+  blockedLog?.outcome === 'codearts-signature-blocked'
+  && (String(blockedLog.detail ?? '').includes('billion-context') || String(blockedLog.detail ?? '').includes('重签')),
+  JSON.stringify(blockedLog))
 
-// 真正的上游 429（不是池空那句）不得触发重启
-caPoolAgent.status = 'running'
-await errHandler(
-  { agent: caPoolAgent, turn: 3, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: 'InferHub.ModelArts.81111.429: The model TPM limit has been significantly exceeded.' } },
-  () => Promise.resolve(undefined),
-)
-caPoolAgent.status = 'idle'
-ok('⑪ 真正的上游 429 不触发重启（只认池空那句固定文案）', restartCalls === 1, `restartCalls=${restartCalls}`)
+// 池状态读不到（接口不可达）时按未知处理，不盲目重启
+globalThis.fetch = async () => ({ ok: false, async json() { return {} } })
+const unknownAction = await failOnCodearts('codearts-unknown-1', { code: 'RATE_LIMIT', status: 429, message: poolEmptyMsg })
+ok('⑪ 池状态不可读时不盲目重启也不 retry', restartCalls === 1 && unknownAction?.kind !== 'retry',
+  `restartCalls=${restartCalls} action=${JSON.stringify(unknownAction) ?? 'undefined'}`)
+ok('⑪ 诊断记录 codearts-unrecoverable', (await lastLogFor('codearts-unknown-1'))?.outcome === 'codearts-unrecoverable',
+  JSON.stringify(await lastLogFor('codearts-unknown-1')))
 
-// 重启后适配器没回来：不返回 retry，避免重试打在未注册的 provider 上。
-// 这条必然处在上面那次重启的冷却期内，所以它同时证明了「冷却期内跳过重启」。
-codeartsRegistered = false
-const notReadyAgent = makeAgent('codearts-pool-2', {}, 'm1')
-agents.push(notReadyAgent)
-await api('POST', '/session-group', { sessionId: 'codearts-pool-2', groupId: 'g2', mode: 'route' })
-notReadyAgent.status = 'running'
-const notReadyAction = await errHandler(
-  { agent: notReadyAgent, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } },
-  () => Promise.resolve(undefined),
-)
-notReadyAgent.status = 'idle'
-ok('⑪ 适配器未就绪 / 冷却期内都不返回 retry', notReadyAction?.kind !== 'retry',
-  `restartCalls=${restartCalls} action=${JSON.stringify(notReadyAction) ?? 'undefined'}`)
-const notReadyLog = (await api('GET', '/status')).body.failureLog.find(f => f.sessionId === 'codearts-pool-2')
-ok('⑪ 未就绪时诊断记录 codearts-pool-empty', notReadyLog?.outcome === 'codearts-pool-empty', JSON.stringify(notReadyLog))
+// /status 回传现场快照，界面能据此直接告诉用户该怎么办
+globalThis.fetch = baseFetch
+await api('POST', '/status')
+const heal = (await api('GET', '/status')).body.codeartsSelfHeal
+ok('⑪ /status 回传 codeartsSelfHeal 现场快照',
+  heal && typeof heal.loaderAvailable === 'boolean' && typeof heal.blockedBySignature === 'boolean',
+  JSON.stringify(heal))
 ctx.get = baseGet
+globalThis.fetch = baseFetch
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)

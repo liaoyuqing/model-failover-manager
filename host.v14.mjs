@@ -863,83 +863,101 @@ export function apply(ctx, config = {}) {
     return next.entry.id
   }
 
-  /* ============ dsh-codearts：全池被永久停用后的自救 ============ */
+  /* ============ dsh-codearts：签名被中间层拒绝时的诊断 ============ */
   //
   // 症状：dsh-codearts 回 429 soft_rate「codearts 当前没有可用账号（全部被禁用
-  // 或冷却中），请稍后重试」，但账号本身完全正常——积分查得到、凭据能直连上游。
+  // 或冷却中），请稍后重试」，但账号与积分都正常。
   //
-  // 根因（dsh-codearts 1.1.1，lib/index.mjs）：它的 chatCompletions 里
-  //   for (attempt < MAX_ROTATE) { id = pool.pick(tried); if (id === undefined) break; ... }
-  //   if (lastKind === void 0) writeOpenAIError(429, 'soft_rate', '没有可用账号…')
-  // 只要 pool.pick() 从第一次就返回 undefined，一次上游请求都不会发出去，直接
-  // 落成这句 429 —— 所以那句话的真实含义是「池里挑不出号」，不是「上游说没号」。
+  // 这不是账号问题，而是**上游拒绝**披了这层外衣。实测链路（session
+  // 6de50bf5，2026-10-25）：
+  //   1. dsh-codearts 发送 CodeArts APIG SDK-HMAC-SHA256 签名的请求；
+  //   2. billion-context 的本地代理（bili）判定「签名覆盖请求体，任何改写
+  //      （上下文压缩）都会让上游 401 APIG.0301」，而它**没有重签凭据**，
+  //      于是直接拒绝转发，回 403 signed_request_requires_resign /
+  //      bili_resign_unavailable；
+  //   3. dsh-codearts 的 classify() 把 403 归为 session_dead，对两个账号都
+  //      pool.disable()；池随之挑不出号；
+  //   4. 下一次请求 pool.pick() 返回 undefined，一个上游请求都不发，回那句 429。
   //
-  // 而池类（同文件 18-137 行）只有两种排除状态：
-  //   coolUntil 冷却 —— noteSuccess() 或到期可清；
-  //   disabled 停用 —— 只有 disable() 会写，**没有任何清除路径**。
-  // disable() 只由两处调用：凭据解析失败，以及 classify() 把 HTTP 401/403 判成
-  // session_dead。于是上游偶然回一次 403（临时凭证临期、并发上限、权益校验），
-  // 这个号就被永久停用；两个号各撞一次，池就再也挑不出号，此后每次请求都是这句
-  // 429，直到宿主重启（新建池才会回到 disabled=false）。
-  //
-  // 我们能做的自救：识别这个签名，重启承载它的 Loader 条目，让插件重新 apply、
-  // 池回到干净状态，然后让本插件重试同一轮。不碰它的任何数据与配置。
+  // 所以那句 429 的真实含义是「池里挑不出号」，成因有两种，处置完全不同：
+  //   A. 账号被签名的中间层拒过（status 里有 bili_resign_unavailable 细节）
+  //      → 重启本插件救不了，必须给 bili 重签凭据或让该链路免压缩；
+  //   B. 其它原因（上游偶发 401/403、凭据解析失败）
+  //      → 重启承载 dsh-codearts 的 Loader 条目即可重建池。
+  // 本节按状态接口里的细节分辨这两种，并在日志与 /status 里给出可执行的下一步。
 
+  /** provider id：dsh-codearts 自己导出的 CODEARTS_PROVIDER */
+  const CODEARTS_PROVIDER_ID = 'codearts'
   /**
-   * dsh-codearts「本地池挑不出号」的错误签名。
+   * 「池里挑不出号」的那句固定文案。
    *
-   * 只认它自己的那句固定文案：真正的上游 429 会被翻译成 TPM/并发提示（见
-   * upstreamErrorMessage），凭据失效是 401 not_signed_in，都不会命中这里。
+   * 只有这一句才说明「一个上游请求都没发出去」；其它 codearts 错误是真实的模型级
+   * 失败，必须继续走分组路由。
    */
   const CODEARTS_POOL_EMPTY = /codearts\s*当前没有可用账号（全部被禁用或冷却中）/
-  /** dsh-codearts 注册的 provider id（它自己导出的 CODEARTS_PROVIDER） */
-  const CODEARTS_PROVIDER_ID = 'codearts'
   /** 两次自救之间的最短间隔：重启是重操作，且失败会重复触发 */
   const CODEARTS_REVIVE_COOLDOWN_MS = 30_000
   /** 重启后等 dsh-codearts 适配器重新注册的上限；它的 apply 会走一次模型发现 */
   const CODEARTS_READY_TIMEOUT_MS = 20_000
   let lastCodeartsReviveAt = 0
+  /** 最近一次 codearts 自救的结论，随 /status 回传 */
+  let lastCodeartsDiagnosis = null
 
-  /** 这次失败是不是「codearts 本地账号池挑不出号」那个假 429 */
-  function isCodeartsPoolEmpty(provider, failure) {
-    if (!failure) return false
-    if (provider !== CODEARTS_PROVIDER_ID && String(failure.provider ?? '') !== CODEARTS_PROVIDER_ID) return false
-    if (failure.status !== 429) return false
-    return CODEARTS_POOL_EMPTY.test(String(failure.message ?? ''))
+  /**
+   * 这个 provider 是不是 codearts。
+   *
+   * 只看 provider 名，不匹配错误文案：真实成因（签名中间层、401、429）各不相同，
+   * 但都落在同一个 provider 上。
+   */
+  function isCodeartsFailure(provider, failure) {
+    if (provider === CODEARTS_PROVIDER_ID) return true
+    return String(failure?.provider ?? '') === CODEARTS_PROVIDER_ID
+  }
+
+  /**
+   * 问 dsh-codearts 的状态接口：池里每个账号现在是什么状态、为什么。
+   *
+   * 只在确认为 codearts 失败后调用，用于把「429 没有可用账号」翻译成真正的原因。
+   *
+   * @returns {Promise<{reachable: boolean, slots: Array<{id: string, state: string, detail?: string}>, blockedBySignature: boolean}>}
+   */
+  async function readCodeartsPoolState() {
+    const out = { reachable: false, slots: [], blockedBySignature: false }
+    try {
+      const res = await fetch('http://127.0.0.1:3080/api/codearts/status', { headers: { accept: 'application/json' } })
+      if (!res.ok) return out
+      const body = await res.json()
+      out.reachable = true
+      out.slots = Array.isArray(body?.usage?.slots) ? body.usage.slots : []
+      out.blockedBySignature = out.slots.some(s => String(s?.detail ?? '').includes('bili_resign_unavailable'))
+    } catch { /* 状态接口不可达时按未知处理 */ }
+    return out
   }
 
   /**
    * 重启承载 dsh-codearts 的 Loader 条目，让它的账号池回到干净状态。
    *
-   * 为什么走 Loader 条目而不是直接改它的池：池实例在它的 apply() 闭包里，既没有
-   * 导出也没有服务；唯一能让「disabled 已被永久置位」的池消失的办法就是让那个
-   * 插件实例重新创建。entry.fiber.restart() 正是「卸载 + 用同一份配置重新加载」，
-   * 不写配置、不改 cordis.yml，也不需要重启整个宿主。
+   * 为什么走 Loader 条目而不是直接改它的池：池实例在 apply() 闭包里，既没有导出
+   * 也没有服务；唯一能让「disabled 已被置位」的池消失的办法就是让那个插件实例
+   * 重新创建。entry.fiber.restart() 是「卸载 + 用同一份配置重新加载」，不写配置。
    *
-   * @returns {Promise<boolean>} 是否真的重启了一个条目
+   * @returns {Promise<boolean>} 是否真的重启并等到了适配器回来
    */
-  async function reviveCodeartsPool(reason) {
+  async function reviveCodeartsPool() {
     const now = Date.now()
-    if (now - lastCodeartsReviveAt < CODEARTS_REVIVE_COOLDOWN_MS) {
-      ctx.logger.info(`[model-failover] codearts 账号池自救在冷却中（${Math.round((CODEARTS_REVIVE_COOLDOWN_MS - (now - lastCodeartsReviveAt)) / 1000)}s 后可再试），本次不重启`)
-      return false
-    }
+    if (now - lastCodeartsReviveAt < CODEARTS_REVIVE_COOLDOWN_MS) return false
     let loader
-    try {
-      loader = ctx.get('loader')
-    } catch { /* 宿主没暴露 loader 时下面统一走 warn */ }
+    try { loader = ctx.get('loader') } catch { /* 下面统一处理 */ }
     if (!loader || typeof loader.entries !== 'function') {
-      ctx.logger.warn('[model-failover] 取不到 loader 服务，无法重启 dsh-codearts 的账号池（请重启宿主恢复）')
+      ctx.logger.warn('[model-failover] 取不到 loader 服务，无法重建 codearts 账号池（请重启宿主）')
       return false
     }
     let target
     try {
-      // 条目 name 是包的模块说明符；用户也可能用 link:/本地路径装，故按包名包含判断
       for (const entry of loader.entries()) {
-        const name = String(entry?.options?.name ?? '')
-        if (!name.includes('dsh-codearts')) continue
-        const fiber = entry.fiber
-        if (!fiber || fiber.uid === null) continue
+        const entryName = String(entry?.options?.name ?? '')
+        if (!entryName.includes('dsh-codearts')) continue
+        if (!entry.fiber || entry.fiber.uid === null) continue
         target = entry
         break
       }
@@ -948,58 +966,22 @@ export function apply(ctx, config = {}) {
       return false
     }
     if (!target) {
-      ctx.logger.warn('[model-failover] 没找到运行中的 dsh-codearts 条目（可能已停用），无法自救；请重启宿主恢复')
+      ctx.logger.warn('[model-failover] 没找到运行中的 dsh-codearts 条目，无法重建账号池')
       return false
     }
     lastCodeartsReviveAt = now
     try {
-      ctx.logger.warn(`[model-failover] codearts 账号池无可用号（${reason}），重启 dsh-codearts 条目以重建账号池后重试`)
       await target.fiber.restart()
     } catch (e) {
-      ctx.logger.warn(`[model-failover] 重启 dsh-codearts 失败：${e?.message || e}（请重启宿主恢复）`)
+      ctx.logger.warn(`[model-failover] 重启 dsh-codearts 失败：${e?.message || e}（请重启宿主）`)
       return false
     }
-    // 重新 apply 之后适配器才重新注册（它的 apply 里是 shim.ready.then(...) 异步挂载），
-    // 立刻重试会撞上「provider 暂时不存在」。等它回到 listProviders 再放行。
-    const ready = await waitForCodeartsProvider()
-    if (!ready) {
-      ctx.logger.warn('[model-failover] dsh-codearts 已重启但适配器未在超时内注册回来，本次不重试（下次请求会自然再走一遍）')
-      return false
-    }
-    ctx.logger.info('[model-failover] dsh-codearts 已重新加载，账号池已重建且适配器就绪')
-    return true
-  }
-
-  /**
-   * 只读诊断：codearts 自救此刻能否执行（`/status` 的 `codeartsSelfHeal`）。
-   *
-   * @returns {{ loaderAvailable: boolean, entryFound: boolean, entryId: string|null, cooldownRemainingMs: number }}
-   */
-  function describeCodeartsSelfHeal() {
-    const remaining = CODEARTS_REVIVE_COOLDOWN_MS - (Date.now() - lastCodeartsReviveAt)
-    const out = { loaderAvailable: false, entryFound: false, entryId: null, cooldownRemainingMs: remaining > 0 ? remaining : 0 }
-    let loader
-    try { loader = ctx.get('loader') } catch { return out }
-    if (!loader || typeof loader.entries !== 'function') return out
-    out.loaderAvailable = true
-    try {
-      for (const entry of loader.entries()) {
-        const name = String(entry?.options?.name ?? '')
-        if (!name.includes('dsh-codearts')) continue
-        if (!entry.fiber || entry.fiber.uid === null) continue
-        out.entryFound = true
-        out.entryId = String(entry.options?.id ?? '')
-        break
-      }
-    } catch { /* 枚举失败保持默认 false */ }
-    return out
+    // 重新 apply 后适配器才重新注册（它的 apply 里是 shim.ready.then(...) 异步挂载）
+    return await waitForCodeartsProvider()
   }
 
   /**
    * 等 dsh-codearts 的 provider 重新出现在 llm 注册表里。
-   *
-   * 重启是「卸载 + 重新 apply」，而它把 registerAdapter 放在 shim.ready.then() 里，
-   * 所以条目重启完成不等于适配器可用。轮询到出现或超时为止。
    *
    * @returns {Promise<boolean>} 超时前是否看到该 provider
    */
@@ -1014,6 +996,86 @@ export function apply(ctx, config = {}) {
       if (Date.now() >= deadline) return false
       await new Promise(resolve => setTimeout(resolve, 200))
     }
+  }
+
+  /**
+   * 只读诊断：codearts 目前的池状态与自救可行性（`/status` 的 `codeartsSelfHeal`）。
+   *
+   * @returns {Promise<object>} 现场快照，供界面与排障读取
+   */
+  async function describeCodeartsSelfHeal() {
+    const state = await readCodeartsPoolState()
+    const remaining = CODEARTS_REVIVE_COOLDOWN_MS - (Date.now() - lastCodeartsReviveAt)
+    let loaderAvailable = false
+    let entryId = null
+    try {
+      const loader = ctx.get('loader')
+      if (loader && typeof loader.entries === 'function') {
+        loaderAvailable = true
+        for (const entry of loader.entries()) {
+          if (!String(entry?.options?.name ?? '').includes('dsh-codearts')) continue
+          if (!entry.fiber || entry.fiber.uid === null) continue
+          entryId = String(entry.options?.id ?? '')
+          break
+        }
+      }
+    } catch { /* 保持默认值 */ }
+    return {
+      loaderAvailable,
+      entryId,
+      cooldownRemainingMs: remaining > 0 ? remaining : 0,
+      poolReachable: state.reachable,
+      // bili（billion-context 的本地代理）在没拿到重签凭据时会拒绝转发带 body
+      // 签名的请求；这是「池里挑不出号」最常见的成因，且重启救不了。
+      blockedBySignature: state.blockedBySignature,
+      slots: state.slots.map(s => ({ id: s.id, state: s.state, detail: s.detail ? String(s.detail).slice(0, 200) : undefined })),
+      lastDiagnosis: lastCodeartsDiagnosis,
+    }
+  }
+
+  /**
+   * codearts 失败后的处置：先分辨成因，再决定能否自救。
+   *
+   * @param {string} provider - 失败请求用的 provider。
+   * @param {string} model - 失败请求用的模型。
+   * @param {{code?: string, status?: number, message?: string}} failure - 宿主给出的失败事实。
+   * @returns {Promise<'retry'|'signature-blocked'|'revived'|'unrecoverable'>}
+   */
+  async function handleCodeartsFailure(provider, model, failure) {
+    // 只接管「池里挑不出号」这一类：正常的模型级失败（额度用完、TPM 超限、模型下线）
+    // 仍然要落给下面的分组路由，否则 codearts 就再也不会切模型了。
+    const poolEmpty = CODEARTS_POOL_EMPTY.test(String(failure?.message ?? ''))
+    const state = await readCodeartsPoolState()
+    const disabled = state.slots.filter(s => s.state === 'disabled').length
+    const cooling = state.slots.filter(s => s.state === 'cooling').length
+    if (!poolEmpty && !state.blockedBySignature) return 'fallthrough'
+
+    // A. 签名中间层拒绝：重启没有任何用，账号凭据和池都是被「拒转发」连带污染的
+    if (state.blockedBySignature) {
+      lastCodeartsDiagnosis = {
+        at: Date.now(), kind: 'signature-blocked', disabled, cooling,
+        hint: 'billion-context 未拿到 CodeArts 重签凭据，拒绝转发带 body 签名的请求（403 signed_request_requires_resign）。'
+          + '需要给它一个可用凭据（DSH credentials 里的 codearts 账号，或 config resign.sdk-hmac-sha256.credentialRef / BILI_CODEARTS_REF），'
+          + '或让这条链路免压缩（resign.sdk-hmac-sha256.passthrough=true / BILI_RESIGN_PASSTHROUGH=1）。重启插件无效。',
+      }
+      ctx.logger.error(`[model-failover] ${provider}/${model} 失败不是账号问题：billion-context（bili）拒绝转发 CodeArts 签名请求（缺重签凭据），${disabled} 个账号因此被标成 disabled。`)
+      ctx.logger.error('[model-failover] 修法：在 ~/.config/billion-context/billion-context.json 加 providers.<codearts 路由>.resign["sdk-hmac-sha256"] = { credentialRef | passthrough:true }，或设 BILI_CODEARTS_REF / BILI_RESIGN_PASSTHROUGH=1，然后重启 bili。')
+      return 'signature-blocked'
+    }
+
+    // B. 池里确实没有可用号，但没有签名证据：重启条目重建池，成功后同一步重试
+    if (disabled > 0 || cooling > 0 || state.slots.length === 0) {
+      const revived = await reviveCodeartsPool()
+      lastCodeartsDiagnosis = {
+        at: Date.now(), kind: revived ? 'revived' : 'revive-failed', disabled, cooling,
+        hint: revived ? '已重启 dsh-codearts 重建账号池。' : '重启 dsh-codearts 未成功，请手动重启宿主。',
+      }
+      if (revived) return 'retry'
+      return 'unrecoverable'
+    }
+
+    lastCodeartsDiagnosis = { at: Date.now(), kind: 'unknown', disabled, cooling, hint: '池状态里没有停用/冷却记录，失败原因见 failure.message。' }
+    return 'unrecoverable'
   }
 
   /** 限流类失败：适配器自己会写冷却标记并换号，无需本插件再冷却账号 */
@@ -1082,15 +1144,23 @@ export function apply(ctx, config = {}) {
       return action
     }
 
-    // dsh-codearts 的「本地池挑不出号」假 429：重启它的 Loader 条目重建账号池，
-    // 然后同一步重试。账号与凭据都是好的，换模型解决不了问题。
-    // 必须在换号/标记失败之前处理——否则会把一次可自愈的池状态写成「模型当日失败」。
-    if (isCodeartsPoolEmpty(provider, failure)) {
-      const revived = await reviveCodeartsPool(String(failure.message ?? '').slice(0, 80))
-      noteFailure(agent, provider, failure, revived ? 'codearts-pool-revived' : 'codearts-pool-empty', { model })
-      // 重启后立刻重试同一轮；selection 没变，retry 是安全的。
-      if (revived) return { kind: 'retry' }
-      return action
+    // dsh-codearts 的失败要分开看：那句「429 没有可用账号」既可能是上游偶发 401/403
+    // 把账号停用（重启条目即可），也可能是 billion-context 拒绝转发签名请求
+    // （重启无效，必须给 bili 重签凭据）。必须在换号/标记失败之前处理——否则会把
+    // 一次可自愈的池状态写成「模型当日失败」，或者对注定失败的链路反复重试。
+    if (isCodeartsFailure(provider, failure)) {
+      const verdict = await handleCodeartsFailure(provider, model, failure)
+      noteFailure(agent, provider, failure, `codearts-${verdict}`, {
+        model,
+        detail: lastCodeartsDiagnosis?.hint ?? null,
+      })
+      // 只有「重建账号池成功」才值得同一步重试；selection 没变，retry 是安全的。
+      if (verdict === 'retry') return { kind: 'retry' }
+      // fallthrough：不是「池挑不出号」，继续走下面的换号 / 分组路由。
+      if (verdict !== 'fallthrough') {
+        // 签名中间层拦截 / 无法自救：重试与换模型都没有意义，直接交给宿主报错。
+        return action
+      }
     }
 
     // Our Free Model 的模型：不论错误类型，一律先试换账号重试。
@@ -1296,7 +1366,7 @@ export function apply(ctx, config = {}) {
         ofmHandoffExcludeProviders: [...ofmHandoffExcludedProviders],
         // codearts 自救是否具备执行条件：loader 可见 + 找得到运行中的条目。
         // 这两项缺一就先在这里暴露出来，而不是等真失败时才发现救不了。
-        codeartsSelfHeal: describeCodeartsSelfHeal(),
+        codeartsSelfHeal: await describeCodeartsSelfHeal(),
         failureLog: failureLog.slice(-10).reverse(),
       })
       return
