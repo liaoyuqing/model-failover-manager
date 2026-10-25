@@ -7,6 +7,10 @@
 # work with no configuration):
 #   dataDir: where groups/bindings/failure state is stored
 #            (default: $DSH_HOME/model-failover-manager)
+#   ofmHandoffExcludeProviders: providers whose failures must skip the
+#            dsh-our-free-model account handoff and go straight to group
+#            routing (default: [codearts], which dsh-codearts serves with its
+#            own account pool)
 
 - insert:
     - id: model-failover-manager

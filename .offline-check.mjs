@@ -21,7 +21,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from './host.v13.mjs'
+import { apply } from './host.v14.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'mfm-offline-'))
 // 与宿主同一套判据：北京时间当前小时，造一个「此刻必然不在窗内」的时段
@@ -130,9 +130,34 @@ handlers.getAll = event => handlers.get(event) ?? []
 handlers.one = event => handlers.getAll(event).at(-1)
 let routeHandler = null
 let selectModelCalls = 0
+/**
+ * 假的 Our Free Model 账号池。
+ *
+ * 只对 'ofm-p' 报出两个可用账号——正是「池里有这个 provider 的账号」这一事实，
+ * 而 'codearts' 明明也有历史账号：插件必须靠 config.ofmHandoffExcludeProviders
+ * 而不是账号存在性来判断是否换号。
+ */
+const poolCalls = []
+const accountPool = {
+  listAccountsByProvider(provider) {
+    if (provider !== 'ofm-p') return []
+    return [
+      { id: 'ofm-p-1', provider, enabled: true },
+      { id: 'ofm-p-2', provider, enabled: true },
+    ]
+  },
+  async getAvailableAccount(provider, model) {
+    poolCalls.push(['getAvailableAccount', provider, model])
+    return { entry: { id: 'ofm-p-1' } }
+  },
+  async updateModelRateLimit(accountId, model, resetAt) {
+    poolCalls.push(['updateModelRateLimit', accountId, model, resetAt])
+  },
+}
 const ctx = {
   logger: { info() {}, warn() {}, error() {} },
   get(name) {
+    if (name === 'accountPool') return accountPool
     if (name === 'agents') return { list: () => agents, get: (id) => agents.find(a => a.id === id) }
     if (name === 'sessionController') {
       return {
@@ -327,6 +352,41 @@ const logResp2 = await api('GET', '/debug/status-log?sessionId=sub-explicit&limi
 ok('⑨ 诊断同时记录转发给 GUI 的 api-session/status',
   (logResp2.body.entries ?? []).some(e => e.kind === 'api-session/status' && e.running === true),
   JSON.stringify((logResp2.body.entries ?? []).at(-1)))
+
+// ⑩ Our Free Model 换账号的 provider 归属：名单内的 provider 不参与换号
+const caAgent = makeAgent('codearts-1', {}, 'm1')
+agents.push(caAgent)
+await api('POST', '/session-group', { sessionId: 'codearts-1', groupId: 'g2', mode: 'route' })
+caAgent.status = 'running'
+const caAction = await errHandler(
+  { agent: caAgent, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', message: 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试', status: 429 } },
+  () => Promise.resolve(undefined),
+)
+caAgent.status = 'idle'
+const caLog = (await api('GET', '/status')).body.failureLog.find(f => f.provider === 'codearts')
+ok('⑩ 名单内的 provider 不写账号冷却（池里就算留着它的历史账号）',
+  !poolCalls.some(c => c[0] === 'updateModelRateLimit' && String(c[1]).startsWith('codearts')),
+  JSON.stringify(poolCalls))
+ok('⑩ codearts 429 不再被当成换号重试', caAction?.kind !== 'retry' && caLog?.outcome !== 'account-handoff',
+  JSON.stringify({ action: caAction, outcome: caLog?.outcome }))
+ok('⑩ codearts 失败照常进分组路由（标记失败 + 选下一个）',
+  caLog?.outcome === 'switched' || caLog?.outcome === 'no-target', JSON.stringify(caLog))
+
+// 对照：不在名单里的 provider 仍走换号（且写池级冷却）
+const ofmAgent = makeAgent('ofm-1', {}, 'm1')
+agents.push(ofmAgent)
+await api('POST', '/session-group', { sessionId: 'ofm-1', groupId: 'g2', mode: 'route' })
+ofmAgent.status = 'running'
+const ofmAction = await errHandler(
+  { agent: ofmAgent, turn: 1, provider: 'ofm-p', failure: { code: 'QUOTA_EXCEEDED', message: '额度用尽', status: 403 } },
+  () => Promise.resolve(undefined),
+)
+ofmAgent.status = 'idle'
+ok('⑩ 名单外的 provider 仍先换账号重试（非限流失败也写冷却标记）',
+  ofmAction?.kind === 'retry' && poolCalls.some(c => c[0] === 'updateModelRateLimit' && c[1] === 'ofm-p-1'),
+  JSON.stringify({ action: ofmAction, calls: poolCalls }))
+ok('⑩ /status 回传生效的排除名单',
+  JSON.stringify((await api('GET', '/status')).body.ofmHandoffExcludeProviders) === JSON.stringify(['codearts']))
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
