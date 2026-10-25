@@ -11,6 +11,13 @@
 #            dsh-our-free-model account handoff and go straight to group
 #            routing (default: [codearts], which dsh-codearts serves with its
 #            own account pool)
+#   compactionGuard: enable the billion-context compression guard (default:
+#            true). When billion-context is the only compressor, providers the
+#            proxy cannot see are ranked last so sessions keep their compaction.
+#   uncompressedProviders: providers whose model endpoint is not on
+#            billion-context's endpoint whitelist, so their traffic is sent
+#            uncompressed (default: [qoder, qodercn], which post to a
+#            WASM-encrypted path bili cannot parse)
 
 - insert:
     - id: model-failover-manager

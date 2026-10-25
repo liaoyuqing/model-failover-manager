@@ -31,6 +31,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - **默认分组**：新会话（startup/clear）自动沿用上次的选择（分组 + 模式）；`resume` / `compact` 不动，尊重旧会话既有选择。
 - **在分组里直接停用模型**：路由分组页签里每个模型块都带两个开关——「失败」把它标记为当日失败（与自动失败共用同一份记录：日界线到期、会话成功一轮、或点「恢复」都会解除，`code=MANUAL`），「禁用」则把它**持久**挡在所有分组之外（写进分组条目的 `disabled` 字段，不随日期恢复，只由你手动「启用」解除）。两者互不覆盖：`routable()` 先判禁用再判失败。
 - **失败模型记录**：按「使用日」记录失败模型（北京时间，日界线默认早上 8:00，见 `failResetHour`），同时保存失败原因（错误码 + 最近一次错误信息）。在弹窗的「失败模型」页签里可展开查看原因，也可逐个或一键全部恢复。到日界线自动过期；会话成功完成一轮也会立即恢复对应模型。所有时间口径固定按北京时间计算，与宿主机时区无关。
+- **压缩旁路守卫（`compactionGuard`）**：`billion-context` 生效时，`qoder` / `qodercn` 这类走 WASM 加密端点的 provider 拿不到任何上下文压缩；插件把这类 provider 降为分组里的兜底候选，并在 `/status` 里标出被降级的模型与此刻正跑在无压缩链路上的会话。见「与 billion-context 的配合」一节。
 - **交还控制权**：你手选模型、解绑分组或删除分组后，插件即不再接管该会话的模型。
 - **换账号只对 Our Free Model 的模型生效**：少数历史上的渠道退役后账号还留在该插件的池里，因此「池里有这个 provider 的账号」不等于「这个 provider 归它管」。`codearts`（由 `dsh-codearts` 提供、账号由它自己的池管理）默认不在换号范围内，失败直接走分组路由，见 `ofmHandoffExcludeProviders`。
 
@@ -52,6 +53,94 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 本插件的处置：识别这句固定文案 → 重启承载 `dsh-codearts` 的 Loader 条目（`entry.fiber.restart()`，让它重新 apply、重建账号池；不写配置、不改 cordis.yml、不重启整个宿主）→ 等它的 provider 重新注册回 `llm` 注册表 → 同一步重试（selection 没变，retry 安全）。30 秒冷却防抖；自救失败时不把模型标成「当日失败」，也不切模型，只记一条诊断。
 
+## 与 billion-context 的配合
+
+`billion-context`（bili）在 DSH 里是**唯一的上下文压缩器**：它一生效，`bili-compaction-gate` 就把宿主自带的 `compaction-basic` 置为 `disabled`。而 bili 的原生通道只改写它认得的模型端点——`/chat/completions`、`/v1/messages`、`/completions`、`/responses`、`/conversations` 与 Gemini 的 `/models/<name>:<method>`，其它 POST 原样直发、不压缩。
+
+`qoder` / `qodercn` 的推理走 WASM 加密端点 `POST /algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1`：正文由 WASM 加密，`Authorization` 是 WASM 生成的 `COSY.<payload>.<sig>` 签名，bili 既认不出这个路径，也没有它的密文编解码器。两件事叠加的后果是：这些会话既没有 bili 压缩，也没有宿主自带压缩，历史只涨不降，bili 的压缩工具也不在请求里，最终在上下文上限处硬失败。
+
+这是硬约束，不是本插件要绕开的缺陷：压缩的前提是读出明文正文，而解密与签名都由 qoder 的 WASM 持有，bili 那条链路上没有谁代劳。插件不解密，而是**把请求改道**（见下节）。万一 shim 不可用——配置里关掉了、`dsh-codearts-auth` 不在、或者 bili 没启用——守卫负责「别让它悄悄发生、别把路由往这条链路上推、把修法说清楚」：
+
+1. **路由降级**：分组里只要有压缩代理看得见的模型，`pickCandidate` 就优先选它们；名单内的 provider 只在全组都不可压缩时才作为兜底被选中。既不把用户往无压缩链路上推，也不让只配了 qoder 的分组变成「无模型可用」。
+2. **失败留痕**：名单内 provider 的请求失败时，仍按原流程标记当日失败并切换，同时把结论写进 `/status.compressionGuard.lastDiagnosis`（带一行可执行的修法），并给 `failureLog` 的对应条目挂 `uncompressed: true`，排障时一眼看出这次失败发生在没有压缩的链路上。
+   - 这类失败重试没有意义、换模型才有意义；换到哪个由分组路由决定，诊断不改变切换路径。
+3. **判定 bili 是否在压缩**：只读全局量 `__BILI_DSH_COMPACTION_VERDICT__`，值为 `'active'` 才算在压缩。它由 bili 在 dsh-native 的 `apply(ctx)` 里、`plan.mode !== 'off'` 时无条件置位——只要 bili 原生通道启用就是 `active`，不需要压缩代理真的连上，也不依赖端口、鉴权与网络；`bili-compaction-gate` 读的是同一个量，两边判定不会分叉。bili 没启用时宿主自带压缩还在跑，这些 provider 照常有压缩。
+
+### qoder 压缩 shim
+
+上面的「路由降级」只是避让；真正的解法是把 qoder 的请求改成 bili 认识的协议跑一趟：**明文进 bili，压缩完再还原成 qoder 的加密 wire**。落地成两段：
+
+1. **换掉请求**：`QoderEncryptedInfer#prepareInfer` 被替换，不再返回 WASM 加密请求，而是返回一个明文 OpenAI 请求指向本机 shim（`http://127.0.0.1:47001/qoder/<rid>/chat/completions`）。路径以 `/chat/completions` 结尾，正是 bili 原生通道认得的那几种之一；`rid` 放在路径段而不是查询串，因为中继层可能改写或剥离查询串。
+2. **压缩后还原**：这次 `fetch` 发生在会话回合内，bili 会带上会话归属、把 `messages` 压缩，再转发回 shim。shim 用压缩后的 `messages` 重建 qoder 的 `ask`（`history` 本来就是 OpenAI 形状，映射几乎是恒等变换，系统消息、工具定义、采样参数原样带回），调用**原始** `prepareInfer` 重新加密，用 `node:https` 直连 qoder。上游 SSE 原样穿回 adapter，响应方向不需要翻译；凭据也不需要复制——shim 复用的正是被截获的那个 WASM 上下文（`this`）。
+
+为什么不做响应方向的协议翻译：qoder 的响应本来就是 OpenAI 形状的 SSE 包了一层信封，adapter 自己会拆；这边只动请求方向。
+
+三个配置项：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `qoderShim` | `true`（本仓库的 patch 里显式写 `true`） | 总开关。关掉后回到「路由降级 + 诊断」的老行为 |
+| `qoderShimPort` | `47001` | shim 监听端口，只绑 `127.0.0.1` |
+| `qoderShimWasmPath` | 自动探测 | 显式指定 `qoder-wasm.js` 的绝对路径；默认在 `$DSH_HOME/profiles/*/node_modules/dsh-codearts-auth/lib/` 下找 |
+
+装不上（模块缺失、导出对不上、端口占用）只告警并自动退回直发，不会阻断插件启动；原因写在 `/status.qoderShim.lastError` 里。
+
+两处细节值得知道：
+
+- **shim 自己也能热更新**：监听端口与 prototype 补丁放在进程级 `globalThis` 槽里，宿主用带构建号的动态 `import` 装载模块。改完 shim 代码后重载插件，同端口再装一次只更换「请求处理实现」，服务器与既有 keep-alive 连接都不重建，因此不会打断进行中的请求。
+- **`rid` 不会用完即删**：adapter 遇到 409 `duplicate_request`、或排队（`model_queued`）之后会原样重发同一个请求，那时 `rid` 必须还能命中，否则重发会变成 410。条目只按 TTL（120 秒）与容量（256 条）淘汰。
+
+「压缩旁路」要四个条件同时成立：`compactionGuard` 开着、provider 在 `uncompressedProviders` 名单里、bili 此刻在压缩，**并且** shim 没有接管它。前三条缺一条都不算；shim 装上之后 qoder/qodercn 的请求已经以明文进 bili，压缩照常发生，因此它们自动退出这份名单、路由也不再被降级。
+
+两个配置项：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `compactionGuard` | `true` | 总开关。关掉后名单内的 provider 恢复原优先级参与路由，失败也不再打压缩旁路诊断 |
+| `uncompressedProviders` | `["qoder", "qodercn"]` | 声明哪些 provider 的端点注定绕过 bili 压缩。写成 `[]` 表示一个都不声明，效果等同于关掉守卫 |
+| `qoderShim` | `false` | 打开 qoder 压缩 shim：明文进 bili、压缩后重新加密出上游。见「qoder 压缩 shim」 |
+| `qoderShimPort` | `47001` | shim 监听端口，只绑 `127.0.0.1` |
+| `qoderShimWasmPath` | 自动探测 | 显式指定 `qoder-wasm.js` 绝对路径 |
+
+### 在 `/status` 里看
+
+`/status` 的 `compressionGuard` 是守卫此刻的现场（只读）：
+
+```json
+"compressionGuard": {
+  "enabled": true,
+  "biliActive": true,
+  "uncompressedProviders": ["qoder", "qodercn"],
+  "shimCovered": ["qoder", "qodercn"],
+  "downgradedModels": [{ "groupId": "g-1", "provider": "qoder", "model": "..." }],
+  "degradedSessions": [{ "sessionId": "...", "provider": "qoder", "model": "..." }],
+  "lastDiagnosis": { "at": 1730000000000, "provider": "qoder", "model": "...", "code": "CONTEXT_LENGTH_EXCEEDED", "hint": "billion-context（bili）现在是唯一的压缩器，但…" }
+}
+```
+
+- `enabled` / `biliActive`：守卫开没开、bili 此刻是不是唯一压缩器。任一为 `false`，下面两份名单都说明不了「此刻真的拿不到压缩」。
+- `uncompressedProviders`：生效中的名单。
+- `shimCovered`：名单里已被压缩 shim 改道的 provider。它们不再计入 `downgradedModels` / `degradedSessions`——请求已经以明文进 bili，压缩照常。
+- `downgradedModels`：所有启用分组里会被降为兜底的条目，最多 50 条。不剔除当日失败、超出时段、过了截止日的条目——它们本来也不参与路由。
+- `degradedSessions`：本插件已接管、且生效模型落在名单里的会话，也就是此刻正跑在无压缩链路上的那些。
+- `lastDiagnosis`：最近一次压缩旁路失败的结论（`at` 是毫秒时间戳）；一次都没发生过时为 `null`。
+
+`/status.qoderShim` 是 shim 此刻的现场：
+
+```json
+"qoderShim": {
+  "enabled": true, "installed": true, "port": 47001,
+  "wasmPath": "…/dsh-codearts-auth/lib/qoder-wasm.js",
+  "intercepted": 12, "forwarded": 12, "compacted": 4, "fallback": 0,
+  "lastError": null, "lastAt": 1730000000000
+}
+```
+
+- `intercepted`：被截下来改道的 `prepareInfer` 次数；`forwarded`：成功重新加密并发出上游的次数。
+- `compacted`：其中 bili 真的压缩过（回来的 `messages` 与发出去的不一样）的次数——这个数大于 0 才说明压缩这一次真的接上了。
+- `fallback`：退回直发的次数（`ask` 形状不合法、重新加密失败、`rid` 过期等），配 `lastError` 看原因。
+- `installed`：`prepareInfer` 补丁装成功了没有；`false` 时 `lastError` 说明为什么（模块找不到、导出对不上）。
+
 ## 安装
 
 ```sh
@@ -63,7 +152,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```yaml
 - insert:
     - id: model-failover-manager
-      name: ./plugins/model-failover-manager/host.v7.mjs
+      name: ./plugins/model-failover-manager/host.v26.mjs
 ```
 
 ### DSH 版本要求
@@ -95,7 +184,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders` |
+| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`） |
 | POST | `/settings` | 保存界面设置（`dialogMode`） |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
@@ -130,6 +219,8 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | `dataDir` | `$DSH_HOME/model-failover-manager` | 上述数据文件的目录 |
 | `failResetHour` | `8` | 「当日失败」的日界线小时（北京时间整点，0..23）；到点自动清除失败标记。改值后配置变化会让 Loader 重新应用，无需重启 |
 | `ofmHandoffExcludeProviders` | `["codearts"]` | 不走 Our Free Model 换号的 provider；这些 provider 失败后直接进分组路由。写成 `[]` 表示不排除任何 provider |
+| `compactionGuard` | `true` | 压缩旁路守卫总开关：bili 生效时把 `uncompressedProviders` 里、且未被 shim 接管的 provider 降为分组兜底候选，并在失败时写压缩旁路诊断 |
+| `uncompressedProviders` | `["qoder", "qodercn"]` | 端点注定绕过 bili 压缩的 provider 名单（见「与 billion-context 的配合」）。写成 `[]` 等同于关掉守卫 |
 
 所有时间口径固定按**北京时间**计算，与宿主机时区、`TZ`、`LANG` 无关。路由时段（`windows` 的 `from`/`to`）的小时也按北京时间解释；截止日 `until` 按自然日比较。
 
@@ -139,12 +230,13 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v14.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救） |
+| `host.v26.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线） |
+| `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游 |
 | `client.js` | 浏览器半（DSH dynamic client bundle） |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v13.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v14.mjs` |
+| `host.mjs`、`host.v2.mjs` … `host.v25.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v26.mjs`。宿主文件内容一变就换文件名，因为 Loader 按路径缓存 ESM |
 
 ## 已知限制
 
@@ -162,6 +254,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model.
 - For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
+- Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
 
 ## License
