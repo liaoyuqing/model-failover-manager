@@ -18,6 +18,15 @@
 #            billion-context's endpoint whitelist, so their traffic is sent
 #            uncompressed (default: [qoder, qodercn], which post to a
 #            WASM-encrypted path bili cannot parse)
+#   qoderShim: route qoder/qodercn through the loopback compression shim
+#            (default: false). The request leaves as plaintext OpenAI JSON so
+#            billion-context compacts it, then the shim re-encrypts it with the
+#            original WASM codec before the upstream call. Needs a hook line in
+#            dsh-our-free-model's pack.js, which the plugin repairs if an
+#            upgrade drops it.
+#   qoderShimPort: loopback port for that shim (default: 47001, 127.0.0.1 only)
+#   qoderShimWasmPath: explicit path to qoder-wasm.js when auto-detection under
+#            $DSH_HOME/profiles/<name>/node_modules fails
 
 - insert:
     - id: model-failover-manager

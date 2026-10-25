@@ -11,14 +11,14 @@
     "type": "git",
     "url": "git+https://github.com/liaoyuqing/model-failover-manager.git"
   },
-  "main": "./host.v57.mjs",
+  "main": "./host.v58.mjs",
   "exports": {
-    ".": "./host.v57.mjs",
+    ".": "./host.v58.mjs",
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
-    "host.v57.mjs",
+    "host.v58.mjs",
     "qoder-compress-shim.mjs",
     "client.js",
     "cordis.patch.yml",

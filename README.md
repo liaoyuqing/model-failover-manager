@@ -180,7 +180,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```yaml
 - insert:
     - id: model-failover-manager
-      name: ./plugins/model-failover-manager/host.v57.mjs
+      name: ./plugins/model-failover-manager/host.v58.mjs
 ```
 
 ### DSH 版本要求
@@ -258,13 +258,13 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v57.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线） |
+| `host.v58.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线） |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回 |
 | `client.js` | 浏览器半（DSH dynamic client bundle） |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v56.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v57.mjs`。宿主文件内容一变就换文件名，因为 Loader 按路径缓存 ESM |
+| `host.mjs`、`host.v2.mjs` … `host.v56.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v58.mjs`。宿主文件内容一变就换文件名，因为 Loader 按路径缓存 ESM |
 
 ## 已知限制
 
