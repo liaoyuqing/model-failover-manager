@@ -359,7 +359,7 @@ agents.push(caAgent)
 await api('POST', '/session-group', { sessionId: 'codearts-1', groupId: 'g2', mode: 'route' })
 caAgent.status = 'running'
 const caAction = await errHandler(
-  { agent: caAgent, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', message: 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试', status: 429 } },
+  { agent: caAgent, turn: 1, provider: 'codearts', failure: { code: 'hard_credit', message: 'codearts 上游错误 (http 402): quota exhausted', status: 402 } },
   () => Promise.resolve(undefined),
 )
 caAgent.status = 'idle'
@@ -367,7 +367,7 @@ const caLog = (await api('GET', '/status')).body.failureLog.find(f => f.provider
 ok('⑩ 名单内的 provider 不写账号冷却（池里就算留着它的历史账号）',
   !poolCalls.some(c => c[0] === 'updateModelRateLimit' && String(c[1]).startsWith('codearts')),
   JSON.stringify(poolCalls))
-ok('⑩ codearts 429 不再被当成换号重试', caAction?.kind !== 'retry' && caLog?.outcome !== 'account-handoff',
+ok('⑩ codearts 失败不再被当成换号重试', caAction?.kind !== 'retry' && caLog?.outcome !== 'account-handoff',
   JSON.stringify({ action: caAction, outcome: caLog?.outcome }))
 ok('⑩ codearts 失败照常进分组路由（标记失败 + 选下一个）',
   caLog?.outcome === 'switched' || caLog?.outcome === 'no-target', JSON.stringify(caLog))
@@ -387,6 +387,78 @@ ok('⑩ 名单外的 provider 仍先换账号重试（非限流失败也写冷�
   JSON.stringify({ action: ofmAction, calls: poolCalls }))
 ok('⑩ /status 回传生效的排除名单',
   JSON.stringify((await api('GET', '/status')).body.ofmHandoffExcludeProviders) === JSON.stringify(['codearts']))
+
+// ⑪ dsh-codearts 全池被永久停用后的自救（假 429 → 重启它的 Loader 条目 → 重试）
+let restartCalls = 0
+let codeartsRegistered = true
+const fakeLoader = {
+  *entries() {
+    yield { options: { id: 'llm-codearts', name: 'dsh-codearts' }, fiber: { uid: 7, async restart() { restartCalls += 1 } } }
+    yield { options: { id: 'other', name: 'some-other-plugin' }, fiber: { uid: 8, async restart() { throw new Error('不该重启这个') } } }
+  },
+}
+const baseGet = ctx.get.bind(ctx)
+ctx.get = (name) => {
+  if (name === 'loader') return fakeLoader
+  if (name === 'llm') return { listProviders: () => codeartsRegistered ? [{ id: 'p', name: 'P' }, { id: 'codearts', name: 'CodeArts' }] : [{ id: 'p', name: 'P' }] }
+  return baseGet(name)
+}
+
+const poolEmptyMsg = 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试'
+// ⑩ 已把 codearts 标成当日失败（那是它对真实上游错误的正确处置）；清掉再验 ⑪。
+await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
+const caPoolAgent = makeAgent('codearts-pool-1', {}, 'm1')
+agents.push(caPoolAgent)
+await api('POST', '/session-group', { sessionId: 'codearts-pool-1', groupId: 'g2', mode: 'route' })
+caPoolAgent.status = 'running'
+const reviveAction = await errHandler(
+  { agent: caPoolAgent, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } },
+  () => Promise.resolve(undefined),
+)
+caPoolAgent.status = 'idle'
+ok('⑪ 假 429 触发重启 dsh-codearts 条目', restartCalls === 1, `restartCalls=${restartCalls}`)
+ok('⑪ 重启后返回 retry（同一步重试，不换模型）', reviveAction?.kind === 'retry', JSON.stringify(reviveAction))
+const reviveLog = (await api('GET', '/status')).body.failureLog.find(f => f.sessionId === 'codearts-pool-1')
+ok('⑪ 诊断记录 codearts-pool-revived', reviveLog?.outcome === 'codearts-pool-revived', JSON.stringify(reviveLog))
+ok('⑪ 未把可自愈的池状态写成「模型当日失败」',
+  !(await api('GET', '/status')).body.failed.some(f => f.provider === 'codearts'))
+
+// 冷却期内不重复重启（重启是重操作）
+caPoolAgent.status = 'running'
+const secondAction = await errHandler(
+  { agent: caPoolAgent, turn: 2, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } },
+  () => Promise.resolve(undefined),
+)
+caPoolAgent.status = 'idle'
+ok('⑪ 冷却期内不重复重启', restartCalls === 1 && secondAction?.kind !== 'retry',
+  `restartCalls=${restartCalls} action=${JSON.stringify(secondAction) ?? 'undefined'}`)
+
+// 真正的上游 429（不是池空那句）不得触发重启
+caPoolAgent.status = 'running'
+await errHandler(
+  { agent: caPoolAgent, turn: 3, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: 'InferHub.ModelArts.81111.429: The model TPM limit has been significantly exceeded.' } },
+  () => Promise.resolve(undefined),
+)
+caPoolAgent.status = 'idle'
+ok('⑪ 真正的上游 429 不触发重启（只认池空那句固定文案）', restartCalls === 1, `restartCalls=${restartCalls}`)
+
+// 重启后适配器没回来：不返回 retry，避免重试打在未注册的 provider 上。
+// 这条必然处在上面那次重启的冷却期内，所以它同时证明了「冷却期内跳过重启」。
+codeartsRegistered = false
+const notReadyAgent = makeAgent('codearts-pool-2', {}, 'm1')
+agents.push(notReadyAgent)
+await api('POST', '/session-group', { sessionId: 'codearts-pool-2', groupId: 'g2', mode: 'route' })
+notReadyAgent.status = 'running'
+const notReadyAction = await errHandler(
+  { agent: notReadyAgent, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } },
+  () => Promise.resolve(undefined),
+)
+notReadyAgent.status = 'idle'
+ok('⑪ 适配器未就绪 / 冷却期内都不返回 retry', notReadyAction?.kind !== 'retry',
+  `restartCalls=${restartCalls} action=${JSON.stringify(notReadyAction) ?? 'undefined'}`)
+const notReadyLog = (await api('GET', '/status')).body.failureLog.find(f => f.sessionId === 'codearts-pool-2')
+ok('⑪ 未就绪时诊断记录 codearts-pool-empty', notReadyLog?.outcome === 'codearts-pool-empty', JSON.stringify(notReadyLog))
+ctx.get = baseGet
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)

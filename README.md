@@ -44,6 +44,14 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - 未安装该插件时，这段逻辑静默跳过。
 - 「属于哪个插件」由 `ofmHandoffExcludeProviders` 决定，而不是由池里有没有账号决定：池是按 provider 字符串存的持久表，渠道退役后账号条目仍在，只看账号会把别的插件提供的模型也卷进换号流程（例如 `codearts` 的 429 被当成换号，冷却一个本次没用到的账号，还挡掉了本该发生的分组路由）。默认排除 `codearts`。
 
+## 与 dsh-codearts 的配合
+
+`dsh-codearts` 有一个已知的失败模式，本插件会兜住：**报「429 没有可用账号」，但账号和积分都正常**。
+
+它的 `chatCompletions` 里，`pool.pick()` 从第一次就返回 `undefined` 时一个上游请求都不会发出去，直接回这句 429 —— 真实含义是「本地池挑不出号」。而它的账号池只有 `coolUntil`（冷却，成功或到期可清）和 `disabled`（停用，**没有任何清除路径**）；`disabled` 由 `session_dead` 写入，而它的 `classify()` 把 HTTP 401 和 403 都判成 `session_dead` —— 上游偶发一次 403（临时凭证临期、并发上限、权益校验）就让该号永久停用，两个号都撞上后池彻底变空，此后每次请求都是这句 429，直到重启宿主。
+
+本插件的处置：识别这句固定文案 → 重启承载 `dsh-codearts` 的 Loader 条目（`entry.fiber.restart()`，让它重新 apply、重建账号池；不写配置、不改 cordis.yml、不重启整个宿主）→ 等它的 provider 重新注册回 `llm` 注册表 → 同一步重试（selection 没变，retry 安全）。30 秒冷却防抖；自救失败时不把模型标成「当日失败」，也不切模型，只记一条诊断。
+
 ## 安装
 
 ```sh
@@ -73,12 +81,13 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 1. 一次请求失败，内层重试策略（内置 `llm-retry`、`llm-error-retry` 等）先依次表态。
 2. 只有它们都放弃后，本插件才接手。
-3. 若失败模型属于 Our Free Model 且该 provider 不在 `ofmHandoffExcludeProviders` 里：先换账号重试（见上一节）。
-4. 否则把该模型标记为「当日失败」，然后按绑定决定目标：
+3. 若错误是 `dsh-codearts` 的「本地池挑不出号」那句 429：重启它的 Loader 条目重建账号池，等适配器就绪后同一步重试（见「与 dsh-codearts 的配合」）。
+4. 若失败模型属于 Our Free Model 且该 provider 不在 `ofmHandoffExcludeProviders` 里：先换账号重试（见上一节）。
+5. 否则把该模型标记为「当日失败」，然后按绑定决定目标：
    - `route`：取组内下一个可用模型；
    - `failover`：同样取组内下一个可用模型作为兜底；
    - 组内没有可用模型（都失败 / 不在时段 / 已过期）时不切换，只记录。
-5. 切换成功即让同一轮继续；失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
+6. 切换成功即让同一轮继续；失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
 
 ## HTTP 接口
 
@@ -130,7 +139,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v14.mjs` | 宿主半，也是 `package.json` 的 `main` |
+| `host.v14.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救） |
 | `client.js` | 浏览器半（DSH dynamic client bundle） |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |

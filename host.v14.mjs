@@ -863,6 +863,159 @@ export function apply(ctx, config = {}) {
     return next.entry.id
   }
 
+  /* ============ dsh-codearts：全池被永久停用后的自救 ============ */
+  //
+  // 症状：dsh-codearts 回 429 soft_rate「codearts 当前没有可用账号（全部被禁用
+  // 或冷却中），请稍后重试」，但账号本身完全正常——积分查得到、凭据能直连上游。
+  //
+  // 根因（dsh-codearts 1.1.1，lib/index.mjs）：它的 chatCompletions 里
+  //   for (attempt < MAX_ROTATE) { id = pool.pick(tried); if (id === undefined) break; ... }
+  //   if (lastKind === void 0) writeOpenAIError(429, 'soft_rate', '没有可用账号…')
+  // 只要 pool.pick() 从第一次就返回 undefined，一次上游请求都不会发出去，直接
+  // 落成这句 429 —— 所以那句话的真实含义是「池里挑不出号」，不是「上游说没号」。
+  //
+  // 而池类（同文件 18-137 行）只有两种排除状态：
+  //   coolUntil 冷却 —— noteSuccess() 或到期可清；
+  //   disabled 停用 —— 只有 disable() 会写，**没有任何清除路径**。
+  // disable() 只由两处调用：凭据解析失败，以及 classify() 把 HTTP 401/403 判成
+  // session_dead。于是上游偶然回一次 403（临时凭证临期、并发上限、权益校验），
+  // 这个号就被永久停用；两个号各撞一次，池就再也挑不出号，此后每次请求都是这句
+  // 429，直到宿主重启（新建池才会回到 disabled=false）。
+  //
+  // 我们能做的自救：识别这个签名，重启承载它的 Loader 条目，让插件重新 apply、
+  // 池回到干净状态，然后让本插件重试同一轮。不碰它的任何数据与配置。
+
+  /**
+   * dsh-codearts「本地池挑不出号」的错误签名。
+   *
+   * 只认它自己的那句固定文案：真正的上游 429 会被翻译成 TPM/并发提示（见
+   * upstreamErrorMessage），凭据失效是 401 not_signed_in，都不会命中这里。
+   */
+  const CODEARTS_POOL_EMPTY = /codearts\s*当前没有可用账号（全部被禁用或冷却中）/
+  /** dsh-codearts 注册的 provider id（它自己导出的 CODEARTS_PROVIDER） */
+  const CODEARTS_PROVIDER_ID = 'codearts'
+  /** 两次自救之间的最短间隔：重启是重操作，且失败会重复触发 */
+  const CODEARTS_REVIVE_COOLDOWN_MS = 30_000
+  /** 重启后等 dsh-codearts 适配器重新注册的上限；它的 apply 会走一次模型发现 */
+  const CODEARTS_READY_TIMEOUT_MS = 20_000
+  let lastCodeartsReviveAt = 0
+
+  /** 这次失败是不是「codearts 本地账号池挑不出号」那个假 429 */
+  function isCodeartsPoolEmpty(provider, failure) {
+    if (!failure) return false
+    if (provider !== CODEARTS_PROVIDER_ID && String(failure.provider ?? '') !== CODEARTS_PROVIDER_ID) return false
+    if (failure.status !== 429) return false
+    return CODEARTS_POOL_EMPTY.test(String(failure.message ?? ''))
+  }
+
+  /**
+   * 重启承载 dsh-codearts 的 Loader 条目，让它的账号池回到干净状态。
+   *
+   * 为什么走 Loader 条目而不是直接改它的池：池实例在它的 apply() 闭包里，既没有
+   * 导出也没有服务；唯一能让「disabled 已被永久置位」的池消失的办法就是让那个
+   * 插件实例重新创建。entry.fiber.restart() 正是「卸载 + 用同一份配置重新加载」，
+   * 不写配置、不改 cordis.yml，也不需要重启整个宿主。
+   *
+   * @returns {Promise<boolean>} 是否真的重启了一个条目
+   */
+  async function reviveCodeartsPool(reason) {
+    const now = Date.now()
+    if (now - lastCodeartsReviveAt < CODEARTS_REVIVE_COOLDOWN_MS) {
+      ctx.logger.info(`[model-failover] codearts 账号池自救在冷却中（${Math.round((CODEARTS_REVIVE_COOLDOWN_MS - (now - lastCodeartsReviveAt)) / 1000)}s 后可再试），本次不重启`)
+      return false
+    }
+    let loader
+    try {
+      loader = ctx.get('loader')
+    } catch { /* 宿主没暴露 loader 时下面统一走 warn */ }
+    if (!loader || typeof loader.entries !== 'function') {
+      ctx.logger.warn('[model-failover] 取不到 loader 服务，无法重启 dsh-codearts 的账号池（请重启宿主恢复）')
+      return false
+    }
+    let target
+    try {
+      // 条目 name 是包的模块说明符；用户也可能用 link:/本地路径装，故按包名包含判断
+      for (const entry of loader.entries()) {
+        const name = String(entry?.options?.name ?? '')
+        if (!name.includes('dsh-codearts')) continue
+        const fiber = entry.fiber
+        if (!fiber || fiber.uid === null) continue
+        target = entry
+        break
+      }
+    } catch (e) {
+      ctx.logger.warn(`[model-failover] 枚举 loader 条目失败：${e?.message || e}`)
+      return false
+    }
+    if (!target) {
+      ctx.logger.warn('[model-failover] 没找到运行中的 dsh-codearts 条目（可能已停用），无法自救；请重启宿主恢复')
+      return false
+    }
+    lastCodeartsReviveAt = now
+    try {
+      ctx.logger.warn(`[model-failover] codearts 账号池无可用号（${reason}），重启 dsh-codearts 条目以重建账号池后重试`)
+      await target.fiber.restart()
+    } catch (e) {
+      ctx.logger.warn(`[model-failover] 重启 dsh-codearts 失败：${e?.message || e}（请重启宿主恢复）`)
+      return false
+    }
+    // 重新 apply 之后适配器才重新注册（它的 apply 里是 shim.ready.then(...) 异步挂载），
+    // 立刻重试会撞上「provider 暂时不存在」。等它回到 listProviders 再放行。
+    const ready = await waitForCodeartsProvider()
+    if (!ready) {
+      ctx.logger.warn('[model-failover] dsh-codearts 已重启但适配器未在超时内注册回来，本次不重试（下次请求会自然再走一遍）')
+      return false
+    }
+    ctx.logger.info('[model-failover] dsh-codearts 已重新加载，账号池已重建且适配器就绪')
+    return true
+  }
+
+  /**
+   * 只读诊断：codearts 自救此刻能否执行（`/status` 的 `codeartsSelfHeal`）。
+   *
+   * @returns {{ loaderAvailable: boolean, entryFound: boolean, entryId: string|null, cooldownRemainingMs: number }}
+   */
+  function describeCodeartsSelfHeal() {
+    const remaining = CODEARTS_REVIVE_COOLDOWN_MS - (Date.now() - lastCodeartsReviveAt)
+    const out = { loaderAvailable: false, entryFound: false, entryId: null, cooldownRemainingMs: remaining > 0 ? remaining : 0 }
+    let loader
+    try { loader = ctx.get('loader') } catch { return out }
+    if (!loader || typeof loader.entries !== 'function') return out
+    out.loaderAvailable = true
+    try {
+      for (const entry of loader.entries()) {
+        const name = String(entry?.options?.name ?? '')
+        if (!name.includes('dsh-codearts')) continue
+        if (!entry.fiber || entry.fiber.uid === null) continue
+        out.entryFound = true
+        out.entryId = String(entry.options?.id ?? '')
+        break
+      }
+    } catch { /* 枚举失败保持默认 false */ }
+    return out
+  }
+
+  /**
+   * 等 dsh-codearts 的 provider 重新出现在 llm 注册表里。
+   *
+   * 重启是「卸载 + 重新 apply」，而它把 registerAdapter 放在 shim.ready.then() 里，
+   * 所以条目重启完成不等于适配器可用。轮询到出现或超时为止。
+   *
+   * @returns {Promise<boolean>} 超时前是否看到该 provider
+   */
+  async function waitForCodeartsProvider() {
+    const deadline = Date.now() + CODEARTS_READY_TIMEOUT_MS
+    for (;;) {
+      try {
+        const llm = ctx.get('llm')
+        const providers = llm?.listProviders?.() ?? []
+        if (providers.some(p => String(p?.id) === CODEARTS_PROVIDER_ID)) return true
+      } catch { /* 重启窗口内服务可能短暂不可读，继续等 */ }
+      if (Date.now() >= deadline) return false
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+  }
+
   /** 限流类失败：适配器自己会写冷却标记并换号，无需本插件再冷却账号 */
   function isRateLimitLike(failure) {
     if (!failure) return false
@@ -926,6 +1079,17 @@ export function apply(ctx, config = {}) {
     }
     if (!provider || !model) {
       noteFailure(agent, eventProvider, failure, 'provider-or-model-unknown')
+      return action
+    }
+
+    // dsh-codearts 的「本地池挑不出号」假 429：重启它的 Loader 条目重建账号池，
+    // 然后同一步重试。账号与凭据都是好的，换模型解决不了问题。
+    // 必须在换号/标记失败之前处理——否则会把一次可自愈的池状态写成「模型当日失败」。
+    if (isCodeartsPoolEmpty(provider, failure)) {
+      const revived = await reviveCodeartsPool(String(failure.message ?? '').slice(0, 80))
+      noteFailure(agent, provider, failure, revived ? 'codearts-pool-revived' : 'codearts-pool-empty', { model })
+      // 重启后立刻重试同一轮；selection 没变，retry 是安全的。
+      if (revived) return { kind: 'retry' }
       return action
     }
 
@@ -1130,6 +1294,9 @@ export function apply(ctx, config = {}) {
         settings,
         failResetHour,
         ofmHandoffExcludeProviders: [...ofmHandoffExcludedProviders],
+        // codearts 自救是否具备执行条件：loader 可见 + 找得到运行中的条目。
+        // 这两项缺一就先在这里暴露出来，而不是等真失败时才发现救不了。
+        codeartsSelfHeal: describeCodeartsSelfHeal(),
         failureLog: failureLog.slice(-10).reverse(),
       })
       return
