@@ -86,7 +86,7 @@ export function applyCompressedBody(ask, body) {
 import http from 'node:http'
 import https from 'node:https'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -116,43 +116,256 @@ export function resolveQoderWasmPath(explicit) {
   return null
 }
 
+
+
 /**
- * 进程内唯一的 shim 状态槽。放在 globalThis 而不是模块作用域：插件重载会重新
- * import 本模块（新的模块实例），但监听端口和 prototype 补丁属于进程本身 ——
- * 共用一个槽就能做到「重载只换实现、不重建服务器」，避免既有 keep-alive 连接
- * 被掐断后客户端撞 ECONNRESET。
+ * 进程级状态槽。放 globalThis 而不是模块作用域：插件重载会重新 import 本模块，
+ * 但监听端口、补丁和计数都属于进程本身，必须跨重载存活。
  */
 const STATE_KEY = '__mfQoderShim'
 
-/** 停服宽限：先停止监听，既有连接自然收尾；超过这个时间再强拆，避免端口长期被占。 */
+/**
+ * 取一条消息的正文文本（字符串或分段数组都摊平成字符串）。
+ *
+ * @param message 一条 OpenAI message
+ * @returns 正文字符串
+ */
+function contentOf(message) {
+  const c = message?.content
+  if (typeof c === 'string') return c
+  if (Array.isArray(c)) return c.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('')
+  return ''
+}
+
+/**
+ * 6 位哈希，只用于判断两条正文是否相同（不是安全用途）。
+ *
+ * @param text 正文
+ * @returns 十六进制哈希
+ */
+function hashOf(text) {
+  let h = 0
+  for (let i = 0; i < text.length; i += 1) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0
+  return (h >>> 0).toString(16)
+}
+
+/**
+ * 逐条比对发出去的正文与回来的正文，给出人可读的差异摘要。
+ *
+ * @param before prepare 阶段留存的 { role, len, hash } 列表
+ * @param after 回来后解析出的 messages
+ * @returns 差异条目数组
+ */
+function diffMessages(before, after) {
+  if (!Array.isArray(before)) return []
+  const out = []
+  const max = Math.max(before.length, after.length)
+  for (let i = 0; i < max; i += 1) {
+    const b = before[i]
+    const a = after[i]
+    const text = contentOf(a)
+    if (b === undefined) {
+      out.push({ index: i, kind: 'added', role: a?.role ?? null, len: text.length, peek: text.slice(0, 160) })
+      continue
+    }
+    if (a === undefined) {
+      out.push({ index: i, kind: 'removed', role: b.role, len: b.len })
+      continue
+    }
+    if (hashOf(text) === b.hash) continue
+    out.push({
+      index: i, kind: text.length > b.len ? 'grown' : 'shrunk', role: a?.role ?? b.role,
+      beforeLen: b.len, afterLen: text.length, delta: text.length - b.len,
+      // 变长时给尾部（通常追加在末尾），变短时给头部（通常是摘要替换）
+      peek: text.length > b.len ? text.slice(-160) : text.slice(0, 160),
+    })
+  }
+  return out
+}
+
+/**
+ * 一组消息的正文净长度（只算 content，不算 JSON 字段名与工具定义）。
+ *
+ * 用它而不是 JSON 长度：bili 会在正文之外添加字段或指令，JSON 长度会变长，
+ * 但那不是压缩。只有正文真的变短、或条数变少，才说明上下文被压缩了。
+ *
+ * @param messages OpenAI messages 数组
+ * @returns 正文字符数
+ */
+function contentCharsOf(messages) {
+  if (!Array.isArray(messages)) return 0
+  return messages.reduce((sum, m) => {
+    const c = m?.content
+    if (typeof c === 'string') return sum + c.length
+    if (Array.isArray(c)) return sum + c.reduce((k, part) => k + (typeof part?.text === 'string' ? part.text.length : 0), 0)
+    return sum
+  }, 0)
+}
+
+
+/** 停服宽限：先停止监听，既有连接自然收尾；超时再强拆，避免端口长期被占。 */
+/**
+ * 在 dsh-our-free-model 的打包产物里补回「暴露加密器」那一行。
+ *
+ * 那个插件把 qoder 的加密器内联进 vendor/channel-pack/pack.js 且不导出，外部插件
+ * 拿不到它 —— 没有它就无法把「先压缩再加密」接进来。pack.js 里有一行把这个类挂到
+ * globalThis.__mfQoderEncryptor；该插件的自更新会用官方发布包整份替换 pack.js，
+ * 那一行随之消失，压缩链路就静默退回直发。
+ *
+ * 所以每次装载都检查一次：钩子不在就补上。补的是**别人的包**，因此只在确实缺失、
+ * 且能唯一定位类定义末尾时动手；结果写进 /status 的 qoderShim.hookRepair。
+ *
+ * @param packPath pack.js 的绝对路径
+ * @returns {{state: string, detail: string}} state 取 ok / repaired / skipped / failed
+ */
+function ensurePackHook(packPath) {
+  const HOOK_MARK = '__mfQoderEncryptor'
+  let text
+  try {
+    text = readFileSync(packPath, 'utf8')
+  } catch (err) {
+    return { state: 'skipped', detail: '读不到 pack.js：' + (err && err.code ? err.code : String(err)) }
+  }
+  if (text.includes(HOOK_MARK)) {
+    // 钩子还在，但引用名可能随上游重命名而失效；只提示，不改。
+    const refsClass = new RegExp('globalThis\\.' + HOOK_MARK + '\\s*=\\s*QoderEncryptedInfer\\b').test(text)
+    return refsClass
+      ? { state: 'ok', detail: '注入口已在' }
+      : { state: 'stale', detail: '注入口在，但已不指向 QoderEncryptedInfer（上游可能重命名了类）' }
+  }
+  const lines = text.split('\n')
+  // 类定义行必须唯一，找不到就不动它 —— 这是别人的包，宁可报告也不猜。
+  const declIndexes = []
+  for (let i = 0; i < lines.length; i += 1) {
+    if (/^var QoderEncryptedInfer = class\b/.test(lines[i])) declIndexes.push(i)
+  }
+  if (declIndexes.length !== 1) {
+    return { state: 'skipped', detail: '类定义行数为 ' + declIndexes.length + '（无法唯一定位）' }
+  }
+  let endIndex = -1
+  for (let i = declIndexes[0]; i < lines.length; i += 1) {
+    if (lines[i] === '};') { endIndex = i; break }
+  }
+  if (endIndex < 0) return { state: 'skipped', detail: '找不到类体结束的 };' }
+  const hook = [
+    '',
+    '// ── model-failover-manager 注入口（本地补丁，不是上游代码）──────',
+    '// 本 pack 内联了 qoder 的加密器却只当模块局部变量用，外部插件拿不到它，',
+    '// 也就无法把「先压缩再加密」接进来。这里挂到进程级槽一次；没人读它时不影响功能。',
+    'try {',
+    '  globalThis.' + HOOK_MARK + ' = QoderEncryptedInfer;',
+    '} catch { /* 只读环境，忽略 */ }',
+  ].join('\n')
+  lines.splice(endIndex + 1, 0, hook)
+  try {
+    writeFileSync(packPath, lines.join('\n'), 'utf8')
+  } catch (err) {
+    return { state: 'failed', detail: '写入失败：' + (err && err.message ? err.message.slice(0, 80) : String(err)) }
+  }
+  return { state: 'repaired', detail: '已补回注入口，从下一次宿主启动起生效' }
+}
+
+/**
+ * 找出 dsh-our-free-model 的 pack.js。与 resolveQoderWasmPath 同样从本文件向上找。
+ *
+ * @returns pack.js 绝对路径，或 null
+ */
+function resolvePackPath() {
+  for (let dir = HERE, i = 0; i < 5 && dir.length > 3; i += 1, dir = dirname(dir)) {
+    const candidate = join(dir, 'plugins', 'dsh-our-free-model', 'vendor', 'channel-pack', 'pack.js')
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
 const STOP_GRACE_MS = 2000
 
 /**
- * 造一份实现：持有一轮装载的 pending 表与计数，负责
- * （1）把 ask 截成明文 OpenAI 请求，（2）处理 bili 压缩后送回来的请求。
+ * 找出「运行时真正在用的」QoderEncryptedInfer。
  *
- * @param context.port 本机监听端口（只用于拼 origin）
- * @param context.wasmPath qoder-wasm.js 绝对路径（回传给 /status）
- * @param context.original 未被替换的 QoderEncryptedInfer#prepareInfer
- * @param context.logger Cordis logger
- * @returns 实现对象 { origin, stats, prepare, handle }
+ * ⚠️ 不能只 patch 磁盘上的 dsh-codearts-auth/lib/qoder-wasm.js：
+ * dsh-our-free-model 把整个 qoder adapter + wasm 源码**内联打包**进了自己的
+ * vendor/channel-pack/pack.js，并在那里注册 qoder / qodercn。运行时真正在跑的
+ * QoderEncryptedInfer 是 pack.js 里那份拷贝 —— 实测给独立包打补丁后，真实请求
+ * 照发加密端点（tap 抓到），而补丁计数始终为 0。
+ *
+ * 所以这里从 llm 注册表拿**已注册的 adapter 实例**，直接补它的原型；再退回磁盘模块
+ * 兜底（有些装机方式下 qoder 不由 our-free-model 接管）。
+ *
+ * @param ctx Cordis 上下文
+ * @param wasmPath 磁盘上的 qoder-wasm.js 绝对路径（可为 null）
+ * @returns 目标列表与诊断说明
+ */
+async function collectTargets(ctx, wasmPath) {
+  const targets = []
+  const notes = []
+  const seen = new Set()
+  const push = (label, holder) => {
+    if (holder === null || holder === undefined || seen.has(holder)) return
+    let original
+    try { original = holder.prepareInfer } catch (err) { notes.push(label + ' 读取 prepareInfer 失败：' + (err && err.message ? err.message.slice(0, 60) : String(err))); return }
+    if (typeof original !== 'function') return
+    seen.add(holder)
+    targets.push({ label, holder, original })
+  }
+
+  // 磁盘上的独立包（有些装机方式下 qoder 不由 our-free-model 接管）。
+  if (typeof wasmPath === 'string' && wasmPath.length > 0) {
+    let real = wasmPath
+    try { real = realpathSync(wasmPath) } catch { real = wasmPath }
+    const urls = new Set([
+      pathToFileURL(real).href,
+      pathToFileURL(real.replace(/^[A-Z]:/, (m) => m.toLowerCase())).href,
+    ])
+    for (const url of urls) {
+      try {
+        const mod = await import(url)
+        const Cls = mod.QoderEncryptedInfer
+        if (typeof Cls === 'function') push('wasm:' + url.slice(-40), Cls.prototype)
+      } catch (err) {
+        notes.push('载入失败 ' + url.slice(-40) + ' :: ' + (err && err.code ? err.code : String(err)))
+      }
+    }
+  }
+
+  // 优先：宿主进程里由 dsh-our-free-model 暴露出来的加密器（见 pack.js 的注入口）。
+  // 这是唯一能拿到「内联打包那份」的方式：它是模块局部变量，不导出、也不在对象图上。
+  try {
+    const exposed = globalThis.__mfQoderEncryptor
+    if (typeof exposed === 'function' && exposed.prototype !== undefined) {
+      push('pack:__mfQoderEncryptor', exposed.prototype)
+    } else if (exposed !== undefined) {
+      notes.push('globalThis.__mfQoderEncryptor 存在但不是类（' + typeof exposed + '）')
+    }
+  } catch (err) {
+    notes.push('读取 __mfQoderEncryptor 失败：' + (err && err.message ? err.message.slice(0, 60) : String(err)))
+  }
+
+  // 注册表里的实际 adapter：只用来装「传送门」——见 installPortals。
+  const adapters = []
+  let registry = null
+  try { registry = ctx?.get?.('llm')?.adapters ?? null } catch { registry = null }
+  for (const id of ['qoder', 'qodercn']) {
+    let reg = null
+    try { reg = registry === null ? null : registry.get?.(id) } catch { reg = null }
+    const adapter = reg === null || reg === undefined ? null : (reg.adapter ?? reg)
+    if (adapter === null) { notes.push('注册表里没有 ' + id + ' adapter'); continue }
+    adapters.push({ id, adapter })
+  }
+
+  return { targets, notes, adapters }
+}
+/**
+ * 造一份实现：持有一轮装载的 pending 表，负责把 ask 截成明文 OpenAI 请求，
+ * 以及处理 bili 压缩后送回来的请求。stats 由调用方传入（跨重载共享）。
+ *
+ * @param context.port 本机监听端口
+ * @param context.stats 共享计数对象
+ * @returns 实现对象 { origin, prepare, handle }
  */
 function createImpl(context) {
   const origin = 'http://127.0.0.1:' + context.port
-  const original = context.original
+  const stats = context.stats
   const pending = new Map()
-  const stats = {
-    enabled: true,
-    installed: true,
-    port: context.port,
-    wasmPath: context.wasmPath,
-    intercepted: 0,
-    forwarded: 0,
-    compacted: 0,
-    fallback: 0,
-    lastError: null,
-    lastAt: null,
-  }
 
   const sweep = () => {
     const now = Date.now()
@@ -161,7 +374,7 @@ function createImpl(context) {
     }
   }
 
-  /** 用原始 prepareInfer 加密，并用 node:https 直连上游（绕开 bili，避免被二次改写），SSE 原样穿回。 */
+  /** 用该实例自己的原始 prepareInfer 加密，node:https 直连上游，SSE 原样穿回。 */
   const forward = (real, res) => {
     const target = new URL(real.url)
     const transport = target.protocol === 'https:' ? https : http
@@ -193,21 +406,32 @@ function createImpl(context) {
     upstream.end(real.body)
   }
 
-  /**
-   * 顶掉 QoderEncryptedInfer#prepareInfer：正常的 qoder 上游请求被换成指向本机 shim
-   * 的明文 OpenAI 请求（路径以 /chat/completions 结尾，bili 才认）。任何异常都退回原实现。
-   */
-  const prepare = (self, ask) => {
+  /** 把一次 ask 换成指向本机 shim 的明文 OpenAI 请求。 */
+  const prepare = (self, ask, original) => {
     let rid = null
     try {
       const body = askToOpenAiBody(ask)
       if (!Array.isArray(body.messages) || body.messages.length === 0) throw new Error('empty messages')
       rid = randomUUID()
-      pending.set(rid, { self, ask, at: Date.now(), used: 0, sentMessages: body.messages.length, sentChars: JSON.stringify(body.messages).length })
+      pending.set(rid, {
+        self, ask, original, at: Date.now(), used: 0,
+        sentMessages: body.messages.length,
+        sentChars: JSON.stringify(body.messages).length,
+        sentContent: contentCharsOf(body.messages),
+        // 留存发出去的正文指纹，供 handle 逐条比对（只留哈希与长度，省内存）
+        sentList: body.messages.map((m) => ({ role: m?.role, len: contentOf(m).length, hash: hashOf(contentOf(m)) })),
+      })
       sweep()
       stats.intercepted += 1
+      // bili 是否把它的压缩工具放进了这次请求 —— 这是「压缩链路真的接上了」的直接证据，
+      // 因为 bili 不会给不经它转发的请求注入任何工具。
+      try {
+        const names = Array.isArray(body.tools) ? body.tools.map((t) => String(t?.function?.name ?? t?.name ?? '')) : []
+        stats.lastPreparedTools = names.slice(0, 12)
+        stats.lastPreparedBiliTools = names.filter((n) => /bili/i.test(n))
+        stats.lastPreparedSystemChars = contentOf(body.messages[0]).length
+      } catch { /* 诊断字段，失败不影响转发 */ }
       return {
-        // rid 放在路径里而不是 query：中继层可能改写或剥离查询串，路径段更稳。
         url: origin + '/qoder/' + rid + '/chat/completions',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
@@ -220,7 +444,7 @@ function createImpl(context) {
     }
   }
 
-  /** 接住 bili 压缩后的明文请求：重建 ask → 重新加密 → 直连上游。 */
+  /** 接住 bili 压缩后的明文请求：重建 ask → 用同一实例重新加密 → 直连上游。 */
   const handle = (req, res) => {
     const url = new URL(req.url === undefined ? '/' : req.url, origin)
     if (req.method !== 'POST' || !url.pathname.endsWith('/chat/completions')) {
@@ -235,25 +459,48 @@ function createImpl(context) {
       const fromPath = segments.length >= 3 ? segments[segments.length - 3] : ''
       const rid = fromPath !== '' ? fromPath : url.searchParams.get('rid')
       const entry = rid === null ? undefined : pending.get(rid)
-      // 不删条目：adapter 遇到 409 duplicate_request / 排队后会**原样重发**同一个请求，
-      // 那时 rid 必须还能命中，否则重试会变成 410。条目只由 TTL 与容量淘汰。
-      if (entry !== undefined) entry.used += 1
       if (entry === undefined) {
         stats.fallback += 1
         res.writeHead(410, { 'content-type': 'application/json' })
         res.end('{"error":{"type":"qoder_shim_rid_expired"}}')
         return
       }
+      // 不删条目：adapter 遇到 409 duplicate_request / 排队后会原样重发，rid 必须还能命中。
+      entry.used += 1
       let body = null
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { body = null }
       const messages = body !== null && Array.isArray(body.messages) ? body.messages : null
-      if (messages !== null && (messages.length !== entry.sentMessages || JSON.stringify(messages).length !== entry.sentChars)) {
-        stats.compacted += 1
+      const gotChars = messages === null ? 0 : JSON.stringify(messages).length
+      const gotCount = messages === null ? 0 : messages.length
+      const gotContent = contentCharsOf(messages)
+      // 「压缩过」= bili 真的改写了 messages。留一份可核对的样本，否则看不出
+      // 是压缩接上了，还是 bili 只是原样透传。
+      const changed = messages !== null && (gotCount !== entry.sentMessages || gotChars !== entry.sentChars)
+      const shrank = gotContent < entry.sentContent
+      if (changed) stats.compacted += 1
+      // 两种「改动」要分开计：bili 注入系统提示也会让 messages 变，那不是压缩。
+      // 只有正文真的变短（folded）才说明上下文被压下来了。
+      if (shrank) stats.folded += 1
+      stats.lastExchange = {
+        rid,
+        at: Date.now(),
+        changed,
+        beforeCount: entry.sentMessages,
+        afterCount: gotCount,
+        beforeChars: entry.sentChars,
+        afterChars: gotChars,
+        // 正文长度与条数才是压缩的证据；JSON 长度变长通常意味着 bili 加了别的东西。
+        beforeContent: entry.sentContent,
+        afterContent: gotContent,
+        contentShrank: gotContent < entry.sentContent,
+        // 逐条比对：哪几条被改、怎么改的。bili 只在正文里加东西时 JSON 长度会变长，
+        // 但条数与正文长度不变 —— 那不是压缩，看 diff 就能分辨。
+        diff: messages === null ? [] : diffMessages(entry.sentList, messages).slice(0, 8),
       }
       const nextAsk = body === null ? null : applyCompressedBody(entry.ask, body)
       let real = null
       try {
-        real = original.call(entry.self, nextAsk === null ? entry.ask : nextAsk)
+        real = entry.original.call(entry.self, nextAsk === null ? entry.ask : nextAsk)
       } catch (err) {
         stats.fallback += 1
         stats.lastError = '重新加密失败：' + (err && err.message ? err.message : String(err))
@@ -267,71 +514,153 @@ function createImpl(context) {
     })
   }
 
-  return { origin, stats, prepare, handle }
+  return { origin, prepare, handle }
+}
+
+
+/**
+ * 给已注册的 adapter 实例换掉 fetchImpl：这是唯一不依赖「拿到加密器类」的接缝。
+ *
+ * dsh-our-free-model 把 qoder adapter + wasm 内联进 pack.js，加密器类是模块局部变量
+ * 且对象图被 Cordis 访问守卫包住，拿不到原型。但 adapter.sendEncrypted 最终调用
+ * `this.fetchImpl(url, init)` —— 换成我们自己的即可在**加密之后**接管请求。
+ *
+ * 代价：拿到的是**当前请求的最终 URL**，body 已是被上游协议要求的样子，所以这条路
+ * 只用来**观测**（例如确认请求到底走向 shim 还是直连加密端点），不参与压缩。
+ *
+ * @param adapters collectTargets 找到的 adapter 列表
+ * @param stats 共享计数
+ * @returns 卸载函数数组
+ */
+function installPortals(adapters, stats) {
+  const restores = []
+  for (const item of adapters) {
+    const adapter = item.adapter
+    let current
+    try { current = adapter.fetchImpl } catch { continue }
+    if (current === undefined || current === null || current.__mfPortal === true) continue
+    const original = current
+    const portal = async function mfQoderShimPortal(url, init) {
+      stats.seenRequests += 1
+      stats.lastRequestUrl = String(url).slice(0, 100)
+      return original.call(this, url, init)
+    }
+    portal.__mfPortal = true
+    try {
+      adapter.fetchImpl = portal
+      restores.push(() => { try { adapter.fetchImpl = original } catch { /* 卸载期忽略 */ } })
+      stats.portals = (stats.portals === undefined ? 0 : stats.portals) + 1
+    } catch { /* 只读实例，跳过 */ }
+  }
+  return restores
 }
 
 /**
- * 启动 qoder 压缩 shim：替换 QoderEncryptedInfer#prepareInfer，并监听一个本机端口
- * 承接 bili 压缩后的明文请求。同端口重复调用视为热替换：服务器与补丁保持不动，
- * 只把请求处理换成新实现，因此改造 shim 代码后重载插件即可生效，且不会打断连接。
+ * 启动 qoder 压缩 shim。同端口重复调用是热替换：服务器与计数保持不动，只把请求
+ * 处理换成新实现，所以改完 shim 代码重载插件即可生效，也不会打断既有连接。
  *
+ * @param options.ctx Cordis 上下文（用于从 llm 注册表取真实 adapter 类）
  * @param options.logger Cordis logger
  * @param options.port 本机监听端口（127.0.0.1）
- * @param options.wasmPath 可选，qoder-wasm.js 绝对路径
+ * @param options.wasmPath 可选，磁盘上的 qoder-wasm.js 绝对路径
  * @returns 句柄：{ status(), stop() }；stop 是幂等的 async
  */
 export async function startQoderShim(options) {
-  const logger = options === undefined ? undefined : options.logger
-  const port = Number.isInteger(options.port) && options.port > 0 && options.port < 65536 ? options.port : 47001
-  const wasmPath = resolveQoderWasmPath(options.wasmPath)
-  const info = (text) => {
-    if (logger !== undefined && typeof logger.info === 'function') logger.info(text)
-  }
-  /** 装不上时的空手柄：只回报原因，不打断 qoder 的正常使用。 */
+  const opts = options === undefined ? {} : options
+  const ctx = opts.ctx
+  const logger = opts.logger
+  const port = Number.isInteger(opts.port) && opts.port > 0 && opts.port < 65536 ? opts.port : 47001
+  const wasmPath = resolveQoderWasmPath(opts.wasmPath)
+  const info = (text) => { if (logger !== undefined && typeof logger.info === 'function') logger.info(text) }
+
   const inert = (reason) => {
     const stats = {
-      enabled: false,
-      installed: false,
-      port,
+      enabled: false, installed: false, port,
       wasmPath: wasmPath === null ? null : wasmPath,
-      intercepted: 0,
-      forwarded: 0,
-      compacted: 0,
-      fallback: 0,
-      lastError: reason,
-      lastAt: null,
+      intercepted: 0, forwarded: 0, compacted: 0, folded: 0, fallback: 0,
+      lastError: reason, lastAt: null, targets: [], seenRequests: 0, portals: 0,
+      hookRepair,
     }
     return { status: () => ({ ...stats }), stop: () => {} }
   }
-  if (wasmPath === null) return inert('qoder-wasm.js 未找到（可用 qoderShimWasmPath 指定绝对路径）')
 
-  const wasm = await import(pathToFileURL(wasmPath).href)
-  const QoderEncryptedInfer = wasm.QoderEncryptedInfer
-  if (typeof QoderEncryptedInfer !== 'function' || typeof QoderEncryptedInfer.prototype.prepareInfer !== 'function') {
-    return inert('qoder-wasm.js 里没有 QoderEncryptedInfer#prepareInfer（版本不兼容）')
+  // 内联打包那份加密器只能靠 pack.js 里的注入口拿到。那个包会被它自己的自更新
+  // 整份替换，钩子随之消失，所以每次装载都核对一次并在缺失时补回去。
+  let hookRepair = { state: 'n/a', detail: '无需注入口' }
+  const needsHook = (() => {
+    try { return typeof globalThis.__mfQoderEncryptor !== 'function' } catch { return true }
+  })()
+  if (needsHook) {
+    const packPath = resolvePackPath()
+    hookRepair = packPath === null
+      ? { state: 'skipped', detail: '没找到 dsh-our-free-model/vendor/channel-pack/pack.js' }
+      : ensurePackHook(packPath)
   }
 
-  const proto = QoderEncryptedInfer.prototype
-  const previous = globalThis[STATE_KEY]
-  const original = previous !== undefined ? previous.original : proto.prepareInfer
-  const impl = createImpl({ port, wasmPath, original, logger })
+  const collected = await collectTargets(ctx, wasmPath)
+  if (collected.targets.length === 0) {
+    return inert('找不到可打补丁的 QoderEncryptedInfer' + (collected.notes.length > 0 ? '：' + collected.notes.join('; ') : ''))
+  }
 
-  // 同端口热替换：监听与补丁都不动，只换实现指针 —— 连接不重建，客户端不会撞 ECONNRESET。
-  if (previous !== undefined && previous.port === port) {
+  const previous = globalThis[STATE_KEY]
+  const stats = previous !== undefined && previous.stats !== undefined
+    ? previous.stats
+    : {
+        enabled: true, installed: true, port, wasmPath,
+        intercepted: 0, forwarded: 0, compacted: 0, folded: 0, fallback: 0,
+        lastError: null, lastAt: null, targets: [], seenRequests: 0, portals: 0,
+      }
+  if (typeof stats.folded !== 'number') stats.folded = 0
+  stats.enabled = true
+  stats.installed = true
+  stats.port = port
+  stats.wasmPath = wasmPath
+  stats.targets = collected.targets.map((t) => t.label)
+  stats.notes = collected.notes
+  stats.hookRepair = hookRepair
+
+  const impl = createImpl({ port, stats })
+
+  /**
+   * 装 dispatcher（幂等）。dispatcher 不随重载更换：它只读全局状态槽，重载时换掉
+   * 槽里的 impl 就生效，因此 stop() 能可靠还原，也不会层层套娃。
+   */
+  const ensureDispatcher = (entry) => {
+    if (entry.fn === undefined) {
+      entry.fn = function mfQoderShimDispatch(ask) {
+        const state = globalThis[STATE_KEY]
+        if (state === undefined) return entry.box.original.call(this, ask)
+        return state.impl.prepare(this, ask, entry.box.original)
+      }
+    }
+    if (entry.holder.prepareInfer !== entry.fn) entry.holder.prepareInfer = entry.fn
+  }
+
+  const patched = previous !== undefined && Array.isArray(previous.patched) ? previous.patched : []
+  for (const t of collected.targets) {
+    const existing = patched.find((p) => p.label === t.label)
+    if (existing === undefined) {
+      const entry = { label: t.label, holder: t.holder, box: { original: t.original }, fn: undefined }
+      ensureDispatcher(entry)
+      patched.push(entry)
+    } else {
+      existing.holder = t.holder
+      existing.box.original = t.original
+      ensureDispatcher(existing)
+    }
+  }
+
+  // 无论有没有打到类，都给真实 adapter 装传送门（诊断 + 覆盖率证明）。
+  const portals = installPortals(collected.adapters, stats)
+
+  if (previous !== undefined && previous.port === port && previous.server !== undefined) {
     previous.impl = impl
-    info('[model-failover] qoder 压缩 shim 已热替换实现（继续复用 127.0.0.1:' + port + '）')
-    return { status: () => ({ ...impl.stats }), stop: previous.stop }
+    previous.patched = patched
+    info('[model-failover] qoder 压缩 shim 已热替换实现（继续复用 127.0.0.1:' + port + '，覆盖 ' + patched.length + ' 个目标）')
+    return { status: () => ({ ...stats }), stop: previous.stop }
   }
   if (previous !== undefined) await previous.stop()
 
-  const patched = function mfQoderShimDispatch(ask) {
-    const state = globalThis[STATE_KEY]
-    if (state === undefined) return original.call(this, ask)
-    return state.impl.prepare(this, ask)
-  }
-  proto.prepareInfer = patched
-
-  // 分发到「当前实现」，这样热替换后新代码立即生效。
   const server = http.createServer((req, res) => {
     const state = globalThis[STATE_KEY]
     const current = state === undefined ? impl : state.impl
@@ -339,11 +668,14 @@ export async function startQoderShim(options) {
   })
 
   let stopped = false
-  /** 退场：还原 prototype、停止监听。幂等；既有连接给 STOP_GRACE_MS 自然收尾再强拆。 */
+  /** 退场：把 dispatcher 换回原始实现、停止监听。幂等。 */
   const stop = async () => {
     if (stopped) return
     stopped = true
-    try { if (proto.prepareInfer === patched) proto.prepareInfer = original } catch { /* 还原失败不影响进程退出 */ }
+    for (const p of patched) {
+      try { if (p.holder !== undefined && p.holder.prepareInfer === p.fn) p.holder.prepareInfer = p.box.original } catch { /* 还原失败不影响进程退出 */ }
+    }
+    for (const restore of portals) { try { restore() } catch { /* 同上 */ } }
     try {
       const state = globalThis[STATE_KEY]
       if (state !== undefined && state.stop === stop) delete globalThis[STATE_KEY]
@@ -363,8 +695,8 @@ export async function startQoderShim(options) {
   }
 
   await new Promise((done) => { server.listen(port, '127.0.0.1', done) })
-  globalThis[STATE_KEY] = { port, wasmPath, proto, original, patched, impl, server, stop }
-  info('[model-failover] qoder 压缩 shim 已监听 127.0.0.1:' + port + '（明文经 bili 压缩后再加密发往上游）')
+  globalThis[STATE_KEY] = { port, wasmPath, stats, impl, patched, portals, server, stop }
+  info('[model-failover] qoder 压缩 shim 已监听 127.0.0.1:' + port + '（明文经 bili 压缩后再加密发往上游；覆盖 ' + patched.length + ' 个目标：' + stats.targets.join(', ') + '）')
 
-  return { status: () => ({ ...impl.stats }), stop }
+  return { status: () => ({ ...stats }), stop }
 }

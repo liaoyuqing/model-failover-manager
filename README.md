@@ -75,6 +75,21 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 为什么不做响应方向的协议翻译：qoder 的响应本来就是 OpenAI 形状的 SSE 包了一层信封，adapter 自己会拆；这边只动请求方向。
 
+#### 补丁打在哪个加密器上
+
+这是整件事最容易踩空的地方：**运行时真正在用的 `QoderEncryptedInfer` 不是 `dsh-codearts-auth` 里的那份**。`dsh-our-free-model` 把整个 qoder adapter 与 WASM 桥**内联打包**进自己的 `vendor/channel-pack/pack.js` 并在那里注册 `qoder` / `qodercn` —— 它是模块局部变量，不导出、也不在任何可遍历的对象图上（Cordis 的访问守卫还会挡住对 adapter 对象图的读取）。给独立包打补丁后，真实请求照发加密端点，而计数一直是 0。
+
+所以 shim 按三条线索找目标，命中几条打几条：
+
+| 线索 | 何时命中 |
+| --- | --- |
+| `globalThis.__mfQoderEncryptor` | `pack.js` 里带注入口（本插件会补这一行） |
+| 磁盘上 `dsh-codearts-auth/lib/qoder-wasm.js` | 有些装机方式下 qoder 不由 `dsh-our-free-model` 接管 |
+
+⚠️ 注意同一文件的两个 URL 变体（Windows 盘符大小写 `file:///D:/` 与 `file:///d:/`）在 Node 的 ESM 缓存里是**两个不同的模块实例**，各有一份类。shim 会逐个 import 并全部打补丁，所以 `/status.qoderShim.targets` 里通常能看到两条 `wasm:` 加一条 `pack:`。
+
+**注入口会被升级覆盖**：`dsh-our-free-model` 的自更新会用官方发布包整份替换 `pack.js`，那一行随之消失。所以 shim 每次装载都核对一次，缺失时自动补回，结果写在 `/status.qoderShim.hookRepair`；补的是别人的包，因此只在**确实缺失且能唯一定位类定义末尾**时动手，定位不唯一就只报告不动文件。
+
 三个配置项：
 
 | 键 | 默认 | 说明 |
@@ -131,15 +146,28 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 "qoderShim": {
   "enabled": true, "installed": true, "port": 47001,
   "wasmPath": "…/dsh-codearts-auth/lib/qoder-wasm.js",
-  "intercepted": 12, "forwarded": 12, "compacted": 4, "fallback": 0,
+  "targets": ["wasm:…qoder-wasm.js", "wasm:…qoder-wasm.js", "pack:__mfQoderEncryptor"],
+  "intercepted": 12, "forwarded": 12, "compacted": 12, "folded": 4, "fallback": 0,
+  "hookRepair": { "state": "ok", "detail": "注入口已在" },
+  "portals": 2, "seenRequests": 12,
+  "lastExchange": {
+    "beforeCount": 1045, "afterCount": 302,
+    "beforeContent": 1209786, "afterContent": 337396,
+    "contentShrank": true, "changed": true, "diff": [ … ]
+  },
   "lastError": null, "lastAt": 1730000000000
 }
 ```
 
-- `intercepted`：被截下来改道的 `prepareInfer` 次数；`forwarded`：成功重新加密并发出上游的次数。
-- `compacted`：其中 bili 真的压缩过（回来的 `messages` 与发出去的不一样）的次数——这个数大于 0 才说明压缩这一次真的接上了。
+- `intercepted` / `forwarded`：被截下来改道的次数、成功重新加密并发出上游的次数。两者相差说明有请求在还原阶段失败，看 `fallback` 与 `lastError`。
+- `compacted`：回来的 `messages` 与发出去的不一样（含 bili 注入系统提示）的次数。
+- `folded`：**其中正文真的变短**的次数。这是「上下文被压下来了」的证据；只看 `compacted` 会被 bili 注入的提示词误导，它也会让 `messages` 变。
+- `lastExchange`：最近一次往返的对照，`beforeContent` / `afterContent` 是正文净长度（只算 `content`，不算 JSON 字段名与工具定义），`diff` 逐条列出哪几条消息被改、长了还是短了。
 - `fallback`：退回直发的次数（`ask` 形状不合法、重新加密失败、`rid` 过期等），配 `lastError` 看原因。
-- `installed`：`prepareInfer` 补丁装成功了没有；`false` 时 `lastError` 说明为什么（模块找不到、导出对不上）。
+- `installed`：补丁装成功了没有；`false` 时 `lastError` 说明为什么。
+- `targets`：实际打了补丁的目标。出现 `pack:__mfQoderEncryptor` 才说明接管了运行时真正在跑的那份加密器。
+- `hookRepair`：`pack.js` 注入口的检查结果。`repaired` 表示刚补回（下一次宿主启动生效）。
+- `portals` / `seenRequests`：在 adapter 的 `fetchImpl` 上装的观测点数量与经过它的请求数。它只用来确认「请求到底走向 shim 还是直连加密端点」，不参与压缩。
 
 ## 安装
 
@@ -152,7 +180,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```yaml
 - insert:
     - id: model-failover-manager
-      name: ./plugins/model-failover-manager/host.v26.mjs
+      name: ./plugins/model-failover-manager/host.v57.mjs
 ```
 
 ### DSH 版本要求
@@ -230,19 +258,20 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v26.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线） |
-| `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游 |
+| `host.v57.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线） |
+| `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回 |
 | `client.js` | 浏览器半（DSH dynamic client bundle） |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v25.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v26.mjs`。宿主文件内容一变就换文件名，因为 Loader 按路径缓存 ESM |
+| `host.mjs`、`host.v2.mjs` … `host.v56.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v57.mjs`。宿主文件内容一变就换文件名，因为 Loader 按路径缓存 ESM |
 
 ## 已知限制
 
 - 依赖 DSH 的 `slots`、`modelDirectories`、`sessions`、`remote`、`remote.session` 服务与 `agent/request-error` 事件；宿主接口变动时需同步跟进。
 - 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
+- qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 
 ## English
 
@@ -254,7 +283,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model.
 - For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
-- Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
+- Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
 
 ## License
