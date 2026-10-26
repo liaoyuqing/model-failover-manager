@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v66'
+const HOST_VERSION = 'v70'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -414,7 +414,35 @@ export function apply(ctx, config = {}) {
   })()
   /** @type {{ key: string; day: string; count: number; provider: string; model: string }[]} */
   let failedList = readJson(failedFile, [])
-  let settings = Object.assign({ dialogMode: false }, readJson(settingsFile, {}))
+  // metricsSort：数据看板上次使用的排序（{ key, dir } 或 null = 默认序）。
+  // 存在 settings.json 里而不是浏览器 localStorage：同一台宿主的多个浏览器
+  // 与刷新后的页面都看到同一份排序，换机器也不会各记一套。
+  let settings = Object.assign({ dialogMode: false, metricsSort: null }, readJson(settingsFile, {}))
+
+  /**
+   * 看板排序列的合法键。与 client.js 的 metricsSortValue 一一对应；
+   * 加列时两边一起改，否则旧值会因为「认不出」被静默丢掉。
+   */
+  const METRICS_SORT_KEYS = new Set(['model', 'rate', 'ttft', 'tps', 'tokens', 'conc', 'status'])
+
+  /**
+   * 校验并规整一个看板排序值。
+   *
+   * 落盘的是用户上次点表头的结果，坏值不该让插件起不来：认不出的键或方向一律
+   * 当成「没有排序」（null），页面回到默认序，用户再点一次就好。
+   *
+   * @param {unknown} raw - settings.json 或请求体里的原始值。
+   * @returns {{key: string, dir: 'asc'|'desc'}|null} 规整后的排序，或 null。
+   */
+  function normalizeMetricsSort(raw) {
+    if (raw === null || raw === undefined) return null
+    if (typeof raw !== 'object' || Array.isArray(raw)) return null
+    const key = typeof raw.key === 'string' ? raw.key : ''
+    if (!METRICS_SORT_KEYS.has(key)) return null
+    return { key, dir: raw.dir === 'desc' ? 'desc' : 'asc' }
+  }
+
+  settings.metricsSort = normalizeMetricsSort(settings.metricsSort)
   let disposed = false
   // 压缩 shim 的句柄：声明在这里，因为「压缩旁路守卫」的路由判断要读它（见 qoderShimCovers）
   let qoderShimHandle = null
@@ -607,6 +635,23 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * 上游用来表达「这条请求本身有问题」的机器码。
+   *
+   * 各家名字不一样：宿主会给出 CONTEXT_WINDOW_EXCEEDED / INVALID_ARGS，而上游可能
+   * 直接把自己的码透传上来（例如 loomy 的 INVALID_REQUEST 配 400 与「内容太长了，
+   * 请精简输入或开启新对话」）。它们指向同一件事，处置也必须是同一件：换模型——
+   * 而不是换账号重试（同一个上限），也不是把模型停用一整天（换个请求它还能用）。
+   */
+  const REQUEST_REJECTED_CODES = new Set([
+    'CONTEXT_WINDOW_EXCEEDED',
+    'INVALID_ARGS',
+    'INVALID_REQUEST',
+    'CONTEXT_LENGTH_EXCEEDED',
+    'MAX_TOKENS_EXCEEDED',
+    'CONTENT_TOO_LONG',
+  ])
+
+  /**
    * 这个失败是不是「这条请求本身有问题」，换账号/原地重试都不会改变结果。
    *
    * 典型是上游按参数拒绝：输入超过模型上下文上限、请求体不合法、模型不支持该模态。
@@ -615,10 +660,13 @@ export function apply(ctx, config = {}) {
    * 上限还是那个上限，重试只会白等。
    *
    * 判据取机器码与上游文案两条，任一命中即算：
-   *  · 宿主规范化码：CONTEXT_WINDOW_EXCEEDED / INVALID_ARGS / EMPTY_RESPONSE 之外的
-   *    参数类错误；
+   *  · 宿主规范化码与上游参数类码：见 REQUEST_REJECTED_CODES；
    *  · 上游文案：context/length 超限、prompt is too long、input too long、
+   *    中文的「超过模型上限」与「内容太长了，请精简输入或开启新对话」，
    *    以及 adapter 把 400 归成 `client` 时附带的那句「按参数拒绝」。
+   *
+   * 判据要收在「这条请求超限/不合法」上：普通 400（请求体写坏、上游网关拒绝）
+   * 仍按当日失败处理，否则一个真坏掉的模型会被无限换着重试。
    *
    * @param {{code?: string, status?: number, message?: string}|undefined} failure - 宿主给出的失败事实。
    * @returns {boolean} 命中则为 true。
@@ -626,11 +674,14 @@ export function apply(ctx, config = {}) {
   function isRequestRejectedFailure(failure) {
     if (!failure) return false
     const code = String(failure.code ?? '').toUpperCase()
-    if (code === 'CONTEXT_WINDOW_EXCEEDED' || code === 'INVALID_ARGS') return true
+    if (REQUEST_REJECTED_CODES.has(code)) return true
     const message = String(failure.message ?? '')
     if (/prompt is too long|input (?:is )?too long|context[ _-](?:length|window)/i.test(message)) return true
+    if (/maximum context length|exceed(?:s|ed|ing)? .{0,20}(?:context|token)/i.test(message)) return true
     // 「本次输入加上历史对话超过了模型上限」这类只有中文的上游文案
     if (/超过(?:了)?模型(?:的)?上限|输入.{0,6}超.{0,4}上限/.test(message)) return true
+    // 上游把上下文超限说成「内容太长了」：换号与原地重试都无效，只能换窗口更大的模型
+    if (/内容太[长多]|对话.{0,8}太[长多]|请精简(?:输入|上下文)|开启新对话/.test(message)) return true
     // 被上游按参数拒绝：与网络/账号/额度无关，换号无效
     if (/被上游按参数拒绝|该请求被上游(?:按参数)?拒绝/.test(message)) return true
     return false
@@ -745,6 +796,12 @@ export function apply(ctx, config = {}) {
     const inTok = numbers(s => s.inTokens)
     const outTok = numbers(s => s.outTokens)
     const tokenSamples = list.filter(s => typeof s.inTokens === 'number' || typeof s.outTokens === 'number').length
+    // 历史（全量）token 用量：不随日期筛选变化。看板上它是大字主值——用户要的是
+    // 「这个模型一共用掉多少 token」，区间内用量只作副行参考。分母用全部样本，
+    // 所以这里单独再算一遍，不能复用区间内的聚合。
+    const lifetimeIn = all.map(s => s.inTokens).filter(v => typeof v === 'number').reduce((a, b) => a + b, 0)
+    const lifetimeOut = all.map(s => s.outTokens).filter(v => typeof v === 'number').reduce((a, b) => a + b, 0)
+    const lifetimeTokenSamples = all.filter(s => typeof s.inTokens === 'number' || typeof s.outTokens === 'number').length
     const pick = (arr, q) => {
       if (arr.length === 0) return null
       const sorted = [...arr].sort((a, b) => a - b)
@@ -766,6 +823,9 @@ export function apply(ctx, config = {}) {
       inTokens: inTok.reduce((a, b) => a + b, 0),
       outTokens: outTok.reduce((a, b) => a + b, 0),
       tokenSamples,
+      lifetimeInTokens: lifetimeIn,
+      lifetimeOutTokens: lifetimeOut,
+      lifetimeTokenSamples,
       lastAt: list.length === 0 ? null : list[list.length - 1].at,
       lastErrorCode,
     }
@@ -1071,21 +1131,30 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * 无会话绑定时，从当前模型所属分组里找优先级不低于它的可路由模型。
+   * 无会话绑定时，从当前模型所属分组里找可路由的替代模型。
    *
-   * 在第一处包含当前模型的分组上就给出结论（哪怕结论是没有候选），
-   * 与旧行为一致：不跨组兜底，避免用户把一个模型放进多个组时被换到无关链路。
+   * 两轮扫描，都是为了「报错就一定要有去处」：
+   *  1. 先找**优先级不差于当前模型**的候选（`priority` 数字越小越优先）；
+   *  2. 一个都挑不出来时放宽到整组——宁可降级，也不要因为「更优的候选恰好都在
+   *     当日失败/时段外/已过期」而原地不动，那正是「报错了却不自动路由」。
+   *
+   * 同一个模型可能同时属于多个分组，所以第一轮不因「某个分组挑不出候选」就收手：
+   * 「第一处命中即返回」的旧行为让排在前面那个分组成了隐形上限。
    */
   function findFailover(currentProvider, currentModel) {
+    const isSelf = (cand) => cand.provider === currentProvider && cand.model === currentModel
+    const holdsCurrent = (group) => group.models.some(m => m.provider === currentProvider && m.model === currentModel)
     for (const group of groups) {
-      if (!group.enabled) continue
+      if (!group.enabled || !holdsCurrent(group)) continue
       const self = group.models.find(m => m.provider === currentProvider && m.model === currentModel)
-      if (!self) continue
-      const limit = self.priority ?? 99
-      return pickCandidate(sortedModels(group.id).filter((cand) => {
-        if (cand.provider === currentProvider && cand.model === currentModel) return false
-        return (cand.priority ?? 99) <= limit
-      }))
+      const limit = self?.priority ?? 99
+      const preferred = pickCandidate(sortedModels(group.id).filter((cand) => !isSelf(cand) && (cand.priority ?? 99) <= limit))
+      if (preferred) return preferred
+    }
+    for (const group of groups) {
+      if (!group.enabled || !holdsCurrent(group)) continue
+      const relaxed = pickCandidate(sortedModels(group.id).filter((cand) => !isSelf(cand)))
+      if (relaxed) return relaxed
     }
     return null
   }
@@ -1957,6 +2026,130 @@ export function apply(ctx, config = {}) {
     } catch { /* 诊断记录绝不影响主流程 */ }
   }
 
+  /* ============ 失败后的共同处置：标记失败 → 换下一个模型 → 排队续跑 ============ */
+  //
+  // 两个入口共用这一段，语义必须一致：agent/request-error（流已经开起来、随后以
+  // error/aborted 结束）与 agent/error（请求还没起来就抛出，见文件后面的监听器）。
+  // 一次失败被两条入口各处置一次，会话就会连跳两个模型。
+  //
+  // 调用方负责先解析出 provider/model，并处理「与本次请求有关」的分支：
+  // codearts 账号池自愈、Our Free Model 的换账号重试。
+  //
+  // @param {any} agent - 失败的 Agent。
+  // @param {string} provider - 这次失败实际用的 provider。
+  // @param {string} model - 这次失败实际用的 model。
+  // @param {any} failure - 结构化失败（{code, message}）。
+  // @param {number|undefined} turn - 本轮序号；写进 errorTurns 供 turn-stopping 判别。
+  // @param {object|null} compressionGap - noteCompressionGap 的结果，只用于诊断标注。
+  // @param {{id: string, revision: number}|null} [goalRef] - 调用方在进入本函数前抓下的 goal ref；
+  //   省略时在本函数内读。agent/error 那条入口必须在 await 之前抓（见下面的监听器）。
+  // @returns {Promise<string>} 处置结果：switched / capacity-switched / rejected-switched / switch-failed / no-target / all-capacity。
+  async function routeAfterModelFailure(agent, provider, model, failure, turn, compressionGap, goalRef = null) {
+    const id = String(agent.session.id)
+    // 并发/容量类失败：模型没坏，只是这一刻排不上。处置方式与「真失败」完全不同——
+    // 绝不 markFailed（那会让它一整天不参与路由），只记一个短冷却，然后临时换到
+    // 组内其它模型，原模型空闲后由 rerouteForNewTurn 切回来。
+    //
+    // 这条分支就是用户报的「触发到模型并发时，临时切换到路由中其他模型」。
+    const capacityFailure = isCapacityFailure(failure)
+    if (capacityFailure) {
+      markCapacity(provider, model, failure?.message ?? CAPACITY_TIMEOUT_CODE)
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 并发已满（${failure?.code ?? 'unknown'}），临时冷却 ${Math.round(capacityCooldownMs / 1000)}s 并切换到组内其它模型`)
+    }
+    // 请求本身被拒（输入超过上下文上限、参数不合法、模态不支持…）：
+    // 换账号没用、原地重试也没用，唯一有效的是换模型。
+    const requestRejected = isRequestRejectedFailure(failure)
+    if (requestRejected) {
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 的失败是请求被拒（${failure?.code ?? 'unknown'}），换号无意义，直接换模型`)
+    }
+    // 请求被拒不写当日失败：这个模型换个请求还能用，停用一整天是错的。
+    // 但它必须参与「别的模型为何被跳过」的判断，所以只记 errorTurns 并继续切模型。
+    if (!capacityFailure && !requestRejected) {
+      markFailed(provider, model, failure)
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 彻底失败（${failure?.code ?? 'unknown'}），已标记为当日失败`)
+    }
+    // 本轮的终局失败由这里处置完毕：agent/error 入口靠它认出同一次失败，不再重复路由。
+    if (turn !== undefined) errorTurns.set(id, turn)
+    // 这一轮里已经因为「请求被拒」被淘汰的模型：请求被拒不写当日失败（模型本身没坏），
+    // 所以下一条续跑必须靠这份名单把它排除掉，否则同一个超限模型会被反复选中，
+    // 每次都要白烧一次上游请求。切到新模型后清空，下一轮重新开始。
+    if (requestRejected) {
+      const tried = rejectedBySession.get(id) ?? new Set()
+      tried.add(failKey(provider, model))
+      rejectedBySession.set(id, tried)
+    }
+    const rejectedNow = rejectedBySession.get(id)
+
+    // 绑定：先看自己，子代理沿 parentSession 继承父会话的分组
+    const inherited = effectiveBinding(agent.session)
+    const binding = inherited?.binding
+    const group = binding ? groups.find(g => g.id === binding.groupId && g.enabled) : undefined
+    const target = pickNext(group, { provider, model }, rejectedNow)
+    if (!target) {
+      const why = binding
+        ? (group ? '分组内无其它可路由模型（全部当日失败/不在时段/已过期/本轮已因请求被拒跳过）' : '绑定的分组已停用或不存在')
+        : '该会话未绑定分组，且该模型不在任何启用分组内'
+      ctx.logger.info(`[model-failover] ${provider}/${model} 失败后不切换：${why}`)
+      noteFailure(agent, provider, failure, 'no-target', { model, detail: why, uncompressed: compressionGap !== null })
+      return 'no-target'
+    }
+    // 整组都并发打满时不换：换过去也是同一个满池，只会在两个模型之间来回抖。
+    // 让这次失败照常暴露，由下一轮的开始检查再判断（那时可能已经有槽位释放）。
+    if (capacityFailure && capacityCooldownOf(target.provider, target.model) !== null) {
+      const why = '组内模型全部并发已满，换过去也不会好，等槽位释放后再路由'
+      ctx.logger.warn(`[model-failover] ${provider}/${model} ${why}`)
+      noteFailure(agent, provider, failure, 'all-capacity', { model, detail: why })
+      return 'all-capacity'
+    }
+    if (inherited?.inherited) {
+      ctx.logger.info(`[model-failover] 子代理 ${id} 按继承的分组 ${binding.groupId}（来自 ${inherited.viaSessionId}）切换`)
+    }
+
+    const ok = await applyActiveModel(agent, target)
+    // 并发切换要记住「原来用的是什么」，rerouteForNewTurn 才能在执行期过后切回去。
+    if (ok && capacityFailure) capacitySwitches.set(id, { provider, model, at: Date.now() })
+    // 切成功就清空本轮的被拒名单：已经离开那个模型了，下一轮从干净的候选集开始。
+    // 不清会让名单无限增长，也会在用户换分组/换模型后挡住本来可用的模型。
+    if (ok) rejectedBySession.delete(id)
+    const outcome = ok
+      ? (capacityFailure ? 'capacity-switched' : requestRejected ? 'rejected-switched' : 'switched')
+      : 'switch-failed'
+    noteFailure(agent, provider, failure, outcome, {
+      model, detail: `→ ${target.provider}/${target.model}${ok ? '' : '（切换失败）'}`,
+      uncompressed: compressionGap !== null,
+    })
+    if (!ok) return 'switch-failed'
+    // 已经 select 了新模型，但本步 selection 已冻结：等本轮收尾后排队续跑。
+    // goalRef 有值时优先用它：调用方是在 await 之前抓的，那才是切换前的真实状态；
+    // agent/error 那条入口与 goal-round-driver 在同一个 emit 里，晚读会读到已 disarm 的 goal。
+    queueContinuation(agent, provider, model, target, goalRef ?? goalRevivalOf(agent))
+    return outcome
+  }
+
+  /**
+   * 把 `agent/error` 携带的错误收敛成 {code, message}；不是 LLM 层失败时返回 null。
+   *
+   * 只认 LLM 层的错误：工具执行失败、宿主自身的配置错误（no provider/model）不是
+   * 模型链路问题，把它们标成「模型当日失败」是错的。取消（ABORTED）也不换——
+   * 那是用户按了停止。
+   *
+   * @param {unknown} error - agent/error 的 payload.error（原样）。
+   * @returns {{code: string, message: string}|null} 结构化失败；不该路由时为 null。
+   */
+  function llmFailureOf(error) {
+    const message = typeof error?.message === 'string' ? error.message : ''
+    const code = typeof error?.code === 'string' && error.code.length > 0 ? error.code : null
+    // name 是 LlmError 自己设的；兜底再认一次 pi-ai 的原话，防止错误被包装过一层
+    const isLlmError = error?.name === 'LlmError' && code !== null
+    if (!isLlmError && !/has no configured model/i.test(message)) return null
+    if (code === 'ABORTED') return null
+    const failure = error?.failure
+    if (failure !== null && typeof failure === 'object' && typeof failure.code === 'string') {
+      return { code: failure.code, message: typeof failure.message === 'string' ? failure.message : message }
+    }
+    return { code: code ?? 'UNKNOWN', message }
+  }
+
   /* ============ 所有重试耗尽后：标记失败 + 切换 + 同一轮续跑 ============ */
   //
   // 组合语义（prepend 到最外层 + 先 await next()）：
@@ -1978,6 +2171,10 @@ export function apply(ctx, config = {}) {
     if (disposed || !agent || !agent.session) return action
 
     const id = String(agent.session.id)
+    // 本轮已经由本监听器处置（换了模型 / 决定不换）时，agent/error 会带着同一个 turn
+    // 再来一次：那是 agent.ts 收尾时新建的 LlmError，不是新一次失败。记下 turn 就是
+    // 为了让 agent/error 那条入口认出它并跳过，避免一次失败连跳两个模型。
+    const endTurn = () => { errorTurns.set(id, turn); return action }
     // provider 优先取事件自带的（就是这次请求实际用的），model 只能从请求头取。
     // 原先两者都只读 requestHeader()，头缺失/滞后时会静默不处理——既不标记也不切换。
     let provider; let model
@@ -1988,6 +2185,8 @@ export function apply(ctx, config = {}) {
       model = active?.model ?? header?.config?.model
     } catch {
       noteFailure(agent, eventProvider, failure, 'no-request-header')
+      // 不记 errorTurns：这条分支什么都没处置，同一个 turn 的 agent/error 入口还要再试一次
+      // （它用 currentModelOf 反查，比请求头可靠）。记了就等于把唯一能路由它的入口挡掉。
       return action
     }
     if (!provider || !model) {
@@ -2010,7 +2209,7 @@ export function apply(ctx, config = {}) {
       // fallthrough：不是「池挑不出号」，继续走下面的换号 / 分组路由。
       if (verdict !== 'fallthrough') {
         // 签名中间层拦截 / 无法自救：重试与换模型都没有意义，直接交给宿主报错。
-        return action
+        return endTurn()
       }
     }
 
@@ -2018,26 +2217,10 @@ export function apply(ctx, config = {}) {
     // 这里只诊断、不截断流程——换到哪个模型交给下面的分组路由，而路由本身已经
     // 优先避开这类 provider（pickCandidate）；沿用着它们的会话才会走到这里。
     const compressionGap = noteCompressionGap(provider, model, failure)
-
-    // 并发/容量类失败：模型没坏，只是这一刻排不上。处置方式与「真失败」完全不同——
-    // 绝不 markFailed（那会让它一整天不参与路由），只记一个短冷却，然后临时换到
-    // 组内其它模型，原模型空闲后由 rerouteForNewTurn 切回来。
-    //
-    // 这条分支就是用户报的「触发到模型并发时，临时切换到路由中其他模型」。
+    // 这两类失败各自的处置（markCapacity / markFailed 的豁免）已经收敛进
+    // routeAfterModelFailure，这里只需要它们来决定要不要走换号分支。
     const capacityFailure = isCapacityFailure(failure)
-    if (capacityFailure) {
-      markCapacity(provider, model, failure?.message ?? CAPACITY_TIMEOUT_CODE)
-      ctx.logger.warn(`[model-failover] ${provider}/${model} 并发已满（${failure?.code ?? 'unknown'}），临时冷却 ${Math.round(capacityCooldownMs / 1000)}s 并切换到组内其它模型`)
-    }
-
-    // 请求本身被拒（输入超过上下文上限、参数不合法、模态不支持…）：
-    // 换账号没用、原地重试也没用，唯一有效的是换模型。所以先记下来，
-    // 下面跳过换号分支，直接进分组路由；并且对这类失败做「保留」处理——
-    // 模型本身是好的（只是这条请求太大），不该被标成当日失败而停用一整天。
     const requestRejected = isRequestRejectedFailure(failure)
-    if (requestRejected) {
-      ctx.logger.warn(`[model-failover] ${provider}/${model} 的失败是请求被拒（${failure?.code ?? 'unknown'}），换号无意义，直接换模型`)
-    }
 
     // Our Free Model 的模型：不论错误类型，一律先试换账号重试。
     // 换的是同一 provider/model 背后的凭据，selection 没变，所以同一步 retry 安全。
@@ -2054,66 +2237,48 @@ export function apply(ctx, config = {}) {
       return { kind: 'retry' }
     }
 
-    // 请求被拒不写当日失败：这个模型换个请求还能用，停用一整天是错的。
-    // 但它必须参与「别的模型为何被跳过」的判断，所以只记 errorTurns 并继续切模型。
-    if (!capacityFailure && !requestRejected) {
-      markFailed(provider, model, failure)
-      ctx.logger.warn(`[model-failover] ${provider}/${model} 彻底失败（${failure?.code ?? 'unknown'}），已标记为当日失败`)
-    }
-    errorTurns.set(id, turn)
-
-    // 这一轮里已经因为「请求被拒」被淘汰的模型：请求被拒不写当日失败（模型本身没坏），
-    // 所以下一条续跑必须靠这份名单把它排除掉，否则同一个超限模型会被反复选中，
-    // 每次都要白烧一次上游请求。切到新模型后清空，下一轮重新开始。
-    if (requestRejected) {
-      const tried = rejectedBySession.get(id) ?? new Set()
-      tried.add(failKey(provider, model))
-      rejectedBySession.set(id, tried)
-    }
-    const rejectedNow = rejectedBySession.get(id)
-
-    // 绑定：先看自己，子代理沿 parentSession 继承父会话的分组
-    const inherited = effectiveBinding(agent.session)
-    const binding = inherited?.binding
-    const group = binding ? groups.find(g => g.id === binding.groupId && g.enabled) : undefined
-    const target = pickNext(group, { provider, model }, rejectedNow)
-    if (!target) {
-      const why = binding
-        ? (group ? '分组内无其它可路由模型（全部当日失败/不在时段/已过期/本轮已因请求被拒跳过）' : '绑定的分组已停用或不存在')
-        : '该会话未绑定分组，且该模型不在任何启用分组内'
-      ctx.logger.info(`[model-failover] ${provider}/${model} 失败后不切换：${why}`)
-      noteFailure(agent, provider, failure, 'no-target', { model, detail: why, uncompressed: compressionGap !== null })
-      return action
-    }
-    // 整组都并发打满时不换：换过去也是同一个满池，只会在两个模型之间来回抖。
-    // 让这次失败照常暴露，由下一轮的开始检查再判断（那时可能已经有槽位释放）。
-    if (capacityFailure && capacityCooldownOf(target.provider, target.model) !== null) {
-      const why = '组内模型全部并发已满，换过去也不会好，等槽位释放后再路由'
-      ctx.logger.warn(`[model-failover] ${provider}/${model} ${why}`)
-      noteFailure(agent, provider, failure, 'all-capacity', { model, detail: why })
-      return action
-    }
-    if (inherited?.inherited) {
-      ctx.logger.info(`[model-failover] 子代理 ${id} 按继承的分组 ${binding.groupId}（来自 ${inherited.viaSessionId}）切换`)
-    }
-
-    const ok = await applyActiveModel(agent, target)
-    // 并发切换要记住「原来用的是什么」，rerouteForNewTurn 才能在执行期过后切回去。
-    if (ok && capacityFailure) capacitySwitches.set(id, { provider, model, at: Date.now() })
-    // 切成功就清空本轮的被拒名单：已经离开那个模型了，下一轮从干净的候选集开始。
-    // 不清会让名单无限增长，也会在用户换分组/换模型后挡住本来可用的模型。
-    if (ok) rejectedBySession.delete(id)
-    noteFailure(agent, provider, failure, ok
-      ? (capacityFailure ? 'capacity-switched' : requestRejected ? 'rejected-switched' : 'switched')
-      : 'switch-failed', {
-      model, detail: `→ ${target.provider}/${target.model}${ok ? '' : '（切换失败）'}`,
-      uncompressed: compressionGap !== null,
-    })
-    if (!ok) return action
-    // 已经 select 了新模型，但本步 selection 已冻结：等本轮收尾后排队续跑。
+    // 标记失败 → 换下一个模型 → 排队续跑；与 agent/error 那条入口共用同一段。
+    await routeAfterModelFailure(agent, provider, model, failure, turn, compressionGap)
+    // 已经 select 了新模型（切换成功时），但本步 selection 已冻结：等本轮收尾后排队续跑。
     // 不返回 retry：让这一轮以错误收尾，续跑消息开下一轮。
-    queueContinuation(agent, provider, model, target, goalRevivalOf(agent))
-    return action
+    return endTurn()
+  }, { prepend: true })
+
+  // 同一段处置的第二条入口：请求还没起来就抛出的失败（UNKNOWN_MODEL / INVALID_CONFIG /
+  // stream 同步抛错 / 工具批处理失败）不会进 agent/request-error——那条 waterfall 只在
+  // live finish 是 error/aborted 时才触发——只在 agent/error 上可见。
+  // 用户报的 `pi-ai provider "codearts" has no configured model "glm-5.3-flash"`
+  // （prepareCall 同步抛，code UNKNOWN_MODEL）走的就是这一条：两条入口都接住，
+  // 「所有报错都路由」才成立。
+  //
+  // 与 request-error 的区别（决定了这里只能从 agent 反查 provider/model）：
+  // agent/error 不带 provider/model，payload 只有 { agent, turn, step, error }；
+  // 而且它是 emit（fire-and-forget），不是在失败步骤里 await 的——所以这里的
+  // routeAfterModelFailure 可能在 turn/end 之后才跑完，续跑要等 agent/status 变 idle
+  // 才发得出去（scheduleContinuation 负责那次投递）。
+  // prepend：goal-round-driver 也监听 agent/error，并在自己的监听器里同步 disarm 活跃 goal。
+  // 必须抢在它前面，才能在任何 await 之前读到 armed 状态的 goal ref（goalRevivalOf 只认 armed），
+  // 否则每一次「请求还没发出去」的切换都会把用户的目标留成「已暂停的目标」。
+  const disposeAgentError = ctx.on('agent/error', async ({ agent, turn, error }) => {
+    if (disposed || !agent || !agent.session) return
+    // 第一个 await 之前就抓：同一个 emit 里 goal-round-driver 会把它 disarm 掉。
+    const goalRef = goalRevivalOf(agent)
+    // agent/error 上的错误种类很杂（工具失败、宿主内部错误…），只接模型链路的。
+    const failure = llmFailureOf(error)
+    if (!failure) return
+    const id = String(agent.session.id)
+    // 本轮的失败如果已经在 request-error 里处置过（errorTurns 记的是同一个 turn），
+    // 这里再路由一次就会连跳两个模型：直接跳过。
+    if (errorTurns.get(id) === turn) return
+    // 从当前选用反查这次请求实际用的 provider/model：agent/error 不携带它们。
+    const current = currentModelOf(agent, id)
+    if (!current?.provider || !current?.model) {
+      noteFailure(agent, current?.provider ?? 'unknown', failure, 'provider-or-model-unknown', { model: current?.model })
+      return
+    }
+    ctx.logger.warn(`[model-failover] ${current.provider}/${current.model} 请求未能发出（${failure.code}：${failure.message}），按模型失败路由`)
+    const compressionGap = noteCompressionGap(current.provider, current.model, failure)
+    await routeAfterModelFailure(agent, current.provider, current.model, failure, turn, compressionGap, goalRef)
   }, { prepend: true })
 
   /**
@@ -2190,6 +2355,51 @@ export function apply(ctx, config = {}) {
   const pendingContinuations = new Map()
 
   /**
+   * 待续跑的兜底闹钟：sessionId -> timer。
+   *
+   * 正常路径是 `agent/status` 的 idle 边沿（见 scheduleContinuation）。但那条边沿不是
+   * 保证：驱动器在 turn/end 之后走的是 throwError 分支时不会再回到 idle，插件也可能
+   * 在这中间被卸载重载——消息就会永远躺在 pendingContinuations 里，用户看到的是
+   * 「模型换了，然后就没有然后了」。兜底只看一件事：到点还挂着、且 agent 确实空闲，
+   * 就补投一次；还在跑就不动它（那条边沿迟早会来，抢跑只会把消息排在运行中的轮次后面）。
+   */
+  const CONTINUATION_FAILSAFE_MS = 30_000
+  const continuationTimers = new Map()
+
+  /**
+   * 给一次待续跑装上兜底闹钟（同一个会话只装一个）。
+   * @param {string} sessionId - 待续跑的会话。
+   * @returns {void}
+   */
+  function armContinuationFailsafe(sessionId) {
+    if (continuationTimers.has(sessionId)) return
+    const timer = setTimeout(() => {
+      continuationTimers.delete(sessionId)
+      if (disposed) return
+      const pending = pendingContinuations.get(sessionId)
+      if (!pending) return
+      if (pending.agent?.status !== 'idle') return
+      ctx.logger.warn(`[model-failover] ${sessionId} 的续跑等了 ${CONTINUATION_FAILSAFE_MS / 1000}s 还没等到 idle 边沿，补投一次`)
+      deliverContinuation(sessionId)
+    }, CONTINUATION_FAILSAFE_MS)
+    // 闹钟不该拖住进程退出
+    if (typeof timer?.unref === 'function') timer.unref()
+    continuationTimers.set(sessionId, timer)
+  }
+
+  /**
+   * 撤掉兜底闹钟（已投递、或该续跑已被丢弃）。
+   * @param {string} sessionId - 待续跑的会话。
+   * @returns {void}
+   */
+  function clearContinuationFailsafe(sessionId) {
+    const timer = continuationTimers.get(sessionId)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    continuationTimers.delete(sessionId)
+  }
+
+  /**
    * 记下一次待续跑，并在 agent 空闲时投递。
    * @param {any} agent - 失败的 Agent。
    * @param {string} fromProvider - 失败请求实际用的 provider。
@@ -2200,6 +2410,7 @@ export function apply(ctx, config = {}) {
   function queueContinuation(agent, fromProvider, fromModel, target, goalRevival = null) {
     const id = String(agent.session.id)
     pendingContinuations.set(id, { agent, fromProvider, fromModel, target, goalRevival })
+    armContinuationFailsafe(id)
     ctx.logger.info(`[model-failover] ${fromProvider}/${fromModel} → ${target.provider}/${target.model}，等待本轮收尾后自动续跑`)
     // 已经空闲（异常路径下可能直接是 idle）：立刻安排投递。
     if (agent.status === 'idle') scheduleContinuation(id)
@@ -2235,7 +2446,13 @@ export function apply(ctx, config = {}) {
     const pending = pendingContinuations.get(sessionId)
     if (!pending) return
     pendingContinuations.delete(sessionId)
-    if (disposed) return
+    clearContinuationFailsafe(sessionId)
+    if (disposed) {
+      // 卸载时丢掉也必须留痕：状态日志里只有 scheduled 没有 delivered，
+      // 排查「模型换了却没续跑」时才看得出是断在这里。
+      logStatus('continuation/dropped', sessionId, null)
+      return
+    }
     logStatus('continuation/delivered', sessionId, null)
     // 先恢复 goal 再投递：goal-round-driver 在 agent 回到 idle 时，如果发现本轮的
     // 预留消息还在队列里且 goal 仍 armed，会主动 pause 它。所以必须在 followup 之前
@@ -2267,6 +2484,231 @@ export function apply(ctx, config = {}) {
       ctx.logger.info(`[model-failover] ${provider}/${model} 本轮成功，已重置失败状态`)
     }
   })
+
+  /* ==================== 一键测速 ==================== */
+  //
+  // 「一键测速」对选中的模型各发一次最小请求（一句 user 文本、maxTokens 很小），
+  // 用真实往返测首字延迟与输出速度。为什么走 `ctx.llm.stream` 而不是自己拼 HTTP：
+  // 只有走同一条链路，provider 适配器（鉴权、选号、并发闸门）与 `llm/stream` 上的
+  // 采样才与真实会话一致，测出来的数才可比；否则测的是另一条路径。
+  //
+  // 不传 sessionId、也不传 purpose：llm-error-retry 只约束带 sessionId 的主请求，
+  // 那套「首字 90s × 5 次」的重试不该覆盖测速——否则一个挂掉的模型会独占几分钟。
+  // 超时由这里自己的 AbortController 控制，一个模型最多占 timeoutMs。
+  const SPEED_TEST_MIN_TIMEOUT_MS = 5_000
+  const SPEED_TEST_MAX_TIMEOUT_MS = 120_000
+  const SPEED_TEST_DEFAULT_TIMEOUT_MS = 45_000
+  const SPEED_TEST_MAX_MODELS = 60
+  const SPEED_TEST_MAX_PARALLEL = 6
+
+  /**
+   * 正在跑的测速任务，null 表示没有。
+   *
+   * 同一时刻只允许一个：并发打上游会把被测模型自己的账号池打满，测出来的首字
+   * 延迟就全是排队时间，比不测更误导。
+   */
+  let speedTestJob = null
+
+  /** 测速任务的对外快照（GET /speedtest 与启动响应共用）。 */
+  function speedTestSnapshot() {
+    if (!speedTestJob) return { running: false, startedAt: null, finishedAt: null, total: 0, done: 0, results: [] }
+    return {
+      running: speedTestJob.finishedAt === null,
+      startedAt: speedTestJob.startedAt,
+      finishedAt: speedTestJob.finishedAt,
+      total: speedTestJob.total,
+      done: speedTestJob.done,
+      // 结果按目标顺序占位，未测的槽是 null：界面据 done/total 画进度条
+      results: speedTestJob.results.filter(Boolean),
+    }
+  }
+
+  /**
+   * 把请求体解析成待测模型清单。
+   *
+   * 两种入口：给 groupId（测整组）或给 models（测界面上当前看到的那些行，
+   * 通常就是「按当前排序 + 已排除无数据模型」的结果）。都走同一条去重路径。
+   *
+   * @param {{groupId?: string, models?: Array<{provider?: string, model?: string, effort?: string}>}} body - 请求体。
+   * @returns {Array<{provider: string, model: string, effort?: string}>} 去重后的待测清单。
+   */
+  function resolveSpeedTestTargets(body) {
+    const out = []
+    const seen = new Set()
+    const push = (provider, model, effort) => {
+      const p = String(provider ?? '')
+      const m = String(model ?? '')
+      if (!p || !m) return
+      const k = `${p}/${m}`
+      if (seen.has(k)) return
+      seen.add(k)
+      out.push({ provider: p, model: m, ...(effort ? { effort: String(effort) } : {}) })
+    }
+    if (Array.isArray(body.models)) {
+      for (const m of body.models) push(m?.provider, m?.model, m?.effort)
+      return out.slice(0, SPEED_TEST_MAX_MODELS)
+    }
+    if (body.groupId) {
+      const group = groups.find(g => g.id === body.groupId)
+      if (!group) return []
+      for (const m of group.models || []) {
+        // 已禁用的模型不测：它在路由里根本不会被选中，测出来的数只会误导。
+        if (m.disabled === true) continue
+        push(m.provider, m.model, m.effort)
+      }
+      return out.slice(0, SPEED_TEST_MAX_MODELS)
+    }
+    return []
+  }
+
+  /**
+   * 测一个模型：发一次最小请求，回填首字延迟、输出速度与用量。
+   *
+   * 采样不在这里记：调用走的就是 `llm.stream`，`guardedStream` 已经按同一套口径
+   * 记了一条样本（首字/速度/token/成败），这里再记一遍会把看板计数翻倍。
+   *
+   * @param {{provider: string, model: string, effort?: string}} target - 待测模型。
+   * @param {number} timeoutMs - 单模型超时。
+   * @param {AbortSignal} outerSignal - 整个任务的取消信号。
+   * @returns {Promise<object>} 一行测速结果。
+   */
+  async function probeModel(target, timeoutMs, outerSignal) {
+    const base = { provider: target.provider, model: target.model, effort: target.effort ?? null }
+    let llm
+    try { llm = ctx.get('llm') } catch { /* 下面统一报错 */ }
+    if (!llm || typeof llm.stream !== 'function') {
+      return { ...base, ok: false, ttftMs: null, tps: null, inTokens: null, outTokens: null, errorCode: 'NO_LLM_SERVICE', error: 'llm 服务不可用' }
+    }
+    const controller = new AbortController()
+    const onOuterAbort = () => controller.abort()
+    outerSignal.addEventListener('abort', onOuterAbort, { once: true })
+    const timer = setTimeout(() => controller.abort(), Math.max(SPEED_TEST_MIN_TIMEOUT_MS, timeoutMs))
+    const startedAt = Date.now()
+    let firstAt = null
+    let usageIn = null
+    let usageOut = null
+    let finish = null
+    let thrown = null
+    try {
+      const options = {
+        provider: target.provider,
+        model: target.model,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+        // 只要够触发一次首字与少量输出即可：测的是链路往返，不是回答质量。
+        maxTokens: 24,
+        signal: controller.signal,
+        ...(target.effort ? { reasoningEffort: target.effort } : {}),
+      }
+      for await (const chunk of llm.stream(options)) {
+        if (firstAt === null
+          && (chunk?.type === 'text-delta' || chunk?.type === 'reasoning-delta' || chunk?.type === 'tool-call-delta')) {
+          firstAt = Date.now()
+        }
+        if (chunk?.type === 'usage') {
+          if (typeof chunk.usage?.inputTokens === 'number') usageIn = chunk.usage.inputTokens
+          if (typeof chunk.usage?.outputTokens === 'number') usageOut = chunk.usage.outputTokens
+        }
+        if (chunk?.type === 'finish') finish = chunk.reason
+      }
+    } catch (e) {
+      thrown = e
+    } finally {
+      clearTimeout(timer)
+      outerSignal.removeEventListener('abort', onOuterAbort)
+    }
+    const endedAt = Date.now()
+    const elapsedMs = endedAt - startedAt
+    // 失败判定与看板口径一致：finish.kind 为 error/aborted 即失败，或用抛出来的异常。
+    const failure = finish?.kind === 'error' || finish?.kind === 'aborted' ? finish.failure : null
+    const errorCode = failure?.code
+      ?? (thrown ? String(thrown.code ?? thrown.name ?? 'ERROR') : null)
+      ?? (controller.signal.aborted ? 'TIMEOUT' : null)
+    const ok = failure === null && thrown === null && !controller.signal.aborted
+    const ttftMs = firstAt === null ? null : firstAt - startedAt
+    const tps = usageOut !== null && firstAt !== null && endedAt > firstAt
+      ? Math.round((usageOut / ((endedAt - firstAt) / 1000)) * 10) / 10
+      : null
+    return {
+      ...base,
+      ok,
+      ttftMs,
+      tps,
+      inTokens: usageIn,
+      outTokens: usageOut,
+      elapsedMs,
+      errorCode: ok ? null : (errorCode ?? 'ERROR'),
+      error: ok ? null : String(failure?.message ?? thrown?.message ?? (controller.signal.aborted ? '测速超时' : '测速失败')).slice(0, 200),
+    }
+  }
+
+  /**
+   * 启动一次测速：立刻返回任务快照，进度由界面轮询 GET /speedtest 拿。
+   *
+   * 为什么不等测完再返回：一个组几十个模型、每个最多几十秒，一次 HTTP 请求
+   * 扛不住（浏览器与代理都会先超时），而且用户需要边测边看。
+   *
+   * @param {object} body - 请求体，见 {@link resolveSpeedTestTargets}，另含 timeoutMs / parallel。
+   * @returns {{status: number, body: object}} HTTP 状态与响应体。
+   */
+  function runSpeedTest(body) {
+    if (speedTestJob && speedTestJob.finishedAt === null) {
+      return { status: 409, body: { ok: false, error: '测速正在进行中，等它跑完再点一次', ...speedTestSnapshot() } }
+    }
+    const targets = resolveSpeedTestTargets(body)
+    if (targets.length === 0) {
+      return { status: 400, body: { ok: false, error: '没有可测速的模型（分组为空、全被禁用，或没给模型清单）' } }
+    }
+    const timeoutRaw = Number(body.timeoutMs)
+    const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0
+      ? Math.min(SPEED_TEST_MAX_TIMEOUT_MS, Math.max(SPEED_TEST_MIN_TIMEOUT_MS, Math.round(timeoutRaw)))
+      : SPEED_TEST_DEFAULT_TIMEOUT_MS
+    const parallelRaw = Number(body.parallel)
+    const parallel = Number.isFinite(parallelRaw) && parallelRaw > 0
+      ? Math.min(SPEED_TEST_MAX_PARALLEL, Math.max(1, Math.round(parallelRaw)))
+      : 2
+    const job = {
+      startedAt: Date.now(),
+      finishedAt: null,
+      total: targets.length,
+      done: 0,
+      results: new Array(targets.length).fill(null),
+      cancel: new AbortController(),
+    }
+    speedTestJob = job
+    ctx.logger.info(`[model-failover] 一键测速开始：${targets.length} 个模型，并发 ${parallel}，单模型超时 ${Math.round(timeoutMs / 1000)}s`)
+    // 任务在后台跑：HTTP 响应立即返回，界面轮询进度。
+    void (async () => {
+      let cursor = 0
+      const worker = async () => {
+        for (;;) {
+          const i = cursor++
+          if (i >= targets.length) return
+          if (job.cancel.signal.aborted) return
+          try {
+            job.results[i] = await probeModel(targets[i], timeoutMs, job.cancel.signal)
+          } catch (e) {
+            // 单个模型崩掉不该让整批停下：记一行失败，继续下一个。
+            job.results[i] = {
+              provider: targets[i].provider, model: targets[i].model, effort: targets[i].effort ?? null,
+              ok: false, ttftMs: null, tps: null, inTokens: null, outTokens: null,
+              errorCode: 'PROBE_CRASH', error: String(e?.message ?? e).slice(0, 200),
+            }
+          }
+          job.done++
+        }
+      }
+      try {
+        await Promise.all(Array.from({ length: Math.min(parallel, targets.length) }, worker))
+      } catch (e) {
+        ctx.logger.warn(`[model-failover] 一键测速异常退出：${e?.message || e}`)
+      } finally {
+        job.finishedAt = Date.now()
+        const okCount = job.results.filter(r => r && r.ok).length
+        ctx.logger.info(`[model-failover] 一键测速结束：${okCount}/${job.total} 成功，用时 ${Math.round((job.finishedAt - job.startedAt) / 1000)}s`)
+      }
+    })()
+    return { status: 200, body: { ok: true, ...speedTestSnapshot() } }
+  }
 
   /* ==================== HTTP API ==================== */
   const readBody = (req) => new Promise((resolve, reject) => {
@@ -2491,6 +2933,9 @@ export function apply(ctx, config = {}) {
       try {
         const body = JSON.parse((await readBody(req)) || '{}')
         if (typeof body.dialogMode === 'boolean') settings.dialogMode = body.dialogMode
+        // metricsSort：看板表头排序的持久化。显式传 null 表示「回到默认序」，
+        // 也是合法的保存动作，所以用 `in` 判断而不是 truthy 判断。
+        if ('metricsSort' in body) settings.metricsSort = normalizeMetricsSort(body.metricsSort)
         saveSettings()
         sendJson(res, 200, { ok: true, settings })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
@@ -2753,6 +3198,77 @@ export function apply(ctx, config = {}) {
       return
     }
 
+    /* ----- 按看板当前排序重设分组内的路由优先级 ----- */
+    //
+    // 用户在看板上点了几次表头（比如按速度降序），看着这个顺序正好就是想要的路由
+    // 顺序，于是希望「把优先级按这个顺序重排」。界面把排序后的 provider/model 数组
+    // 按先后顺序原样送上来，这里只负责按起始序号依次写回 priority：
+    //  - 只看该分组里**实际存在**的条目，不在分组里的名字被忽略（界面不该送，但坏了
+    //    也不该整批失败）；
+    //  - 跳过的条目保持原优先级不变——「没有数据的模型排除」由界面决定要不要送，
+    //    Host 不替它判断有没有采样，避免两边口径不一致；
+    //  - 整批一次写入、一次落盘：失败不会留下半套优先级。
+    if (path === `${API_PATH}/groups/reorder-priority` && req.method === 'POST') {
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        if (!body.groupId) { sendJson(res, 400, { ok: false, error: 'groupId 必填' }); return }
+        const group = groups.find(g => g.id === body.groupId)
+        if (!group) { sendJson(res, 404, { ok: false, error: '分组不存在' }); return }
+        const startRaw = body.start
+        const start = Number(startRaw)
+        // 起始序号：正整数；缺省 1。上限 999 与界面输入框一致（priority 只是排序键，
+        // 但上界能挡住手改请求体写进来的天文数字）。
+        if (startRaw !== undefined && startRaw !== null && startRaw !== ''
+          && (!Number.isInteger(start) || start < 1 || start > 999)) {
+          sendJson(res, 400, { ok: false, error: 'start 需为 1..999 的整数' }); return
+        }
+        const order = Array.isArray(body.order) ? body.order : []
+        if (order.length === 0) { sendJson(res, 400, { ok: false, error: 'order 不能为空' }); return }
+        const base = Number.isInteger(start) && start >= 1 ? start : 1
+        const byKey = new Map()
+        for (const m of group.models || []) byKey.set(`${m.provider}/${m.model}`, m)
+        const applied = []
+        let next = base
+        const touched = new Set()
+        for (const entry of order) {
+          const provider = String(entry?.provider ?? '')
+          const model = String(entry?.model ?? '')
+          if (!provider || !model) continue
+          const k = `${provider}/${model}`
+          // 同一条目在 order 里出现两次时只认第一次，否则后面那次会把它顶到两位数
+          if (touched.has(k)) continue
+          const member = byKey.get(k)
+          if (!member) continue
+          touched.add(k)
+          member.priority = Math.min(999, next)
+          applied.push({ provider, model, priority: member.priority })
+          next++
+        }
+        if (applied.length === 0) {
+          sendJson(res, 400, { ok: false, error: 'order 里没有任何属于该分组的模型' }); return
+        }
+        saveGroups()
+        ctx.logger.info(`[model-failover] 分组「${group.name}」按看板排序重设了 ${applied.length} 个模型的优先级（${base} 起）`)
+        sendJson(res, 200, { ok: true, groupId: group.id, start: base, applied: applied.length, models: applied })
+      } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
+      return
+    }
+
+    /* ----- 一键测速：对分组内的模型各打一次最小请求，测首字与速度 ----- */
+    if (path === `${API_PATH}/speedtest` && req.method === 'POST') {
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const result = await runSpeedTest(body)
+        sendJson(res, result.status, result.body)
+      } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
+      return
+    }
+
+    if (path === `${API_PATH}/speedtest` && req.method === 'GET') {
+      sendJson(res, 200, speedTestSnapshot())
+      return
+    }
+
     sendJson(res, 404, { ok: false, error: 'not found: ' + path })
   }
 
@@ -2848,7 +3364,7 @@ export function apply(ctx, config = {}) {
     })()
   }
 
-  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + concurrency gate with temporary capacity switching + speed board)`)
+  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe)`)
 
   /* ==================== 清理 ==================== */
   ctx.effect(() => () => {
@@ -2859,9 +3375,13 @@ export function apply(ctx, config = {}) {
     disposeLlmStream()
     disposeSessionEvent()
     disposeError()
+    disposeAgentError()
     disposeStop()
     if (qoderShimHandle) qoderShimHandle.stop()
     if (routeDisposer) routeDisposer()
+    // 兜底闹钟随插件一起结束：卸载后既没人投递，也不该再留定时器
+    for (const timer of continuationTimers.values()) clearTimeout(timer)
+    continuationTimers.clear()
     // 卸载即刷新待写样本，否则最近 1.5s 内的采样会随进程一起消失
     flushMetrics()
   }, 'model-failover-manager: unmount')

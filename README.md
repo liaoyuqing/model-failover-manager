@@ -197,14 +197,16 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ## 失败切换的判定过程
 
 1. 一次请求失败，内层重试策略（内置 `llm-retry`、`llm-error-retry` 等）先依次表态。
-2. 只有它们都放弃后，本插件才接手。
+2. 只有它们都放弃后，本插件才接手。**两条入口**都接：`agent/request-error`（流已经开起来、随后以 error/aborted 结束）与 `agent/error`（请求还没发出就抛，例如 `UNKNOWN_MODEL`、适配器同步报错）。任一条入口处置过的轮次，另一条按 `turn` 认出并跳过，不会一次失败连跳两个模型——所以本插件不再依赖「自己恰好是最外层」这个前提。
 3. 若错误是 `dsh-codearts` 的「本地池挑不出号」那句 429：重启它的 Loader 条目重建账号池，等适配器就绪后同一步重试（见「与 dsh-codearts 的配合」）。
 4. 若失败模型属于 Our Free Model 且该 provider 不在 `ofmHandoffExcludeProviders` 里：先换账号重试（见上一节）。
-5. 否则把该模型标记为「当日失败」，然后按绑定决定目标：
+5. 请求本身被拒（上下文超限 / 参数不合法 / 该模型不支持这个模态）不写「当日失败」：模型没坏，只是这条请求它吃不下。判据同时看机器码（`CONTEXT_WINDOW_EXCEEDED`、`INVALID_ARGS`，以及上游透传的 `INVALID_REQUEST` 等）与上游文案（`prompt is too long`、「超过模型上限」、「内容太长了，请精简输入或开启新对话」等），命中即跳过换号、直接换模型，并把该模型记进「本轮已被拒」名单，避免下一轮又选回它。
+6. 否则把该模型标记为「当日失败」，然后按绑定决定目标：
    - `route`：取组内下一个可用模型；
    - `failover`：同样取组内下一个可用模型作为兜底；
-   - 组内没有可用模型（都失败 / 不在时段 / 已过期）时不切换，只记录。
-6. 切换成功即让同一轮继续；失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
+   - 未绑定分组：在该模型所属的**每一个**启用分组里找替代者，先找优先级不差于它的，找不到就放宽到整组（宁可降级也不原地不动）；
+   - 真的一个都找不到时不切换，只记录。
+7. 切换成功即让同一轮继续；续跑消息等 agent 回到 idle 后投递，若 30 秒还没等到那条边沿则补投一次（卸载时丢弃会记 `continuation/dropped`）。失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
 
 ## 并发与临时切换
 
@@ -248,7 +250,7 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 
 `goal-round-driver` 监听 `agent/error`，任何 agent 错误都会让它 `disarm` 当前活跃目标；而本插件换模型的代价正是「让本轮以错误收尾」（selection 在 pre-step 已冻结，只能下一轮生效）。两个机制叠加的结果就是：每次故障转移都会把进行中的目标顺手改成 disarmed，界面上显示成「已暂停的目标」。
 
-插件在切换时记下该会话当时的活跃 goal ref（只记 `phase=active && activation=armed` 的），在投递续跑消息**之前**用 `goals.resume()` 把授权恢复回去。恢复用记下的 `revision` 做 CAS：期间被用户 edit / resume / complete 过就放弃，用户主动 pause 的目标也绝不复活——只有被这次切换误伤的目标会被救回。goal 插件未安装或恢复失败时只记日志，不影响续跑本身。
+插件在切换时记下该会话当时的活跃 goal ref（只记 `phase=active && activation=armed` 的），在投递续跑消息**之前**用 `goals.resume()` 把授权恢复回去。两条入口都必须抢在 `goal-round-driver` 前面读到这份现场：`agent/error` 是同步 `emit`，多个监听器跑在同一个调用栈里，所以该监听器 `prepend` 并让 `goalRevivalOf` 出现在第一个 `await` 之前——晚一步读到的只会是已经 disarmed 的目标。恢复用记下的 `revision` 做 CAS：期间被用户 edit / resume / complete 过就放弃，用户主动 pause 的目标也绝不复活——只有被这次切换误伤的目标会被救回。goal 插件未安装或恢复失败时只记日志，不影响续跑本身。
 
 ## HTTP 接口
 
@@ -257,7 +259,7 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`） |
-| POST | `/settings` | 保存界面设置（`dialogMode`） |
+| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`） |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
@@ -266,11 +268,21 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 | POST | `/failed/reset` | 恢复一个模型的失败状态 |
 | POST | `/groups/model-disabled` | 禁用/启用某个模型参与路由（写 `disabled` 字段，覆盖所有含它的分组） |
 | POST | `/model-concurrency` | 设置/清除某个模型的并发上限（`concurrency` 正整数即设置，`null`/`0`/`""` 清除覆盖回落到 `defaultConcurrency`）；按模型索引，作用于所有分组 |
+| POST | `/groups/reorder-priority` | 按看板当前排序重设某个分组的优先级：`{groupId, start, order: [{provider, model}]}`，按 `order` 的顺序从 `start` 起连续写回（`start` 缺省 1，需 1..999）。不在该分组里的名字被忽略，重复条目只认第一次 |
+| GET | `/speedtest` | 一键测速的进度快照：`{running, startedAt, finishedAt, total, done, results}`；`results` 每项含 `provider/model/ok/ttftMs/tps/inTokens/outTokens/errorCode` |
+| POST | `/speedtest` | 启动一键测速：`{models: [{provider, model}]}` 或 `{groupId}`（后者跳过已禁用的模型），可选 `timeoutMs`（5s..120s，默认 45s）与 `parallel`（1..6，默认 2）。立即返回任务快照，任务在后台跑；已有任务在跑时返回 409 |
 | GET | `/session-info?sessionId=` | 单个会话解析后的有效分组、是否继承、当前模型覆盖 |
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
 | GET | `/debug/status-log?sessionId=&limit=` | 只读诊断：最近 200 条运行态事件（`agent/status`、转发给界面的 `api-session/status`、续跑排队与投递），带自增 `seq` 与毫秒时间戳 |
-| GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略 |
+| GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略。每行另带 `lifetimeInTokens`/`lifetimeOutTokens`/`lifetimeTokenSamples`——该模型的**全量历史**用量，不随筛选变化 |
+
+### 数据看板
+
+- **排序会被记住**：点表头（升序 → 降序 → 回到默认序）后写回 `settings.json`，刷新页面、换个浏览器、甚至重启宿主之后打开看板，仍是上次那一列与方向；认不出的旧值回落成默认序，不会让插件带病启动。
+- **token 列的大字是历史用量**：主行显示该模型**全部历史**的输入+输出合计（不随日期筛选变化），副行是 `↑输入 ↓输出`；区间内用量与「有多少条样本带 token」放在 tooltip 里。
+- **按当前排序重设优先级**：表格上方的操作条可选目标分组、填起始优先级，然后按当前排序把**有采样**的模型从起始序号连续编号；**没有数据的模型被排除**、保持原优先级不变（操作条上直接显示会有几个模型参与）。
+- **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
 
 ## 数据文件
 
@@ -353,12 +365,24 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Samples have **no count cap**: every model keeps every call it has seen since the plugin started.
   A cap would quietly redefine the statistics as "the latest N" — a range that starts earlier, or a
   model busy enough to pass the cap in a day, would report only the tail of what was asked for.
-- The token column sums output usage on the main line and input usage after `↑` on the second,
-  counting only calls whose adapter reported `usage`; the tooltip gives sampled-call coverage, so a
-  provider that reports nothing shows `—` throughout rather than 0, which would read as "used
-  nothing" instead of "not recorded". Samples persist to `dataDir/metrics.json` in full (debounced
-  1.5s and flushed on unmount), so the dashboard survives a restart; older samples without token
-  fields count as no data rather than 0.
+- The token column's large number is the model's **lifetime** usage — input plus output over every
+  sample, unaffected by the date filter — with `↑input ↓output` underneath; the range total and the
+  sampled-call coverage live in the tooltip. A provider that never reports `usage` shows `—` rather
+  than 0, which would read as "used nothing" instead of "not recorded". Samples persist to
+  `dataDir/metrics.json` in full (debounced 1.5s and flushed on unmount), so the dashboard survives
+  a restart; older samples without token fields count as no data rather than 0.
+- The dashboard remembers its sort: clicking a header (ascending, descending, then the default order)
+  writes it to `settings.json`, so a page reload, another browser, or a host restart all come back to
+  the same column and direction. A stored value this build does not recognize falls back to the
+  default order instead of failing activation.
+- The action bar above the table applies the current sort as routing priorities: pick the target group
+  and a starting number, and every model **with samples** is numbered consecutively from it, in the
+  order shown. Models without data are excluded and keep their existing priority.
+- One-click speed test: every enabled model of the target group gets one minimal request through the
+  real `llm.stream` (so the measurement also feeds the samples above). The run happens in the
+  background while the dialog polls its progress every 1.5s, showing first-token latency and tokens/s
+  under each model; only one run may be active at a time, because measuring in parallel would report
+  queueing as first-token latency.
 - Some failures are neither network nor account nor quota: the upstream rejected the request itself.
   The common case is input beyond the model's context window (`prompt is too long`,
   `CONTEXT_WINDOW_EXCEEDED`), which adapters usually class as `400` / `code: client`. Swapping

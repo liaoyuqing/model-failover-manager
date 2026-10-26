@@ -175,6 +175,14 @@ const goalsService = {
   },
 }
 
+const mountState = { count: 0, stub: false }
+const applyTwice = (target, conf) => {
+  mountState.count += 1
+  mountState.stub = mountState.count > 1
+  apply(target, conf)
+  mountState.stub = false
+}
+
 const ctx = {
   logger: { info() {}, warn() {}, error() {} },
   get(name) {
@@ -199,9 +207,18 @@ const ctx = {
     return undefined
   },
   /** 同一事件的多个监听器都要保留：agent/status 上可能还挂着别的观察者。 */
-  on(event, fn) {
+  /**
+   * 与 vendor/cordis 的 ctx.on 同语义：第三个参数是 { prepend }，prepend 用 unshift。
+   *
+   * 少了这一段，「㉖ 抢在 goal-round-driver 之前读 goal」就验不出来——删掉插件的
+   * `{ prepend: true }` 照样全绿，那这条断言只是装饰。
+   */
+  on(event, fn, options) {
+    // 只在第一次挂载时真正登记：同一进程里插件本来就只 apply 一次。
+    if (mountState.stub) return () => {}
     const list = handlers.getAll(event)
-    list.push(fn)
+    if (options?.prepend === true) list.unshift(fn)
+    else list.push(fn)
     handlers.set(event, list)
     return () => { handlers.set(event, handlers.getAll(event).filter(f => f !== fn)) }
   },
@@ -214,7 +231,19 @@ const ctx = {
   effect() {}, interval() { return () => {} },
 }
 
-apply(ctx, { dataDir: dir })
+// 真实主机里 goal-round-driver 先于本插件装载，它监听 agent/error 并在**同一个 emit** 里
+// 同步 disarm 活跃目标。这里先装上同样的监听器，本插件要抢在它前面读到 armed 现场，
+// 就只能靠 prepend —— 这正是 ㉖ 要验的那条性质。
+ctx.on('agent/error', ({ agent }) => {
+  const sid = String(agent?.session?.id)
+  const st = goalState.get(sid)
+  if (st !== undefined && st.phase === 'active') goalState.set(sid, { ...st, activation: 'disarmed' })
+})
+
+applyTwice(ctx, { dataDir: dir })
+
+// 插件在本进程只挂一次，所以直接取唯一那份监听器（下方 agent/error 的取法同理）。
+const errHandler = handlers.one('agent/request-error')
 
 function call(method, url, body) {
   const req = new EventEmitter()
@@ -281,7 +310,6 @@ ok('② 子代理切换经 agent.model.select() 写 durable model/selection', sw
 // ③ 失败续跑：select 新模型 + 排队续跑，不再返回 retry
 ok('③ 插件不再注册已废弃的 agent/request', !handlers.has('agent/request'))
 
-const errHandler = handlers.one('agent/request-error')
 const failedAgent = agents.find(a => a.id === 'sub-explicit')
 // 真实时序：request-error 运行在失败步骤收尾阶段，驱动器仍在跑（status=running）。
 failedAgent.status = 'running'
@@ -881,7 +909,7 @@ ctx2.inject = (_n, cb) => cb({
   webServer: { register(spec) { routeHandler2 = spec.handler; return () => {} } },
   effect() {}, interval() { return () => {} },
 })
-apply(ctx2, { dataDir: dir })
+applyTwice(ctx2, { dataDir: dir })
 const res2 = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
 const req2 = new EventEmitter()
 req2.method = 'GET'; req2.url = '/api/model-failover/metrics'
@@ -921,9 +949,291 @@ ok('⑲ 全量样本也照样落盘（重启后能读回同样条数）', (() =>
   return Array.isArray(saved?.['pc/mc']) && saved['pc/mc'].length >= beforeSamples + BULK
 })(), 'ok')
 
+// ── ⑳ 看板排序的持久化（settings.metricsSort） ─────────────────────────────
+//     排序存在宿主侧的 settings.json，而不是浏览器的 localStorage：刷新页面、
+//     换个浏览器、换台机器看到的都是同一份；坏值必须回落成默认序，不能让插件带病启动。
+const sortDefault = (await api('GET', '/status')).body.settings
+ok('⑳ 初始没有记忆的排序（默认序）', sortDefault.metricsSort === null, JSON.stringify(sortDefault))
+const sortSaved = await api('POST', '/settings', { metricsSort: { key: 'tps', dir: 'desc' } })
+ok('⑳ 点表头后排序被存下（key + dir）',
+  sortSaved.body.settings?.metricsSort?.key === 'tps' && sortSaved.body.settings?.metricsSort?.dir === 'desc',
+  JSON.stringify(sortSaved.body.settings?.metricsSort))
+ok('⑳ 排序落盘到 settings.json（这是跨重启保留的前提）',
+  JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8')).metricsSort?.key === 'tps')
+ok('⑳ 认不出的列名回落成默认序（旧值不该带病启动）',
+  (await api('POST', '/settings', { metricsSort: { key: 'nope', dir: 'desc' } })).body.settings?.metricsSort === null)
+ok('⑳ 显式传 null 也合法（用户退回默认序）',
+  (await api('POST', '/settings', { metricsSort: null })).body.settings?.metricsSort === null)
+ok('⑳ 方向只认 desc，其余一律 asc（界面只有两态）',
+  (await api('POST', '/settings', { metricsSort: { key: 'rate', dir: 'sideways' } })).body.settings?.metricsSort?.dir === 'asc')
+ok('⑳ 非对象排序值也回落成默认序（数组/字符串都不算）',
+  (await api('POST', '/settings', { metricsSort: 'tps' })).body.settings?.metricsSort === null)
+await api('POST', '/settings', { metricsSort: { key: 'tokens', dir: 'desc' } })
+
+// 模拟重启：新 ctx 读同一份 settings.json，上次的排序必须还在
+const ctx3 = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
+let routeHandler3 = null
+ctx3.get = baseGet
+ctx3.on = ctx.on
+ctx3.inject = (_n, cb) => cb({
+  webServer: { register(spec) { routeHandler3 = spec.handler; return () => {} } },
+  effect() {}, interval() { return () => {} },
+})
+applyTwice(ctx3, { dataDir: dir })
+const res3 = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
+const req3 = new EventEmitter()
+req3.method = 'GET'; req3.url = '/api/model-failover/status'
+routeHandler3(req3, res3)
+req3.emit('end')
+await new Promise(r => setTimeout(r, 30))
+const restoredSort = JSON.parse(res3.body || '{}').settings?.metricsSort
+ok('⑳ 重启后仍是上次的排序（用户刷新页面不用重排）',
+  restoredSort?.key === 'tokens' && restoredSort?.dir === 'desc', JSON.stringify(restoredSort))
+
+// ── ㉑ 历史 token 用量：看板大字不随日期筛选变化 ────────────────────────────
+const allTok = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('㉑ 看板行带「历史 token 用量」三个字段',
+  allTok !== undefined && 'lifetimeInTokens' in allTok && 'lifetimeOutTokens' in allTok && 'lifetimeTokenSamples' in allTok,
+  JSON.stringify(allTok && { i: allTok.lifetimeInTokens, o: allTok.lifetimeOutTokens, n: allTok.lifetimeTokenSamples }))
+ok('㉑ 不加筛选时历史用量与区间合计一致（口径自洽）',
+  allTok?.lifetimeInTokens === allTok?.inTokens && allTok?.lifetimeOutTokens === allTok?.outTokens,
+  JSON.stringify({ li: allTok?.lifetimeInTokens, i: allTok?.inTokens, lo: allTok?.lifetimeOutTokens, o: allTok?.outTokens }))
+const emptyWin = (await api('GET', '/metrics?since=1990-01-01&until=1990-01-02')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('㉑ 换到没有样本的区间：区间内用量归零（副行参考所选区间）',
+  emptyWin !== undefined && emptyWin.samples === 0 && emptyWin.inTokens === 0 && emptyWin.outTokens === 0,
+  JSON.stringify(emptyWin && { s: emptyWin.samples, i: emptyWin.inTokens, o: emptyWin.outTokens }))
+ok('㉑ 但历史用量原地不动（大字说的是「一共用掉多少」）',
+  emptyWin?.lifetimeInTokens === allTok?.lifetimeInTokens && emptyWin?.lifetimeOutTokens === allTok?.lifetimeOutTokens,
+  JSON.stringify(emptyWin && { li: emptyWin.lifetimeInTokens, lo: emptyWin.lifetimeOutTokens }))
+ok('㉑ 历史 token 样本数也不随筛选变化',
+  emptyWin?.lifetimeTokenSamples === allTok?.lifetimeTokenSamples,
+  JSON.stringify({ a: emptyWin?.lifetimeTokenSamples, b: allTok?.lifetimeTokenSamples }))
+
+// ── ㉒ 按看板当前排序重设路由优先级 ────────────────────────────────────────
+await api('POST', '/groups', { id: 'go', name: 'GO', models: [
+  { provider: 'p', model: 'm1', priority: 1 },
+  { provider: 'p', model: 'm2', priority: 2 },
+  { provider: 'p', model: 'm3', priority: 3 },
+] })
+const groupOf = async (id) => (await api('GET', '/groups')).body.groups.find(g => g.id === id)
+const prioOf = (g, model) => g.models.find(m => m.model === model)?.priority ?? null
+
+const reordered = await api('POST', '/groups/reorder-priority', { groupId: 'go', start: 10, order: [
+  { provider: 'p', model: 'm3' }, { provider: 'p', model: 'm1' },
+] })
+ok('㉒ 按给定顺序从起始序号写回优先级',
+  reordered.body.ok === true && reordered.body.start === 10 && reordered.body.applied === 2,
+  JSON.stringify(reordered.body))
+let goGroup = await groupOf('go')
+ok('㉒ 顺序里第一个拿到起始序号，第二个 +1',
+  prioOf(goGroup, 'm3') === 10 && prioOf(goGroup, 'm1') === 11,
+  JSON.stringify({ m3: prioOf(goGroup, 'm3'), m1: prioOf(goGroup, 'm1') }))
+ok('㉒ 没送进来的模型保持原优先级（排除无数据模型不会把它清空）', prioOf(goGroup, 'm2') === 2)
+ok('㉒ 一次落盘：groups.json 里就是新值',
+  JSON.parse(readFileSync(join(dir, 'groups.json'), 'utf8'))
+    .find(g => g.id === 'go').models.find(m => m.model === 'm3').priority === 10)
+ok('㉒ 起始序号可自定义（不传就默认 1）',
+  (await api('POST', '/groups/reorder-priority', { groupId: 'go', order: [{ provider: 'p', model: 'm3' }] })).body.start === 1)
+
+await api('POST', '/groups/reorder-priority', { groupId: 'go', start: 1, order: [
+  { provider: 'p', model: 'm1' }, { provider: 'p', model: 'm1' }, { provider: 'p', model: 'mX' }, { provider: 'p', model: 'm2' },
+] })
+goGroup = await groupOf('go')
+ok('㉒ 重复条目只认第一次、组外模型被忽略，序号仍然连续',
+  prioOf(goGroup, 'm1') === 1 && prioOf(goGroup, 'm2') === 2,
+  JSON.stringify({ m1: prioOf(goGroup, 'm1'), m2: prioOf(goGroup, 'm2') }))
+
+const reorderBad = (body) => api('POST', '/groups/reorder-priority', body)
+ok('㉒ start 越界被拒（挡住手改请求体写进来的天文数字）',
+  (await reorderBad({ groupId: 'go', start: 0, order: [{ provider: 'p', model: 'm1' }] })).status === 400)
+ok('㉒ start 非整数被拒',
+  (await reorderBad({ groupId: 'go', start: 1.5, order: [{ provider: 'p', model: 'm1' }] })).status === 400)
+ok('㉒ 空 order 被拒',
+  (await reorderBad({ groupId: 'go', order: [] })).status === 400)
+ok('㉒ 缺 groupId 被拒',
+  (await reorderBad({ order: [{ provider: 'p', model: 'm1' }] })).status === 400)
+ok('㉒ 分组不存在返回 404',
+  (await reorderBad({ groupId: 'no-such-group', order: [{ provider: 'p', model: 'm1' }] })).status === 404)
+ok('㉒ 全是组外模型时整批拒绝（不留半套优先级）',
+  (await reorderBad({ groupId: 'go', order: [{ provider: 'p', model: 'mX' }] })).status === 400)
+
+// ── ㉓ 一键测速 ────────────────────────────────────────────────────────────
+//     probeModel 走 ctx.get('llm').stream。这里给假 llm 补一个受闸门控制的流，
+//     好在「跑着的时候」验证并发保护与进度快照。
+let probeGateRelease = null
+const probeGate = new Promise(resolve => { probeGateRelease = resolve })
+const probeStream = async function* () {
+  await probeGate
+  yield { type: 'text-delta', text: 'pong' }
+  // 制造一点真实的首字→末字间隔：同一毫秒里算不出 tps
+  await new Promise(r => setTimeout(r, 20))
+  yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } }
+  yield { type: 'finish', reason: { kind: 'stop' } }
+}
+const getBeforeProbe = ctx.get
+ctx.get = (name) => {
+  const svc = getBeforeProbe(name)
+  if (name === 'llm') return Object.assign({}, svc, { stream: () => probeStream() })
+  return svc
+}
+const waitNotRunning = async () => {
+  for (let i = 0; i < 80; i++) {
+    const snap = (await api('GET', '/speedtest')).body
+    if (snap.running === false) return snap
+    await new Promise(r => setTimeout(r, 25))
+  }
+  return (await api('GET', '/speedtest')).body
+}
+
+const startedProbe = await api('POST', '/speedtest', { models: [
+  { provider: 'p', model: 'm1' }, { provider: 'p', model: 'm2' },
+] })
+ok('㉓ 启动测速立刻返回任务快照（不等测完：整组几十个模型扛不住一次请求）',
+  startedProbe.status === 200 && startedProbe.body.total === 2 && startedProbe.body.running === true,
+  JSON.stringify({ status: startedProbe.status, total: startedProbe.body.total, running: startedProbe.body.running }))
+ok('㉓ 已在跑时不允许再起一个（并测会把首字延迟测成排队时间）',
+  (await api('POST', '/speedtest', { models: [{ provider: 'p', model: 'm3' }] })).status === 409)
+ok('㉓ GET 也能拿到进度（界面 1.5s 轮询这条）',
+  (await api('GET', '/speedtest')).body.total === 2)
+
+probeGateRelease()
+const probeDone = await waitNotRunning()
+ok('㉓ 测完 running=false 且 done=total',
+  probeDone.running === false && probeDone.done === 2, JSON.stringify({ r: probeDone.running, d: probeDone.done }))
+ok('㉓ 每个模型一行结果，带首字/速度/token',
+  probeDone.results?.length === 2
+  && probeDone.results.every(r => r.ok === true && typeof r.ttftMs === 'number' && typeof r.tps === 'number'
+    && r.inTokens === 3 && r.outTokens === 2),
+  JSON.stringify(probeDone.results?.map(r => ({ ok: r.ok, f: r.ttftMs, s: r.tps, i: r.inTokens, o: r.outTokens }))))
+ok('㉓ 结果按 provider/model 对齐，界面据此在模型列挂副行',
+  probeDone.results?.map(r => `${r.provider}/${r.model}`).sort().join(',') === 'p/m1,p/m2',
+  JSON.stringify(probeDone.results?.map(r => `${r.provider}/${r.model}`)))
+
+await api('POST', '/groups', { id: 'gs', name: 'GS', models: [
+  { provider: 'p', model: 'm1', priority: 1 },
+  { provider: 'p', model: 'm2', priority: 2, disabled: true },
+] })
+const probeByGroup = await api('POST', '/speedtest', { groupId: 'gs' })
+ok('㉓ 按分组测速时跳过已禁用的模型（它在路由里根本不会被选中）',
+  probeByGroup.status === 200 && probeByGroup.body.total === 1, JSON.stringify(probeByGroup.body))
+await waitNotRunning()
+ok('㉓ 没有可测模型时报 400（不是静默起一个空任务）',
+  (await api('POST', '/speedtest', { models: [] })).status === 400)
+ok('㉓ 连分组也不给时报 400', (await api('POST', '/speedtest', {})).status === 400)
+
 ctx.get = baseGet
 globalThis.fetch = baseFetch
 
+
+// ㉔ 请求根本没发出去就抛的失败（UNKNOWN_MODEL）只在 agent/error 上可见：
+//     用户报的 `pi-ai provider "codearts" has no configured model "glm-5.3-flash"`
+//     就是这一条（prepareCall 同步抛，不进 agent/request-error 的 waterfall）。
+//     这条入口从 agent 反查 provider/model，所以假 Agent 要能给出 model.current()。
+const llmErr = (code, message) => {
+  const err = new Error(message)
+  err.name = 'LlmError'
+  err.code = code
+  err.failure = { code, message }
+  return err
+}
+// 一个进程里插件只会被 apply 一次：⑱/⑳ 的「模拟重启」不该往同一个 handlers 里再挂
+// 监听器（那样每个事件都攒三份实例，断言只能靠猜该用哪一份）。改成只让第一次 apply
+// 注册监听器与路由；后两次仍真正执行（读回 settings/采样、重写 status 路由都靠它），
+// 只是把不是 webServer.register 的注册 API 全部换成空实现。
+// prepend 过的监听器排在列表第一位；goal-round-driver 是后注册的替身，只能排在它之后。
+// 取插件那份（按实现特征认），不要按下标取：下标取法会把「prepend 生效了吗」这件事
+// 混进 ㉔/㉕ 的断言里，真正的顺序性质由 ㉖ 单独断言。
+const agentErrorHandler = handlers.getAll('agent/error').find(f => String(f).includes('llmFailureOf')) ?? (() => {})
+const driverStandIn = handlers.getAll('agent/error').find(f => !String(f).includes('llmFailureOf')) ?? (() => {})
+if (typeof errHandler !== 'function') throw new Error('agent/request-error 没有注册监听器')
+// 插件没挂 agent/error 时这里取到的是替身：下面的 ㉔/㉕/㉖ 会自然报 FAIL，而不是把整份自检炸掉。
+if (typeof agentErrorHandler !== 'function') throw new Error('agent/error 没有任何监听器')
+{
+  const a1 = makeAgent('err-only-1', {}, 'm1')
+  agents.push(a1)
+  await api('POST', '/session-group', { sessionId: 'err-only-1', groupId: 'g2', mode: 'route' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+  useModel('err-only-1', 'm1')
+  // 真实时序：agent/error 在 turn 收尾阶段抛出，驱动器仍在跑（status=running）。
+  a1.status = 'running'
+  await agentErrorHandler({
+    agent: a1, turn: 7, step: 1,
+    error: llmErr('UNKNOWN_MODEL', 'pi-ai provider "codearts" has no configured model "glm-5.3-flash"'),
+  })
+  ok('㉔ 未配置模型（UNKNOWN_MODEL）也路由：切到组内下一个模型', switchOf('err-only-1') === 'm2',
+    `→ ${switchOf('err-only-1')}`)
+  ok('㉔ 该失败被记为当日失败（不再被路由选中）',
+    (await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'm1' && f.code === 'UNKNOWN_MODEL'))
+  a1.status = 'idle'
+  for (const fn of handlers.getAll('agent/status')) fn({ agent: a1, status: 'idle' })
+  await Promise.resolve()
+  ok('㉔ 切完模型仍排队一条续跑（本轮以错误收尾，下一轮用新模型继续）',
+    followups.some(f => f.id === 'err-only-1'))
+}
+
+// ㉕ 两条入口同时可见时不能连跳两个模型：NO_ADAPTER 先经 request-error 换到 m2，
+//     宿主随后在 turn 收尾时再发一次 agent/error（同一个 turn）——第二次必须被跳过。
+{
+  const a2 = makeAgent('err-only-2', {}, 'm1')
+  agents.push(a2)
+  await api('POST', '/session-group', { sessionId: 'err-only-2', groupId: 'g2', mode: 'route' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+  useModel('err-only-2', 'm1')
+  a2.status = 'running'
+  const action = await errHandler(
+    { agent: a2, turn: 3, provider: 'p', failure: { code: 'NO_ADAPTER', message: 'pi-ai adapter does not own provider' } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㉕ request-error 换到组内下一个模型', action === undefined && switchOf('err-only-2') === 'm2',
+    `action=${JSON.stringify(action)} → ${switchOf('err-only-2')}`)
+  await agentErrorHandler({
+    agent: a2, turn: 3, step: 1,
+    error: llmErr('NO_ADAPTER', 'pi-ai adapter does not own provider'),
+  })
+  ok('㉕ 同一个 turn 的第二次进入（agent/error）被跳过，不连跳两个模型',
+    switchOf('err-only-2') === 'm2', `→ ${switchOf('err-only-2')}`)
+}
+
+
+// ㉖ agent/error 那条入口也要保住目标：goal-round-driver 与我们在同一个 emit 里，
+//     它在我们的监听器之后同步 disarm；所以 ref 必须在第一个 await 之前抓下来，
+//     并且本监听器要 prepend 在它前面，否则读到的是已 disarm 的 goal（只认 armed）。
+{
+  const sid = 'goal-agent-error'
+  const ga = makeAgent(sid, {}, 'm1')
+  agents.push(ga)
+  await api('POST', '/session-group', { sessionId: sid, groupId: 'g2', mode: 'route' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+  useModel(sid, 'm1')
+  goalState.set(sid, { id: 'goal-d', revision: 5, phase: 'active', activation: 'armed' })
+  goalCalls.length = 0
+  ga.status = 'running'
+  // 真实宿主是同步 emit：同一个调用栈里按注册顺序把同一个 payload 交给每个监听器。
+  // 这里必须走真实顺序而不是「先调插件再调替身」——后者等于把要验的 prepend 写死了。
+  const errPayload = {
+    agent: ga, turn: 9, step: 1,
+    error: llmErr('UNKNOWN_MODEL', 'pi-ai provider "codearts" has no configured model "glm-5.3-flash"'),
+  }
+  for (const fn of handlers.getAll('agent/error')) {
+    const ret = fn(errPayload)
+    if (ret !== undefined) await ret
+  }
+  ok('㉖ agent/error 监听器 prepend 在 goal-round-driver 之前（它在同一个 emit 里 disarm）',
+    handlers.getAll('agent/error')[0] === agentErrorHandler,
+    `index=${handlers.getAll('agent/error').indexOf(agentErrorHandler)}`)
+  ok('㉖ agent/error 入口照样换到组内下一个模型', switchOf(sid) === 'm2', `→ ${switchOf(sid)}`)
+  ga.status = 'idle'
+  for (const fn of handlers.getAll('agent/status')) fn({ agent: ga, status: 'idle' })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  ok('㉖ 切换后把被 disarm 的活跃 goal 重新 arm（ref 抓在 await 之前）',
+    goalState.get(sid)?.activation === 'armed', JSON.stringify(goalState.get(sid)))
+  ok('㉖ 恢复用的仍是切换前的 ref（revision 做 CAS）',
+    goalCalls.some(c => c.sid === sid && c.ref.id === 'goal-d' && c.ref.revision === 5),
+    JSON.stringify(goalCalls))
+}
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

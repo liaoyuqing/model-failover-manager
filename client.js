@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v8'
+    var VERSION = 'v9'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -270,6 +270,14 @@ window.__ModuleLoader__.load({
         display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap',
         padding: '0 2px 8px',
       },
+      /** 操作条：分组选择 + 起始优先级 + 重设按钮 + 一键测速（表格正上方） */
+      metricsActions: {
+        display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap',
+        padding: '6px 8px', marginBottom: '6px',
+        border: '0.5px solid var(--dsw-alias-border-l2)',
+        borderRadius: 'var(--dsw-radius-sm)',
+        background: 'var(--dsw-alias-bg-layer-2)',
+      },
       metricsDate: {
         boxSizing: 'border-box', flex: '0 0 auto',
         background: 'var(--dsw-alias-bg-layer-1)',
@@ -318,6 +326,9 @@ window.__ModuleLoader__.load({
         fontSize: '10px', opacity: .55, fontVariantNumeric: 'tabular-nums',
         whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%',
       },
+      // token 列的大字：比同表其它主值大一档（15px 对 12px），它是看板上最常被
+      // 拿来横向比的一个数。字号只加在这里，其它列保持安静。
+      metricsNumBig: { fontSize: '15px', fontWeight: 600, letterSpacing: '-.2px' },
       // 模型名：允许折行（break-word 兜住没有空格的长 id）
       metricsCellModel: { minWidth: 0, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: '1.35' },
       metricsTagCell: {
@@ -515,8 +526,24 @@ window.__ModuleLoader__.load({
       var infoPair = React.useState(null); var subInfo = infoPair[0]; var setSubInfo = infoPair[1]
       /** 数据看板：GET /metrics 的结果；只在看板页签可见时才轮询 */
       var metPair = React.useState(null); var metrics = metPair[0]; var setMetrics = metPair[1]
-      /** 看板排序：{ key, dir }；null = 默认序（分组名 → 优先级 → provider/model） */
+      /**
+       * 看板排序：{ key, dir }；null = 默认序（分组名 → 优先级 → provider/model）。
+       *
+       * 初值取 status.metricsSort（Host 存在 settings.json 里），所以刷新页面、
+       * 换个浏览器、甚至重启宿主后回到看板还是上次那个排序。status 是异步到的，
+       * 由下面的 effect 补一次；用户已经点过表头（dirty）就不再覆盖。
+       */
       var sortPair = React.useState(null); var sort = sortPair[0]; var setSort = sortPair[1]
+      /** 用户是否已经自己点过表头：点过就不再让迟到的 status 覆盖排序 */
+      var sortDirtyPair = React.useState(false); var sortDirty = sortDirtyPair[0]; var setSortDirty = sortDirtyPair[1]
+      /** 重设路由优先级的起始序号（只对当前排序里「有采样」的模型生效） */
+      var orderStartPair = React.useState('1'); var orderStart = orderStartPair[0]; var setOrderStart = orderStartPair[1]
+      /** 重设优先级的目标分组；空串 = 用第一行所属分组（看板通常只展示一个分组） */
+      var orderGroupPair = React.useState(''); var orderGroupId = orderGroupPair[0]; var setOrderGroupId = orderGroupPair[1]
+      /** 一键测速：进度来自 GET /speedtest，null = 还没点过 */
+      var speedTestPair = React.useState(null); var speedTest = speedTestPair[0]; var setSpeedTest = speedTestPair[1]
+      /** 重设优先级 / 启动测速的操作回执：{ ok, text }，只保留最近一条 */
+      var orderNoticePair = React.useState(null); var orderNotice = orderNoticePair[0]; var setOrderNotice = orderNoticePair[1]
       /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
       var rangePair = React.useState({ since: '', until: '' })
       var range = rangePair[0]; var setRange = rangePair[1]
@@ -569,6 +596,42 @@ window.__ModuleLoader__.load({
         var t = setInterval(tick, 3000)
         return function () { clearInterval(t) }
       }, [open, tab, range])
+
+      /**
+       * 恢复上次的看板排序：status.settings.metricsSort 是 Host 落盘的值。
+       * 只在用户还没自己点过表头时套用——否则一次慢到的 status 会把刚点的排序
+       * 顶回旧的。sortDirty 一旦置位就不再复位，直到弹窗重新挂载。
+       */
+      React.useEffect(function () {
+        if (sortDirty) return
+        var saved = status && status.settings ? status.settings.metricsSort : null
+        if (!saved || typeof saved.key !== 'string') return
+        var dir = saved.dir === 'desc' ? 'desc' : 'asc'
+        setSort(function (prev) {
+          if (prev && prev.key === saved.key && prev.dir === dir) return prev
+          return { key: saved.key, dir: dir }
+        })
+      }, [status, sortDirty])
+
+      /**
+       * 一键测速的进度轮询：只有任务在跑时才每 1.5 秒问一次 /speedtest，
+       * 跑完就停（最后一次响应里 running=false，不再续定时器）。
+       */
+      React.useEffect(function () {
+        if (!speedTest || !speedTest.running) return
+        var t = setInterval(function () {
+          apiGet(API + '/speedtest').then(function (d) {
+            if (d) setSpeedTest(d)
+          }).catch(function () { })
+        }, 1500)
+        return function () { clearInterval(t) }
+      }, [speedTest && speedTest.running])
+
+      /** 离开看板页签时清掉测速面板（任务本身在 Host 里跑，回来还能再问） */
+      React.useEffect(function () {
+        if (tab === 'dashboard') return
+        setSpeedTest(null)
+      }, [tab])
 
       if (!props.available) return null
       // 内置模型目录对有归属的子代理会话不给快照；子代理位改用 Host 的
@@ -875,11 +938,19 @@ window.__ModuleLoader__.load({
       /**
        * 表头点击：升序 → 降序 → 回到默认序。
        * 三态循环让用户不必猜「再点一次会怎样」，也能明确退出排序。
+       *
+       * 每次点击都把结果写回 Host（settings.json 的 metricsSort），这样刷新页面
+       * 或换浏览器回来还是这个排序。写失败不打断界面：本地状态已经生效，
+       * 下次打开退回默认序而已。
        */
       function toggleSort(key) {
-        if (!sort || sort.key !== key) { setSort({ key: key, dir: 'asc' }); return }
-        if (sort.dir === 'asc') { setSort({ key: key, dir: 'desc' }); return }
-        setSort(null)
+        var next
+        if (!sort || sort.key !== key) next = { key: key, dir: 'asc' }
+        else if (sort.dir === 'asc') next = { key: key, dir: 'desc' }
+        else next = null
+        setSortDirty(true)
+        setSort(next)
+        apiSend(API + '/settings', 'POST', { metricsSort: next }).catch(function () { })
       }
 
       /** 看板与分组页签共用的刷新：metrics 与 status 一起重取（并发上限两边都显示） */
@@ -975,15 +1046,32 @@ window.__ModuleLoader__.load({
         if (key === 'rate') return rateOf(r)
         if (key === 'ttft') return isNum(r.ttftP50) ? r.ttftP50 : null
         if (key === 'tps') return isNum(r.tpsP50) ? r.tpsP50 : null
-        // token 列按总用量排（输入 + 输出），没有 token 样本的行垫底
-        if (key === 'tokens') {
-          if (!isNum(r.inTokens) && !isNum(r.outTokens)) return null
-          return (isNum(r.inTokens) ? r.inTokens : 0) + (isNum(r.outTokens) ? r.outTokens : 0)
-        }
+        // token 列看的是「历史总用量」（表格里的大字就是它），所以按同一个数排，
+        // 而不是按区间内的用量——否则点这个表头排出来的序和肉眼看到的数不一致。
+        if (key === 'tokens') return lifetimeTokensOf(r)
         // 并发列按「生效上限」排：不限（null）垫底，与显示一致
         if (key === 'conc') return Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
         return metricsStatusRank(r)
       }
+
+      /**
+       * 某行的历史 token 总量（输入 + 输出），null = 一次 usage 都没报过。
+       *
+       * 「历史」指不随日期筛选变化的全量样本，由 Host 的 lifetimeInTokens /
+       * lifetimeOutTokens 提供；旧版 Host 没有这两个字段时回落到区间内的合计，
+       * 至少不会一片空白。
+       */
+      function lifetimeTokensOf(r) {
+        var inT = isNum(r.lifetimeInTokens) ? r.lifetimeInTokens : r.inTokens
+        var outT = isNum(r.lifetimeOutTokens) ? r.lifetimeOutTokens : r.outTokens
+        var hasIn = isNum(inT)
+        var hasOut = isNum(outT)
+        if (!hasIn && !hasOut) return null
+        return (hasIn ? inT : 0) + (hasOut ? outT : 0)
+      }
+
+      /** 某行是否有任何采样（决定它是否参与「按当前排序重设优先级」） */
+      function hasSamples(r) { return isNum(r.samples) && r.samples > 0 }
 
       function dashboardTab() {
         var rows = (metrics && metrics.rows) || []
@@ -997,6 +1085,93 @@ window.__ModuleLoader__.load({
         var noneSampled = rows.length > 0 && rows.every(function (r) { return !(r.samples > 0) })
         var now = Date.now()
         var defaultHint = defConc === null ? '' : (defConc === 0 ? '当前默认不限' : '当前默认 ' + defConc)
+
+        // ---- 「按当前排序重设优先级」与「一键测速」共用的一份目标清单 ----
+        //
+        // 看板一次展示所有分组，而优先级是分组内的属性：重设必须落到某一个分组上。
+        // 由上面的分组下拉选择；缺省取排序后第一行所属分组（最常见的用法：看板里
+        // 就一个分组）。samplesOf 决定「有没有数据」——没有采样的模型被排除，
+        // 既不参与重排、也不重置它的优先级。
+        var groupOptions = []
+        var seenGroup = {}
+        sorted.forEach(function (it) {
+          var gid = it.row.groupId
+          if (!gid || seenGroup[gid]) return
+          seenGroup[gid] = true
+          groupOptions.push({ id: gid, name: it.groupName || gid })
+        })
+        var effOrderGroupId = orderGroupId || (groupOptions.length > 0 ? groupOptions[0].id : '')
+        // 有采样且属于目标分组、且没被手动禁用的行：按当前排序的先后顺序
+        var orderTargets = sorted.filter(function (it) {
+          return it.row.groupId === effOrderGroupId && hasSamples(it.row) && it.row.disabled !== true
+        }).map(function (it) { return it.row })
+        // 测速目标：同样只测有数据之外也要测——「一键测速」的价值恰恰在于给
+        // 还没采样的模型补数据，所以这里不按 samples 过滤，只排除已禁用的。
+        var speedTargets = sorted.filter(function (it) {
+          return it.row.groupId === effOrderGroupId && it.row.disabled !== true
+        }).map(function (it) { return it.row })
+
+        /**
+         * 按当前排序重设优先级：把 orderTargets 的先后顺序写回 priority。
+         * 起始序号由输入框给，缺省 1；Host 侧再校验一次（1..999）。
+         */
+        function applyReorderPriority() {
+          var start = parseInt(String(orderStart).trim(), 10)
+          if (!isFinite(start) || start < 1 || start > 999) {
+            setOrderNotice({ ok: false, text: '起始序号需为 1..999 的整数' })
+            return
+          }
+          if (!effOrderGroupId) { setOrderNotice({ ok: false, text: '先选一个分组' }); return }
+          if (orderTargets.length === 0) {
+            setOrderNotice({ ok: false, text: '当前分组里没有带采样的模型，无法按排序重设' })
+            return
+          }
+          setOrderNotice({ ok: true, text: '正在重设 ' + orderTargets.length + ' 个模型的优先级…' })
+          apiSend(API + '/groups/reorder-priority', 'POST', {
+            groupId: effOrderGroupId,
+            start: start,
+            order: orderTargets.map(function (r) { return { provider: r.provider, model: r.model } }),
+          }).then(function (res) {
+            if (res && res.ok) {
+              setOrderNotice({ ok: true, text: '已按当前排序重设 ' + res.applied + ' 个模型的优先级（' + res.start + ' 起）' })
+              return refreshMetrics()
+            }
+            setOrderNotice({ ok: false, text: (res && res.error) || '重设失败' })
+          }).catch(function (e) {
+            setOrderNotice({ ok: false, text: '重设失败：' + String(e && e.message ? e.message : e) })
+          })
+        }
+
+        /**
+         * 一键测速：对目标分组里所有未禁用的模型各打一次最小请求。
+         * 立刻返回任务快照，进度由上面的 effect 轮询 GET /speedtest 推进。
+         */
+        function startSpeedTest() {
+          if (speedTargets.length === 0) {
+            setOrderNotice({ ok: false, text: '当前分组里没有可测速的模型（都被禁用了？）' })
+            return
+          }
+          setSpeedTest({ running: true, startedAt: Date.now(), finishedAt: null, total: speedTargets.length, done: 0, results: [] })
+          apiSend(API + '/speedtest', 'POST', {
+            models: speedTargets.map(function (r) {
+              return { provider: r.provider, model: r.model, effort: r.effort || undefined }
+            }),
+          }).then(function (res) {
+            if (res) setSpeedTest(res)
+            if (!res || res.ok === false) {
+              setOrderNotice({ ok: false, text: (res && res.error) || '测速启动失败' })
+            }
+          }).catch(function (e) {
+            setSpeedTest(null)
+            setOrderNotice({ ok: false, text: '测速启动失败：' + String(e && e.message ? e.message : e) })
+          })
+        }
+
+        /** 测速结果按 provider/model 索引，行内直接标出本次实测值 */
+        var probeByKey = {}
+        if (speedTest && speedTest.results) {
+          speedTest.results.forEach(function (p) { if (p) probeByKey[keyOf(p.provider, p.model)] = p })
+        }
 
 
         /** 表头：点击切 升序 → 降序 → 默认序；▲/▼ 标出当前排序列与方向 */
@@ -1073,6 +1248,64 @@ window.__ModuleLoader__.load({
           metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
           metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
 
+          // 操作条：把「看着这个顺序顺眼，就照它排路由」和「这些模型现在到底通不通」
+          // 两件看板上最常用的动作放在表格正上方，不用再翻分组页签。
+          rows.length > 0 && e('div', { style: S.metricsActions },
+            e('span', { style: { fontSize: '11px', opacity: .6, flexShrink: 0 } }, '分组'),
+            groupOptions.length > 1
+              ? e('select', {
+                style: S.metricsDate,
+                value: effOrderGroupId,
+                title: '重设优先级与一键测速都作用于这个分组',
+                onChange: function (ev) { setOrderGroupId(ev.target.value) },
+              }, groupOptions.map(function (g) {
+                return e('option', { key: g.id, value: g.id }, g.name)
+              }))
+              : e('span', { style: { fontSize: '11px', opacity: .8 } },
+                groupOptions.length === 1 ? groupOptions[0].name : '—'),
+            e('span', { style: { opacity: .3, fontSize: '11px' } }, '|'),
+            e('span', {
+              style: { fontSize: '11px', opacity: .6, flexShrink: 0 },
+              title: '重设优先级时从这个序号开始，依次加一',
+            }, '起始优先级'),
+            e('input', {
+              type: 'number', min: 1, max: 999, step: 1,
+              style: Object.assign({}, S.metricsDate, { width: '58px' }),
+              value: orderStart,
+              title: '1..999；当前排序里有采样的模型从它开始依次占用',
+              onChange: function (ev) { setOrderStart(ev.target.value) },
+            }),
+            e('button', {
+              style: S.btn,
+              disabled: orderTargets.length === 0,
+              title: orderTargets.length === 0
+                ? '当前分组里没有带采样的模型，先跑一次会话或点右侧「一键测速」'
+                : '按看板当前排序，把 ' + orderTargets.length + ' 个有数据的模型的优先级从 '
+                  + (orderStart || '1') + ' 起依次重排（无数据的模型保持原优先级）',
+              onClick: applyReorderPriority,
+            }, '按当前排序重设优先级'),
+            e('span', { style: { fontSize: '10px', opacity: .45 } },
+              orderTargets.length > 0 ? orderTargets.length + ' 个有数据' : '无带数据模型'),
+            e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' } },
+              speedTest && speedTest.running && e('span', { style: { fontSize: '11px', opacity: .7 } },
+                '测速中 ' + (speedTest.done || 0) + '/' + (speedTest.total || 0)),
+              speedTest && !speedTest.running && e('span', { style: { fontSize: '11px', opacity: .6 } },
+                '测速完成 '
+                + (speedTest.results || []).filter(function (p) { return p && p.ok }).length
+                + '/' + (speedTest.total || 0)),
+              e('button', {
+                style: S.btn,
+                disabled: !!(speedTest && speedTest.running),
+                title: '对当前分组里未禁用的模型各发一次最小请求，实测首字延迟与输出速度（结果同时进入采样）',
+                onClick: startSpeedTest,
+              }, speedTest && speedTest.running ? '测速进行中…' : '一键测速'))),
+          orderNotice && e('div', {
+            style: {
+              fontSize: '11px', padding: '0 2px 6px',
+              color: orderNotice.ok ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-state-warn-label)',
+            },
+          }, orderNotice.text),
+
           rows.length > 0 && e('div', { style: S.metricsTable },
             e('div', { style: Object.assign({}, S.metricsRow, S.metricsRowHead) },
               sortHead('model', '模型', false),
@@ -1115,7 +1348,23 @@ window.__ModuleLoader__.load({
                     title: r.provider + '/' + r.model + (it.groupName ? '\n分组：' + it.groupName : ''),
                   }, r.provider + '/' + r.model),
                   e('div', { style: S.metricsSub },
-                    it.groupName ? it.groupName : '未分组')),
+                    it.groupName ? it.groupName : '未分组'),
+                  // 一键测速的本次实测结果：贴在模型名下，与看板的历史聚合值区分开。
+                  // 失败只标错误码，不占一整行——表格里最要紧的是「通 / 不通」。
+                  (function () {
+                    var p = probeByKey[k]
+                    if (!p) return null
+                    return e('div', {
+                      style: Object.assign({}, S.metricsSub, { opacity: .85 },
+                        p.ok ? {} : { color: 'var(--dsw-alias-state-warn-label)' }),
+                      title: p.ok
+                        ? '本次测速：首字 ' + fmtMs(p.ttftMs) + '，速度 ' + fmtTps(p.tps)
+                          + (isNum(p.outTokens) ? '，输出 ' + p.outTokens + ' tok' : '')
+                        : '本次测速失败：' + (p.errorCode || 'ERROR') + (p.error ? '（' + p.error + '）' : ''),
+                    }, p.ok
+                      ? '测速 ' + fmtMs(p.ttftMs) + ' · ' + fmtTps(p.tps)
+                      : '测速失败 ' + (p.errorCode || 'ERROR'))
+                  })()),
                 // 成功率：主行百分比、副行「成功数/采样数」。没样本（分母 0）两行都写 —，
                 // 不显示 0%——0% 会被读成「全都失败」，与「还没打过」是两回事。
                 (function () {
@@ -1138,18 +1387,33 @@ window.__ModuleLoader__.load({
                 })(),
                 p90Cell(r.ttftP50, r.ttftP90, fmtMs),
                 p90Cell(r.tpsP50, r.tpsP90, fmtTps),
-                // token：主行输出用量、副行输入用量（带 token 数的样本条数放 title）。
-                // 没有 usage 的调用不计入；一条都没有时显示 —，不显示 0（0 会被读成「确实没用量」）。
-                e('div', { style: S.metricsNumCell },
-                  e('span', {
-                    style: S.metricsNumMain,
-                    title: '输出 token 合计（区间内）'
-                      + (isNum(r.tokenSamples) ? '\n有 token 数据的样本：' + r.tokenSamples + ' / ' + (isNum(r.samples) ? r.samples : 0) : ''),
-                  }, isNum(r.outTokens) && r.tokenSamples > 0 ? fmtTokens(r.outTokens) : '—'),
-                  isNum(r.inTokens) && r.tokenSamples > 0 && e('span', {
-                    style: S.metricsNumSub,
-                    title: '输入 token 合计（区间内）',
-                  }, '↑' + fmtTokens(r.inTokens))),
+                // token：大字是**历史总用量**（不随日期筛选变化，输入 + 输出），
+                // 副行给输入/输出的拆分。区间内用量放在 title 里——用户要的是
+                // 「这个模型一共烧了多少 token」，区间数字只在排查某天时才有用。
+                (function () {
+                  var lifetimeTotal = lifetimeTokensOf(r)
+                  var lifetimeIn = isNum(r.lifetimeInTokens) ? r.lifetimeInTokens : r.inTokens
+                  var lifetimeOut = isNum(r.lifetimeOutTokens) ? r.lifetimeOutTokens : r.outTokens
+                  var tokenSamples = isNum(r.lifetimeTokenSamples) ? r.lifetimeTokenSamples : r.tokenSamples
+                  var split = []
+                  if (isNum(lifetimeIn) && lifetimeIn > 0) split.push('↑' + fmtTokens(lifetimeIn))
+                  if (isNum(lifetimeOut) && lifetimeOut > 0) split.push('↓' + fmtTokens(lifetimeOut))
+                  return e('div', { style: S.metricsNumCell },
+                    e('span', {
+                      style: Object.assign({}, S.metricsNumMain, S.metricsNumBig),
+                      title: '历史 token 总用量（全部样本，输入 + 输出）：'
+                        + (lifetimeTotal === null ? '—' : fmtTokens(lifetimeTotal))
+                        + '\n输入 ' + (isNum(lifetimeIn) ? fmtTokens(lifetimeIn) : '—')
+                        + ' / 输出 ' + (isNum(lifetimeOut) ? fmtTokens(lifetimeOut) : '—')
+                        + (isNum(tokenSamples) ? '\n有 token 数据的样本：' + tokenSamples + ' / ' + (isNum(r.samples) ? r.samples : 0) : '')
+                        + '\n当前日期区间内：↑' + (isNum(r.inTokens) ? fmtTokens(r.inTokens) : '—')
+                        + ' ↓' + (isNum(r.outTokens) ? fmtTokens(r.outTokens) : '—'),
+                    }, lifetimeTotal === null ? '—' : fmtTokens(lifetimeTotal)),
+                    split.length > 0 && e('span', {
+                      style: S.metricsNumSub,
+                      title: '历史输入 / 输出 token 拆分（不受日期筛选影响）',
+                    }, split.join(' ')))
+                })(),
                 // 并发：只读展示「进行中 / 上限」，上限在模型页签改
                 e('div', { style: S.metricsNumCell },
                   e('span', {
