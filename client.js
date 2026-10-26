@@ -283,11 +283,12 @@ window.__ModuleLoader__.load({
         background: 'var(--dsw-alias-bg-layer-1)',
       },
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
-      // 五列：模型 / 首字 / 速度 / 并发 / 状态。状态列固定宽，否则「当日失败 +
+      // 六列：模型 / 首字 / 速度 / token / 并发 / 状态。状态列固定宽，否则「当日失败 +
       // 错误码」会把 auto 列撑宽、把模型列从 308px 压到 248px，整张表看着就乱了。
+      // token 列比速度列宽一点：它要放「1.2K / 8.4K」这种两个数。
       metricsRow: {
         display: 'grid',
-        gridTemplateColumns: 'minmax(120px, 1fr) 66px 82px 76px 92px',
+        gridTemplateColumns: 'minmax(120px, 1fr) 66px 82px 96px 76px 92px',
         alignItems: 'center', gap: '8px', padding: '6px 10px',
         borderTop: '0.5px solid var(--dsw-alias-border-l1)',
         fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
@@ -421,6 +422,13 @@ window.__ModuleLoader__.load({
     function fmtMs(v) { return isNum(v) ? Math.round(v) + 'ms' : '—' }
     function fmtTps(v) { return isNum(v) ? (Math.round(v * 10) / 10).toFixed(1) + ' tok/s' : '—' }
     function fmtConcLimit(v) { return Number.isInteger(v) && v > 0 ? String(v) : '不限' }
+    /** 压缩计数写法：1234 → 1.2K，1234567 → 1.2M；保留一位小数，够看板比对用量 */
+    function fmtTokens(v) {
+      if (!isNum(v)) return '—'
+      if (v < 1000) return String(Math.round(v))
+      if (v < 1e6) return (Math.round(v / 100) / 10).toFixed(1) + 'K'
+      return (Math.round(v / 1e5) / 10).toFixed(1) + 'M'
+    }
     /** 合法的并发上限：正整数；其余（空、0、非整数）都表示「没配，跟随默认」 */
     function validConc(v) {
       var n = Math.floor(Number(v))
@@ -947,6 +955,11 @@ window.__ModuleLoader__.load({
         if (key === 'model') return r.provider + '/' + r.model
         if (key === 'ttft') return isNum(r.ttftP50) ? r.ttftP50 : null
         if (key === 'tps') return isNum(r.tpsP50) ? r.tpsP50 : null
+        // token 列按总用量排（输入 + 输出），没有 token 样本的行垫底
+        if (key === 'tokens') {
+          if (!isNum(r.inTokens) && !isNum(r.outTokens)) return null
+          return (isNum(r.inTokens) ? r.inTokens : 0) + (isNum(r.outTokens) ? r.outTokens : 0)
+        }
         // 并发列按「生效上限」排：不限（null）垫底，与显示一致
         if (key === 'conc') return Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
         return metricsStatusRank(r)
@@ -1028,10 +1041,13 @@ window.__ModuleLoader__.load({
             (range.since || range.until) && e('span', { style: { fontSize: '11px', opacity: .5 } },
               '已筛选，结果不含区间外的样本')),
           e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
-            '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；并发 = 正在进行的请求 / 生效上限'
+            '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
+            + 'token = 区间内该模型的输入/输出用量合计（只统计适配器报了 usage 的调用）；'
+            + '并发 = 正在进行的请求 / 生效上限'
             + '（上限在「模型」页签的模型行上设置，对所有分组统一生效）。'),
           e('div', { style: S.metricsNote },
-            '副行灰字是该列的补充：首字与速度给 P90，并发给等槽时间与排队数，模型给所属分组与当日采样。'),
+            '副行灰字是该列的补充：首字与速度给 P90，token 给输入用量，并发给等槽时间与排队数，'
+            + '模型给所属分组与当日采样。采样与 token 用量会落盘，重启后仍在。'),
           noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
           metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
           metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
@@ -1041,6 +1057,7 @@ window.__ModuleLoader__.load({
               sortHead('model', '模型', false),
               sortHead('ttft', '首字', true),
               sortHead('tps', '速度', true),
+              sortHead('tokens', 'token', true),
               sortHead('conc', '并发', true),
               sortHead('status', '状态', false)),
             sorted.map(function (it) {
@@ -1080,6 +1097,18 @@ window.__ModuleLoader__.load({
                     + ' · ' + (isNum(r.okSamples) ? r.okSamples : 0) + '/' + (isNum(r.samples) ? r.samples : 0) + ' 成功')),
                 p90Cell(r.ttftP50, r.ttftP90, fmtMs),
                 p90Cell(r.tpsP50, r.tpsP90, fmtTps),
+                // token：主行输出用量、副行输入用量（带 token 数的样本条数放 title）。
+                // 没有 usage 的调用不计入；一条都没有时显示 —，不显示 0（0 会被读成「确实没用量」）。
+                e('div', { style: S.metricsNumCell },
+                  e('span', {
+                    style: S.metricsNumMain,
+                    title: '输出 token 合计（区间内）'
+                      + (isNum(r.tokenSamples) ? '\n有 token 数据的样本：' + r.tokenSamples + ' / ' + (isNum(r.samples) ? r.samples : 0) : ''),
+                  }, isNum(r.outTokens) && r.tokenSamples > 0 ? fmtTokens(r.outTokens) : '—'),
+                  isNum(r.inTokens) && r.tokenSamples > 0 && e('span', {
+                    style: S.metricsNumSub,
+                    title: '输入 token 合计（区间内）',
+                  }, '↑' + fmtTokens(r.inTokens))),
                 // 并发：只读展示「进行中 / 上限」，上限在模型页签改
                 e('div', { style: S.metricsNumCell },
                   e('span', {

@@ -18,7 +18,7 @@
  *   ⑦ 手动标记失败 / ⑧ 禁用参与路由
  */
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from './host.mjs'
@@ -846,6 +846,54 @@ ok('⑯c 普通 400 仍按当日失败处理（阈值不过宽）',
   (await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'm1'),
   JSON.stringify((await api('GET', '/status')).body.failed))
 await api('POST', '/failed/reset', {})
+
+// ⑰ token 用量：入/出分别累加，且只统计适配器报了 usage 的调用
+const tokRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑰ 看板行带 token 汇总字段',
+  tokRow !== undefined && 'inTokens' in tokRow && 'outTokens' in tokRow && 'tokenSamples' in tokRow,
+  JSON.stringify(tokRow && { i: tokRow.inTokens, o: tokRow.outTokens, n: tokRow.tokenSamples }))
+// fakeStream 每次吐 input 10 / output 8，共跑了两次（⑬ 的 A、B）
+ok('⑰ 输入 token 是区间内累加值（10×2）', tokRow?.inTokens === 20, `in=${tokRow?.inTokens}`)
+ok('⑰ 输出 token 是区间内累加值（8×2）', tokRow?.outTokens === 16, `out=${tokRow?.outTokens}`)
+ok('⑰ tokenSamples 只数带 usage 的样本', tokRow?.tokenSamples >= 2, `n=${tokRow?.tokenSamples}`)
+const emptyTokRow = (await api('GET', '/metrics')).body.rows.find(r => r.samples === 0)
+ok('⑰ 没采样过的模型 token 为 0 而不是 null（sum of nothing）',
+  emptyTokRow !== undefined && emptyTokRow.inTokens === 0 && emptyTokRow.outTokens === 0
+  && emptyTokRow.tokenSamples === 0, JSON.stringify(emptyTokRow))
+
+// ⑱ 采样落盘：看板数据必须跨重启保留
+//     刷新是防抖的（1.5s），这里等它落盘后检查文件内容与「重启后能否读回」。
+await new Promise(r => setTimeout(r, 1800))
+const metricsPath = join(dir, 'metrics.json')
+ok('⑱ 采样写进了 dataDir/metrics.json', existsSync(metricsPath), metricsPath)
+const onDisk = existsSync(metricsPath) ? JSON.parse(readFileSync(metricsPath, 'utf8')) : null
+ok('⑱ 落盘内容按 provider/model 分组，且带 token 字段',
+  onDisk?.['pc/mc']?.length >= 2
+  && typeof onDisk['pc/mc'][0].inTokens === 'number'
+  && typeof onDisk['pc/mc'][0].outTokens === 'number',
+  JSON.stringify(onDisk?.['pc/mc']?.slice(-1)))
+// 模拟重启：用同一个 dataDir 重新 apply 一次，历史样本应被读回
+const ctx2 = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
+let routeHandler2 = null
+ctx2.get = baseGet
+ctx2.on = ctx.on
+ctx2.inject = (_n, cb) => cb({
+  webServer: { register(spec) { routeHandler2 = spec.handler; return () => {} } },
+  effect() {}, interval() { return () => {} },
+})
+apply(ctx2, { dataDir: dir })
+const res2 = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
+const req2 = new EventEmitter()
+req2.method = 'GET'; req2.url = '/api/model-failover/metrics'
+routeHandler2(req2, res2)
+req2.emit('end')
+await new Promise(r => setTimeout(r, 30))
+const restarted = JSON.parse(res2.body || '{}').rows?.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑱ 重启后样本仍在（samples/token 都能读回）',
+  restarted?.samples >= 2 && restarted?.inTokens === 20 && restarted?.outTokens === 16,
+  JSON.stringify(restarted && { s: restarted.samples, i: restarted.inTokens, o: restarted.outTokens }))
+ok('⑱ 重启后首字与速度分位数也在', typeof restarted?.tpsP50 === 'number' && typeof restarted?.ttftP50 === 'number',
+  JSON.stringify(restarted && { t: restarted.tpsP50, f: restarted.ttftP50 }))
 
 ctx.get = baseGet
 globalThis.fetch = baseFetch

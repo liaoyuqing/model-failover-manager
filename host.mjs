@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v64'
+const HOST_VERSION = 'v65'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -661,9 +661,50 @@ export function apply(ctx, config = {}) {
   const speedSamples = new Map()
 
   /**
+   * 采样落盘文件。缓冲区是内存态的，重启即清空；看板要跨重启保留，
+   * 所以每次记样本后写一份到 dataDir（最多 SPEED_SAMPLE_LIMIT × 模型数个对象，
+   * 量级几十 KB，直接整体覆写比维护增量日志简单且不会写出半截文件）。
+   */
+  const metricsFile = join(dataDir, 'metrics.json')
+
+  /** 落盘防抖：一次会话里连续几十次调用不必每次同步写盘 */
+  let metricsFlushTimer = null
+  const METRICS_FLUSH_DELAY_MS = 1500
+
+  function flushMetrics() {
+    if (metricsFlushTimer !== null) { clearTimeout(metricsFlushTimer); metricsFlushTimer = null }
+    try {
+      /** @type {Record<string, any[]>} */
+      const out = {}
+      for (const [key, list] of speedSamples) out[key] = list
+      writeJson(metricsFile, out)
+    } catch { /* 采样落盘失败只影响看板历史，绝不影响主流程 */ }
+  }
+
+  function scheduleMetricsFlush() {
+    if (metricsFlushTimer !== null) return
+    metricsFlushTimer = setTimeout(flushMetrics, METRICS_FLUSH_DELAY_MS)
+    // 别让一次挂起的落盘把进程钉住
+    if (typeof metricsFlushTimer?.unref === 'function') metricsFlushTimer.unref()
+  }
+
+  // 启动时读回历史样本；样本字段随版本增补（如 inTokens），
+  // 老样本缺字段时按 null 处理——不拿 0 冒充，否则看板会把「没记」显示成「用了 0」。
+  try {
+    const saved = readJson(metricsFile, null)
+    if (saved && typeof saved === 'object') {
+      for (const [key, list] of Object.entries(saved)) {
+        if (!Array.isArray(list)) continue
+        const clean = list.filter(s => s && typeof s.at === 'number')
+        if (clean.length > 0) speedSamples.set(key, clean.slice(-SPEED_SAMPLE_LIMIT))
+      }
+    }
+  } catch { /* 损坏的采样文件当作没有历史，不让插件起不来 */ }
+
+  /**
    * 记一条速度样本并裁剪。
    * @param {string} key - `provider/model`。
-   * @param {{ttftMs: number|null, outTokens: number, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, at: number}} sample - 一次调用的观测值。
+   * @param {{ttftMs: number|null, inTokens: number|null, outTokens: number|null, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, at: number}} sample - 一次调用的观测值。
    * @returns {void}
    */
   function recordSpeedSample(key, sample) {
@@ -671,15 +712,16 @@ export function apply(ctx, config = {}) {
     list.push(sample)
     if (list.length > SPEED_SAMPLE_LIMIT) list.splice(0, list.length - SPEED_SAMPLE_LIMIT)
     speedSamples.set(key, list)
+    scheduleMetricsFlush()
   }
 
   /**
-   * 汇总某模型的看板数据：首字延迟、输出速度、排队等待的分位数。
+   * 汇总某模型的看板数据：首字延迟、输出速度、排队等待的分位数，以及 token 用量。
    * @param {string} key - `provider/model`。
    * @param {{since?: number, until?: number}} [window] - 采样时间窗（毫秒时间戳，两端包含）；
    *   省略则统计全部保留的样本。日期筛选由这里做，而不是交给界面：缓冲区只有
    *   最近 N 条，若先取分位数再筛，算出来的就是「最近 N 条」而不是「所选区间」。
-   * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
+   * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, inTokens: number, outTokens: number, tokenSamples: number, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
    */
   function speedStatsOf(key, window) {
     const all = speedSamples.get(key) ?? []
@@ -691,6 +733,11 @@ export function apply(ctx, config = {}) {
     const ttfts = numbers(s => s.ttftMs)
     const tpss = numbers(s => s.speedTps)
     const waits = numbers(s => s.waitMs)
+    // token 用量按区间求和：适配器没报 usage 的调用不计入（老样本也没有该字段），
+    // 所以另外给出「有多少条样本带 token 数」，界面据此说明覆盖范围。
+    const inTok = numbers(s => s.inTokens)
+    const outTok = numbers(s => s.outTokens)
+    const tokenSamples = list.filter(s => typeof s.inTokens === 'number' || typeof s.outTokens === 'number').length
     const pick = (arr, q) => {
       if (arr.length === 0) return null
       const sorted = [...arr].sort((a, b) => a - b)
@@ -709,6 +756,9 @@ export function apply(ctx, config = {}) {
       tpsP50: pick(tpss, 0.5),
       tpsP90: pick(tpss, 0.9),
       waitP50: pick(waits, 0.5),
+      inTokens: inTok.reduce((a, b) => a + b, 0),
+      outTokens: outTok.reduce((a, b) => a + b, 0),
+      tokenSamples,
       lastAt: list.length === 0 ? null : list[list.length - 1].at,
       lastErrorCode,
     }
@@ -740,7 +790,7 @@ export function apply(ctx, config = {}) {
       // 取消不是失败：既不采样，也不换模型，原样抛给宿主按取消处理。
       if (err?.code !== CAPACITY_TIMEOUT_CODE) throw err
       recordSpeedSample(key, {
-        ttftMs: null, outTokens: 0, speedTps: null,
+        ttftMs: null, inTokens: null, outTokens: null, speedTps: null,
         waitMs: Date.now() - startedAt, ok: false, errorCode: CAPACITY_TIMEOUT_CODE, at: Date.now(),
       })
       yield { type: 'finish', reason: { kind: 'error', failure: { message: err.message, code: CAPACITY_TIMEOUT_CODE } } }
@@ -750,6 +800,7 @@ export function apply(ctx, config = {}) {
     const generatingStart = Date.now()
     let firstTokenAt = null
     let usageOut = null
+    let usageIn = null
     let failureCode = null
     let settledOk = false
     try {
@@ -758,7 +809,9 @@ export function apply(ctx, config = {}) {
           && (chunk?.type === 'text-delta' || chunk?.type === 'reasoning-delta' || chunk?.type === 'tool-call-delta')) {
           firstTokenAt = Date.now()
         }
+        // 一次调用可能吐多条 usage（增量或最后一次汇总），取最后一条为准
         if (chunk?.type === 'usage' && typeof chunk.usage?.outputTokens === 'number') usageOut = chunk.usage.outputTokens
+        if (chunk?.type === 'usage' && typeof chunk.usage?.inputTokens === 'number') usageIn = chunk.usage.inputTokens
         if (chunk?.type === 'finish') {
           const kind = chunk.reason?.kind
           settledOk = kind !== 'error' && kind !== 'aborted'
@@ -778,7 +831,8 @@ export function apply(ctx, config = {}) {
         : null
       recordSpeedSample(key, {
         ttftMs,
-        outTokens: usageOut ?? 0,
+        inTokens: usageIn,
+        outTokens: usageOut,
         speedTps,
         waitMs,
         ok: settledOk,
@@ -2800,5 +2854,7 @@ export function apply(ctx, config = {}) {
     disposeStop()
     if (qoderShimHandle) qoderShimHandle.stop()
     if (routeDisposer) routeDisposer()
+    // 卸载即刷新待写样本，否则最近 1.5s 内的采样会随进程一起消失
+    flushMetrics()
   }, 'model-failover-manager: unmount')
 }
