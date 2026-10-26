@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v7'
+    var VERSION = 'v8'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -283,12 +283,13 @@ window.__ModuleLoader__.load({
         background: 'var(--dsw-alias-bg-layer-1)',
       },
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
-      // 六列：模型 / 首字 / 速度 / token / 并发 / 状态。状态列固定宽，否则「当日失败 +
+      // 七列：模型 / 成功率 / 首字 / 速度 / token / 并发 / 状态。状态列固定宽，否则「当日失败 +
       // 错误码」会把 auto 列撑宽、把模型列从 308px 压到 248px，整张表看着就乱了。
       // token 列比速度列宽一点：它要放「1.2K / 8.4K」这种两个数。
+      // 成功率列只放「98.5%」加副行「166/168」：主值够宽就够，副行靠 10px 字号塞进同一格。
       metricsRow: {
         display: 'grid',
-        gridTemplateColumns: 'minmax(120px, 1fr) 66px 82px 96px 76px 92px',
+        gridTemplateColumns: 'minmax(120px, 1fr) 56px 66px 82px 96px 76px 92px',
         alignItems: 'center', gap: '8px', padding: '6px 10px',
         borderTop: '0.5px solid var(--dsw-alias-border-l1)',
         fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
@@ -429,6 +430,22 @@ window.__ModuleLoader__.load({
       if (v < 1e6) return (Math.round(v / 100) / 10).toFixed(1) + 'K'
       return (Math.round(v / 1e5) / 10).toFixed(1) + 'M'
     }
+    /**
+     * 成功率：ok / samples 的百分比。保留一位小数，但 100% 与 0% 不加小数——
+     * 只有这两种是「全对 / 全错」，多写个 .0 反而像还有误差。
+     * 分母为 0（还没采样）返回 null，由调用方画 —。
+     */
+    function fmtRate(ok, samples) {
+      if (!isNum(ok) || !isNum(samples) || samples <= 0) return null
+      var ratio = Math.max(0, Math.min(1, ok / samples))
+      if (ratio >= 1) return '100%'
+      if (ratio <= 0) return '0%'
+      return (Math.round(ratio * 1000) / 10).toFixed(1) + '%'
+    }
+    /** 成功率的排序 / 配色取值：null 表示没采样（排序恒定垫底、不参与配色） */
+    function rateOf(r) {
+      return isNum(r.okSamples) && isNum(r.samples) && r.samples > 0 ? r.okSamples / r.samples : null
+    }
     /** 合法的并发上限：正整数；其余（空、0、非整数）都表示「没配，跟随默认」 */
     function validConc(v) {
       var n = Math.floor(Number(v))
@@ -438,7 +455,8 @@ window.__ModuleLoader__.load({
     /**
      * 拉看板数据。
      * @param {{since?: string, until?: string}} [range] - YYYY-MM-DD，按北京时间整天；
-     *   省略即全部保留的样本。筛选在 Host 侧做——缓冲区只有最近 N 条，界面拿不到被裁掉的。
+     *   省略即全部样本。筛选在 Host 侧做——汇总（成功率、分位数、token 合计）要按
+     *   所选区间算，界面拿不到区间内的原始样本。
      */
     function loadMetrics(range) {
       var qs = ''
@@ -953,6 +971,8 @@ window.__ModuleLoader__.load({
       /** 某一列的排序值；null 表示「没有数据」，排序时恒定垫底 */
       function metricsSortValue(r, key) {
         if (key === 'model') return r.provider + '/' + r.model
+        // 成功率按 ratio 排（不是按字符串），没样本的行垫底
+        if (key === 'rate') return rateOf(r)
         if (key === 'ttft') return isNum(r.ttftP50) ? r.ttftP50 : null
         if (key === 'tps') return isNum(r.tpsP50) ? r.tpsP50 : null
         // token 列按总用量排（输入 + 输出），没有 token 样本的行垫底
@@ -1006,8 +1026,8 @@ window.__ModuleLoader__.load({
                 style: S.btn,
                 onClick: function () { refreshMetrics() },
               }, '刷新'))),
-          // 日期筛选：按北京时间整天。筛选在 Host 侧做（缓冲区只留最近 N 条，
-          // 界面自己筛会把更早的样本算丢）。快捷区间覆盖最常用的三种看法。
+          // 日期筛选：按北京时间整天。筛选在 Host 侧做（区间内的分位数与合计要在
+          // 同一批样本上算，不能在界面里二次切分）。快捷区间覆盖最常用的三种看法。
           e('div', { style: S.metricsFilter },
             e('span', { style: { fontSize: '11px', opacity: .6, flexShrink: 0 } }, '日期'),
             e('input', {
@@ -1041,13 +1061,14 @@ window.__ModuleLoader__.load({
             (range.since || range.until) && e('span', { style: { fontSize: '11px', opacity: .5 } },
               '已筛选，结果不含区间外的样本')),
           e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
-            '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
+            '成功率 = 区间内成功调用 / 区间内全部采样（历史全部保留，不按条数截断）；'
+            + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
             + 'token = 区间内该模型的输入/输出用量合计（只统计适配器报了 usage 的调用）；'
             + '并发 = 正在进行的请求 / 生效上限'
             + '（上限在「模型」页签的模型行上设置，对所有分组统一生效）。'),
           e('div', { style: S.metricsNote },
-            '副行灰字是该列的补充：首字与速度给 P90，token 给输入用量，并发给等槽时间与排队数，'
-            + '模型给所属分组与当日采样。采样与 token 用量会落盘，重启后仍在。'),
+            '副行灰字是该列的补充：成功率给成功数 / 采样数，首字与速度给 P90，token 给输入用量，'
+            + '并发给等槽时间与排队数，模型给所属分组。采样与 token 用量会落盘，重启后仍在。'),
           noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
           metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
           metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
@@ -1055,6 +1076,7 @@ window.__ModuleLoader__.load({
           rows.length > 0 && e('div', { style: S.metricsTable },
             e('div', { style: Object.assign({}, S.metricsRow, S.metricsRowHead) },
               sortHead('model', '模型', false),
+              sortHead('rate', '成功率', true),
               sortHead('ttft', '首字', true),
               sortHead('tps', '速度', true),
               sortHead('tokens', 'token', true),
@@ -1093,8 +1115,27 @@ window.__ModuleLoader__.load({
                     title: r.provider + '/' + r.model + (it.groupName ? '\n分组：' + it.groupName : ''),
                   }, r.provider + '/' + r.model),
                   e('div', { style: S.metricsSub },
-                    (it.groupName ? it.groupName : '未分组')
-                    + ' · ' + (isNum(r.okSamples) ? r.okSamples : 0) + '/' + (isNum(r.samples) ? r.samples : 0) + ' 成功')),
+                    it.groupName ? it.groupName : '未分组')),
+                // 成功率：主行百分比、副行「成功数/采样数」。没样本（分母 0）两行都写 —，
+                // 不显示 0%——0% 会被读成「全都失败」，与「还没打过」是两回事。
+                (function () {
+                  var ratio = rateOf(r)
+                  var rateText = fmtRate(r.okSamples, r.samples)
+                  // 样本太少时不下颜色判断：2 条里错 1 条不该红一整行
+                  var enough = isNum(r.samples) && r.samples >= 5
+                  var warn = ratio !== null && enough && ratio < 0.9
+                  return e('div', { style: S.metricsNumCell },
+                    e('span', {
+                      style: Object.assign({}, S.metricsNumMain,
+                        warn ? { color: 'var(--dsw-alias-state-warn-label)', fontWeight: 600 } : {}),
+                      title: '成功率 = 成功调用 / 采样数（区间内全部采样，不限条数）'
+                        + (isNum(r.okSamples) && isNum(r.samples) ? '\n' + r.okSamples + ' 成功 / ' + r.samples + ' 次' : ''),
+                    }, rateText === null ? '—' : rateText),
+                    rateText !== null && e('span', {
+                      style: S.metricsNumSub,
+                      title: '成功数 / 采样数',
+                    }, (isNum(r.okSamples) ? r.okSamples : 0) + '/' + (isNum(r.samples) ? r.samples : 0)))
+                })(),
                 p90Cell(r.ttftP50, r.ttftP90, fmtMs),
                 p90Cell(r.tpsP50, r.tpsP90, fmtTps),
                 // token：主行输出用量、副行输入用量（带 token 数的样本条数放 title）。

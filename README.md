@@ -216,13 +216,17 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`（并发占满、账号本身没坏），重启账号池只会打断正在跑的请求，所以按并发类失败临时换模型，不动账号池。只有池里确实全被禁用或冷却时才重启。
 
-「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、token 用量、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），错误码放在副行，列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。
+「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、token 用量、成功率、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），错误码放在副行，列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。
+
+成功率列：主行是区间内成功调用 / 区间内全部采样，副行写「成功数/采样数」。样本少于 5 条时只显示数值、不标黄，避免 2 条错 1 条就把整行染红；失败多到 90% 以下才转成警示色。
 
 token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输入**用量合计。两者都只累加适配器报了 `usage` 的调用，所以悬停提示同时给「有 token 数据的样本 / 总样本」——没有 usage 的 provider 会一直显示 `—`，而不是 0（0 会被读成「确实没用量」，与「没记」是两件事）。
 
-顶部有日期筛选：两个 `YYYY-MM-DD` 输入框 +「今天」「近 7 天」「全部」快捷项，按北京时间整天、两端包含。筛选在宿主侧做，因为每个模型只保留最近 200 条样本——如果在界面里筛汇总值，算出来的会是「保留的那一段」而不是所选区间。
+顶部有日期筛选：两个 `YYYY-MM-DD` 输入框 +「今天」「近 7 天」「全部」快捷项，按北京时间整天、两端包含。筛选在宿主侧做：成功率、分位数、token 合计都要按所选区间算，不能先在界面里取一段缓冲再汇总。
 
-样本会落盘到 `dataDir/metrics.json`（每个模型最近 200 条，写盘防抖 1.5 秒、卸载时强制刷新），所以看板数据跨重启保留。老样本缺 token 字段时按「无数据」处理，不补 0。
+采样**不设条数上限**：每个模型保留启动以来的全部调用样本。条数上限会把「所选区间」偷换成「最近 N 条」——筛选早一点的日期、或模型一天里跑上万次，成功率和 token 合计就只是最后一段的和。单条样本只有几十字节，按条数砍掉的是用户要看的历史。
+
+样本会落盘到 `dataDir/metrics.json`（全量样本，写盘防抖 1.5 秒、卸载时强制刷新），所以看板数据跨重启保留。老样本缺 token 字段时按「无数据」处理，不补 0。
 
 ## 请求被拒也算失败，也要换模型
 
@@ -340,16 +344,21 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   normal), puts the error code on a second line, and has a fixed width: an auto-width last column
   let a row with an error code widen its own cell and squeeze the model name, which reads as
   misaligned columns across the table.
+- A success-rate column shows successful calls over all samples in the selected range, with the raw
+  counts underneath. Ratings stay neutral below five samples — one failure out of two should not
+  paint a whole row — and turn to the warning colour only under 90%.
 - A date filter sits above the table: two `YYYY-MM-DD` inputs plus today / last-7-days / clear
-  shortcuts, resolved to Beijing whole days with both ends inclusive. Filtering runs in the host
-  because each model retains only its latest 200 samples — filtering the summary in the browser
-  would compute percentiles over the retained slice rather than the range you picked.
+  shortcuts, resolved to Beijing whole days with both ends inclusive. Filtering runs in the host so
+  that success rate, percentiles, and token totals are all computed over the range you picked.
+- Samples have **no count cap**: every model keeps every call it has seen since the plugin started.
+  A cap would quietly redefine the statistics as "the latest N" — a range that starts earlier, or a
+  model busy enough to pass the cap in a day, would report only the tail of what was asked for.
 - The token column sums output usage on the main line and input usage after `↑` on the second,
   counting only calls whose adapter reported `usage`; the tooltip gives sampled-call coverage, so a
   provider that reports nothing shows `—` throughout rather than 0, which would read as "used
-  nothing" instead of "not recorded". Samples persist to `dataDir/metrics.json` (latest 200 per
-  model, debounced 1.5s and flushed on unmount), so the dashboard survives a restart; older samples
-  without token fields count as no data rather than 0.
+  nothing" instead of "not recorded". Samples persist to `dataDir/metrics.json` in full (debounced
+  1.5s and flushed on unmount), so the dashboard survives a restart; older samples without token
+  fields count as no data rather than 0.
 - Some failures are neither network nor account nor quota: the upstream rejected the request itself.
   The common case is input beyond the model's context window (`prompt is too long`,
   `CONTEXT_WINDOW_EXCEEDED`), which adapters usually class as `400` / `code: client`. Swapping

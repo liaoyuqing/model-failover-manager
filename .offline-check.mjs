@@ -744,7 +744,7 @@ ok('⑭ 未采集过的模型也有行（样本 0，字段为 null）', (() => {
   return empty !== undefined && empty.ttftP50 === null && empty.tpsP50 === null
 })(), JSON.stringify(metrics.rows.find(r => r.samples === 0)))
 
-// ⑮ 日期筛选：按北京时间整天，在 Host 侧筛（缓冲区只有最近 N 条，界面自己筛会算丢）
+// ⑮ 日期筛选：按北京时间整天，在 Host 侧筛（区间内的分位数与合计要在同一批样本上算）
 const bjDay = (offsetDays) => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
 }).format(new Date(Date.now() + offsetDays * 86_400_000))
@@ -894,6 +894,32 @@ ok('⑱ 重启后样本仍在（samples/token 都能读回）',
   JSON.stringify(restarted && { s: restarted.samples, i: restarted.inTokens, o: restarted.outTokens }))
 ok('⑱ 重启后首字与速度分位数也在', typeof restarted?.tpsP50 === 'number' && typeof restarted?.ttftP50 === 'number',
   JSON.stringify(restarted && { t: restarted.tpsP50, f: restarted.ttftP50 }))
+
+// ⑲ 采样不设条数上限：历史全部保留，统计不被「最近 N 条」偷换
+//     造超过旧上限（200）的调用次数，看板行数必须一条不少地累加。
+const BULK = 220
+const beforeBulk = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+const beforeSamples = beforeBulk?.samples ?? 0
+for (let i = 0; i < BULK; i++) {
+  // 逐条串行：并发上限是 1，并发跑会在闸门里排队
+  const iter = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream())
+  for await (const _chunk of iter) { /* 消费完整个流，触发采样 */ }
+}
+const bulkMetrics = (await api('GET', '/metrics')).body
+const bulkRow = bulkMetrics.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑲ 超过 200 条也不裁剪，样本数等于实际调用次数',
+  bulkRow?.samples === beforeSamples + BULK,
+  `before=${beforeSamples} after=${bulkRow?.samples} expect=${beforeSamples + BULK}`)
+ok('⑲ /metrics 不再声明每模型条数上限（sampleLimit 为 null）',
+  bulkMetrics.sampleLimit === null, `sampleLimit=${JSON.stringify(bulkMetrics.sampleLimit)}`)
+ok('⑲ token 合计按全部样本累加（不是最近 200 条）',
+  bulkRow?.inTokens === 10 * (beforeSamples + BULK) && bulkRow?.outTokens === 8 * (beforeSamples + BULK),
+  JSON.stringify({ i: bulkRow?.inTokens, o: bulkRow?.outTokens, n: bulkRow?.samples }))
+await new Promise(r => setTimeout(r, 1800))
+ok('⑲ 全量样本也照样落盘（重启后能读回同样条数）', (() => {
+  const saved = JSON.parse(readFileSync(metricsPath, 'utf8'))
+  return Array.isArray(saved?.['pc/mc']) && saved['pc/mc'].length >= beforeSamples + BULK
+})(), 'ok')
 
 ctx.get = baseGet
 globalThis.fetch = baseFetch

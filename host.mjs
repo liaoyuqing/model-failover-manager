@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v65'
+const HOST_VERSION = 'v66'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -655,15 +655,18 @@ export function apply(ctx, config = {}) {
   const rejectedBySession = new Map()
 
 
-  /** 速度采样环形缓冲（每个模型最多留 N 条，供看板求分位数） */
-  const SPEED_SAMPLE_LIMIT = 200
-  /** provider/model -> 最近的调用样本 */
+  /**
+   * 速度采样缓冲：provider/model -> 启动以来的全部调用样本（按时间先后）。
+   *
+   * **不设条数上限**。上限会让「最近 200 条」悄悄变成统计口径：窗口筛得早一点、
+   * 或者模型一天跑上万次，看板上的成功率和 token 合计就只是最后一段的和，而不是
+   * 所选区间的和。单条样本几十字节，按条数砍掉的是用户要看的历史。
+   */
   const speedSamples = new Map()
 
   /**
    * 采样落盘文件。缓冲区是内存态的，重启即清空；看板要跨重启保留，
-   * 所以每次记样本后写一份到 dataDir（最多 SPEED_SAMPLE_LIMIT × 模型数个对象，
-   * 量级几十 KB，直接整体覆写比维护增量日志简单且不会写出半截文件）。
+   * 所以每次记样本后整体覆写一份到 dataDir（不写增量日志，也就不会留下半截文件）。
    */
   const metricsFile = join(dataDir, 'metrics.json')
 
@@ -677,7 +680,8 @@ export function apply(ctx, config = {}) {
       /** @type {Record<string, any[]>} */
       const out = {}
       for (const [key, list] of speedSamples) out[key] = list
-      writeJson(metricsFile, out)
+      // 样本不设上限，这份文件会一直长；不缩进，省掉每行两个空格
+      writeFileSync(metricsFile, JSON.stringify(out), 'utf8')
     } catch { /* 采样落盘失败只影响看板历史，绝不影响主流程 */ }
   }
 
@@ -696,13 +700,17 @@ export function apply(ctx, config = {}) {
       for (const [key, list] of Object.entries(saved)) {
         if (!Array.isArray(list)) continue
         const clean = list.filter(s => s && typeof s.at === 'number')
-        if (clean.length > 0) speedSamples.set(key, clean.slice(-SPEED_SAMPLE_LIMIT))
+        if (clean.length > 0) speedSamples.set(key, clean)
       }
     }
   } catch { /* 损坏的采样文件当作没有历史，不让插件起不来 */ }
 
   /**
-   * 记一条速度样本并裁剪。
+   * 记一条速度样本。
+   *
+   * 只追加、不裁剪：样本是看板统计的原始数据，条数上限会把「所选区间」偷换成
+   * 「最近 N 条」。内存占用按调用次数线性增长，单条几十字节，正常量级可忽略。
+   *
    * @param {string} key - `provider/model`。
    * @param {{ttftMs: number|null, inTokens: number|null, outTokens: number|null, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, at: number}} sample - 一次调用的观测值。
    * @returns {void}
@@ -710,17 +718,16 @@ export function apply(ctx, config = {}) {
   function recordSpeedSample(key, sample) {
     const list = speedSamples.get(key) ?? []
     list.push(sample)
-    if (list.length > SPEED_SAMPLE_LIMIT) list.splice(0, list.length - SPEED_SAMPLE_LIMIT)
     speedSamples.set(key, list)
     scheduleMetricsFlush()
   }
 
   /**
-   * 汇总某模型的看板数据：首字延迟、输出速度、排队等待的分位数，以及 token 用量。
+   * 汇总某模型的看板数据：成功率、首字延迟、输出速度、排队等待的分位数，以及 token 用量。
    * @param {string} key - `provider/model`。
    * @param {{since?: number, until?: number}} [window] - 采样时间窗（毫秒时间戳，两端包含）；
-   *   省略则统计全部保留的样本。日期筛选由这里做，而不是交给界面：缓冲区只有
-   *   最近 N 条，若先取分位数再筛，算出来的就是「最近 N 条」而不是「所选区间」。
+   *   省略则统计全部样本。日期筛选由这里做，而不是交给界面：分位数与合计都要按
+   *   「所选区间」算。缓冲区不设条数上限，所以这里的统计就是全量历史。
    * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, inTokens: number, outTokens: number, tokenSamples: number, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
    */
   function speedStatsOf(key, window) {
@@ -2431,7 +2438,8 @@ export function apply(ctx, config = {}) {
       sendJson(res, 200, {
         rows,
         sampledAt: Date.now(),
-        sampleLimit: SPEED_SAMPLE_LIMIT,
+        // 采样不设条数上限：界面据 sampleLimit === null 说明「保留全部历史」
+        sampleLimit: null,
         // 筛选回显：界面据此知道结果对应哪个区间，而不是只信本地状态
         window: { since: url.searchParams.get('since') || null, until: url.searchParams.get('until') || null },
         defaultConcurrency,
