@@ -222,13 +222,16 @@ window.__ModuleLoader__.load({
         color: 'var(--dsw-alias-state-business-primary)',
       },
       /** 模型行上的并发上限输入：贴着分组徽标，只对已入组的模型显示 */
-      modelConcWrap: { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: '2px' },
+      modelConcWrap: { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: '3px' },
+      // 宽 62px：34px 时数字输入框自带的上下箭头要吃掉约 14px，文本区只剩十几像素，
+      // 两位以上的数都显示不全。这里留出 3 位数 + 箭头的余量。
       modelConcInput: {
-        width: '34px', textAlign: 'center', boxSizing: 'border-box',
+        width: '62px', textAlign: 'center', boxSizing: 'border-box',
         background: 'var(--dsw-alias-bg-base)',
         border: '0.5px solid var(--dsw-alias-border-l4)',
         borderRadius: '4px', padding: '1px 2px', fontSize: '11px',
         color: 'var(--dsw-alias-label-primary)', outline: 'none',
+        fontVariantNumeric: 'tabular-nums',
       },
       modelConcLabel: { fontSize: '10px', opacity: .55, whiteSpace: 'nowrap' },
       addMenu: {
@@ -648,8 +651,12 @@ window.__ModuleLoader__.load({
               // 空 = 跟随默认上限；写数字 = 该模型显式上限，对所有分组统一生效。
               inGroups.length > 0 && e('span', {
                 style: S.modelConcWrap,
+                title: '该模型同时最多几个请求，对所有分组统一生效；留空 = 跟随默认上限'
+                  + (defaultConcHint ? '（' + defaultConcHint + '）' : '')
+                  + '。达到上限时会先尝试切到组内其它空闲模型，都满才排队。',
                 onClick: function (ev) { ev.stopPropagation() },
               },
+                e('span', { style: S.modelConcLabel }, '并发'),
                 e('input', {
                   type: 'number', min: '1', max: '999',
                   style: S.modelConcInput,
@@ -657,9 +664,7 @@ window.__ModuleLoader__.load({
                     ? concDraft[k]
                     : (explicitConcOf(providerGroup.id, m.id) === null ? '' : String(explicitConcOf(providerGroup.id, m.id))),
                   placeholder: defaultConcText(),
-                  title: '该模型同时最多几个请求，对所有分组统一生效；留空 = 跟随默认上限'
-                    + (defaultConcHint ? '（' + defaultConcHint + '）' : '')
-                    + '。达到上限时会先尝试切到组内其它空闲模型，都满才排队。',
+                  'aria-label': '并发上限',
                   onChange: function (ev) { commitConcurrency(providerGroup.id, m.id, ev.target.value) },
                   onBlur: function () {
                     // 失焦即放弃本地草稿，输入框回到服务端记录的真实值
@@ -667,8 +672,7 @@ window.__ModuleLoader__.load({
                     delete nxt[k]
                     setConcDraft(nxt)
                   },
-                }),
-                e('span', { style: S.modelConcLabel }, '并发')),
+                })),
               // 快捷加入分组
               e('button', {
                 style: S.addBtn, title: '加入路由分组',
