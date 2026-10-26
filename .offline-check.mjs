@@ -744,6 +744,39 @@ ok('⑭ 未采集过的模型也有行（样本 0，字段为 null）', (() => {
   return empty !== undefined && empty.ttftP50 === null && empty.tpsP50 === null
 })(), JSON.stringify(metrics.rows.find(r => r.samples === 0)))
 
+// ⑮ 日期筛选：按北京时间整天，在 Host 侧筛（缓冲区只有最近 N 条，界面自己筛会算丢）
+const bjDay = (offsetDays) => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(new Date(Date.now() + offsetDays * 86_400_000))
+const today = bjDay(0)
+const tomorrow = bjDay(1)
+const longAgo = bjDay(-30)
+// 今天：mc 有刚才那两次采样
+const todayMetrics = (await api('GET', `/metrics?since=${today}&until=${today}`)).body
+const todayRow = todayMetrics.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑮ 今天区间包含今天的采样', todayRow?.samples >= 2, JSON.stringify(todayRow && { s: todayRow.samples }))
+// 只筛未来：一条都没有
+const futureMetrics = (await api('GET', `/metrics?since=${tomorrow}`)).body
+const futureRow = futureMetrics.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑮ 区间外没有样本时 samples=0、分位数为 null',
+  futureRow?.samples === 0 && futureRow?.ttftP50 === null && futureRow?.tpsP50 === null,
+  JSON.stringify(futureRow && { s: futureRow.samples, t: futureRow.ttftP50 }))
+// 一个覆盖很久以前到很久以后的区间：仍包含今天的采样
+const wideMetrics = (await api('GET', `/metrics?since=${longAgo}&until=${tomorrow}`)).body
+const wideRow = wideMetrics.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑮ 宽区间仍包含今天采样', wideRow?.samples >= 2, JSON.stringify(wideRow && { s: wideRow.samples }))
+ok('⑮ 只给 since 也生效（until 开放）',
+  (await api('GET', `/metrics?since=${today}`)).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')?.samples >= 2)
+ok('⑮ /metrics 回显筛选区间',
+  (() => {
+    const w = todayMetrics.window
+    return w?.since === today && w?.until === today
+  })(), JSON.stringify(todayMetrics.window))
+ok('⑮ 非法日期被忽略，等价于不筛',
+  (await api('GET', '/metrics?since=not-a-date')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')?.samples >= 2)
+ok('⑮ 不传日期时 window 为 null（表示未筛选）',
+  (await api('GET', '/metrics')).body.window?.since === null)
+
 ctx.get = baseGet
 globalThis.fetch = baseFetch
 

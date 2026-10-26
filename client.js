@@ -119,6 +119,8 @@ window.__ModuleLoader__.load({
         fontSize: '10px', padding: '1px 6px', borderRadius: '4px',
         background: 'var(--dsw-alias-interactive-bg-hover-danger)',
         color: 'var(--dsw-alias-state-error-primary)',
+        // 固定宽度列里必须能收窄，否则长标签会把整列挤宽
+        maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       },
       hint: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)', padding: '6px 2px' },
       btn: {
@@ -263,17 +265,29 @@ window.__ModuleLoader__.load({
         fontSize: '11px', lineHeight: '1.6', color: 'var(--dsw-alias-label-tertiary)',
         padding: '0 2px 8px',
       },
+      /** 日期筛选条：日期输入 + 快捷区间 */
+      metricsFilter: {
+        display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap',
+        padding: '0 2px 8px',
+      },
+      metricsDate: {
+        boxSizing: 'border-box', flex: '0 0 auto',
+        background: 'var(--dsw-alias-bg-layer-1)',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        borderRadius: 'var(--dsw-radius-sm)', padding: '2px 6px', fontSize: '11px',
+        color: 'var(--dsw-alias-label-primary)', outline: 'none',
+      },
       metricsTable: {
         border: '1px solid var(--dsw-alias-border-l2)',
         borderRadius: 'var(--dsw-radius-sm)', overflow: 'hidden',
         background: 'var(--dsw-alias-bg-layer-1)',
       },
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
-      // 六列：模型 / 首字 / 速度 / 并发 / 排队 / 状态。样本并进首字与速度的
-      // 副行、等待并进并发的副行，省下的宽度全部让给模型名。
+      // 五列：模型 / 首字 / 速度 / 并发 / 状态。状态列固定宽，否则「当日失败 +
+      // 错误码」会把 auto 列撑宽、把模型列从 308px 压到 248px，整张表看着就乱了。
       metricsRow: {
         display: 'grid',
-        gridTemplateColumns: 'minmax(120px, 1fr) 66px 82px 76px minmax(64px, auto)',
+        gridTemplateColumns: 'minmax(120px, 1fr) 66px 82px 76px 92px',
         alignItems: 'center', gap: '8px', padding: '6px 10px',
         borderTop: '0.5px solid var(--dsw-alias-border-l1)',
         fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
@@ -304,7 +318,10 @@ window.__ModuleLoader__.load({
       },
       // 模型名：允许折行（break-word 兜住没有空格的长 id）
       metricsCellModel: { minWidth: 0, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: '1.35' },
-      metricsTagCell: { minWidth: 0, display: 'flex', flexWrap: 'wrap', gap: '2px', alignItems: 'center' },
+      metricsTagCell: {
+        minWidth: 0, display: 'flex', flexDirection: 'column',
+        alignItems: 'flex-start', gap: '1px', lineHeight: '1.3',
+      },
       metricsModel: { fontWeight: 600 },
       metricsSub: { fontSize: '10px', opacity: .6, marginTop: '1px', whiteSpace: 'normal', wordBreak: 'break-word' },
       // 表头按钮：整格可点，▲/▼ 指示当前排序列与方向
@@ -410,10 +427,36 @@ window.__ModuleLoader__.load({
       return isFinite(n) && n >= 1 ? n : null
     }
 
-    function loadMetrics() {
-      return fetch(API + '/metrics', { credentials: 'same-origin', cache: 'no-store' })
+    /**
+     * 拉看板数据。
+     * @param {{since?: string, until?: string}} [range] - YYYY-MM-DD，按北京时间整天；
+     *   省略即全部保留的样本。筛选在 Host 侧做——缓冲区只有最近 N 条，界面拿不到被裁掉的。
+     */
+    function loadMetrics(range) {
+      var qs = ''
+      if (range && (range.since || range.until)) {
+        var p = []
+        if (range.since) p.push('since=' + encodeURIComponent(range.since))
+        if (range.until) p.push('until=' + encodeURIComponent(range.until))
+        qs = '?' + p.join('&')
+      }
+      return fetch(API + '/metrics' + qs, { credentials: 'same-origin', cache: 'no-store' })
         .then(function (r) { return r.json() })
         .catch(function () { return null })
+    }
+
+    /** 北京时间「今天」的 YYYY-MM-DD，与 Host 的日期筛选口径一致 */
+    function beijingToday() {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date())
+    }
+
+    /** 往前推 n 天的北京时间日期（供快捷区间用） */
+    function beijingDaysAgo(n) {
+      return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(new Date(Date.now() - n * 86_400_000))
     }
 
     /**
@@ -448,6 +491,9 @@ window.__ModuleLoader__.load({
       var metPair = React.useState(null); var metrics = metPair[0]; var setMetrics = metPair[1]
       /** 看板排序：{ key, dir }；null = 默认序（分组名 → 优先级 → provider/model） */
       var sortPair = React.useState(null); var sort = sortPair[0]; var setSort = sortPair[1]
+      /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
+      var rangePair = React.useState({ since: '', until: '' })
+      var range = rangePair[0]; var setRange = rangePair[1]
       /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
       var concPair = React.useState({}); var concDraft = concPair[0]; var setConcDraft = concPair[1]
 
@@ -489,14 +535,14 @@ window.__ModuleLoader__.load({
       }, [props.sessionId, props.subagent, status, open])
 
       // 数据看板：弹窗打开且停在看板页签时每 3 秒拉一次 metrics；离开即停。
-      // 依赖 [open, tab] 保证其它页签不会额外轮询。
+      // 依赖 [open, tab, range] 保证其它页签不会额外轮询，改日期范围立即重取。
       React.useEffect(function () {
         if (!open || tab !== 'dashboard') return
-        function tick() { loadMetrics().then(function (d) { if (d) setMetrics(d) }) }
+        function tick() { loadMetrics(range).then(function (d) { if (d) setMetrics(d) }) }
         tick()
         var t = setInterval(tick, 3000)
         return function () { clearInterval(t) }
-      }, [open, tab])
+      }, [open, tab, range])
 
       if (!props.available) return null
       // 内置模型目录对有归属的子代理会话不给快照；子代理位改用 Host 的
@@ -812,7 +858,7 @@ window.__ModuleLoader__.load({
 
       /** 看板与分组页签共用的刷新：metrics 与 status 一起重取（并发上限两边都显示） */
       function refreshMetrics() {
-        return Promise.all([loadMetrics(), loadStatus()]).then(function (res) {
+        return Promise.all([loadMetrics(range), loadStatus()]).then(function (res) {
           if (res[0]) setMetrics(res[0])
           if (res[1]) setStatus(res[1])
         }).catch(function () { })
@@ -942,11 +988,45 @@ window.__ModuleLoader__.load({
               '默认并发上限：' + (defConc === null ? '—' : (defConc === 0 ? '不限（0）' : String(defConc)))),
             metrics && isNum(metrics.sampledAt) && e('span', { style: { fontSize: '11px', opacity: .5 } },
               '采样于 ' + new Date(metrics.sampledAt).toLocaleTimeString()),
-            e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px' } },
+            e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' } },
               e('button', {
                 style: S.btn,
                 onClick: function () { refreshMetrics() },
               }, '刷新'))),
+          // 日期筛选：按北京时间整天。筛选在 Host 侧做（缓冲区只留最近 N 条，
+          // 界面自己筛会把更早的样本算丢）。快捷区间覆盖最常用的三种看法。
+          e('div', { style: S.metricsFilter },
+            e('span', { style: { fontSize: '11px', opacity: .6, flexShrink: 0 } }, '日期'),
+            e('input', {
+              type: 'date', style: S.metricsDate,
+              value: range.since, max: range.until || '',
+              title: '起始日期（北京时间，含当天）',
+              onChange: function (ev) { setRange({ since: ev.target.value, until: range.until }) },
+            }),
+            e('span', { style: { opacity: .45, fontSize: '11px' } }, '—'),
+            e('input', {
+              type: 'date', style: S.metricsDate,
+              value: range.until, min: range.since || '',
+              title: '结束日期（北京时间，含当天）',
+              onChange: function (ev) { setRange({ since: range.since, until: ev.target.value }) },
+            }),
+            e('button', {
+              style: Object.assign({}, S.btn, { padding: '1px 8px' }),
+              title: '只看今天（北京时间）',
+              onClick: function () { setRange({ since: beijingToday(), until: beijingToday() }) },
+            }, '今天'),
+            e('button', {
+              style: Object.assign({}, S.btn, { padding: '1px 8px' }),
+              title: '最近 7 天（北京时间）',
+              onClick: function () { setRange({ since: beijingDaysAgo(6), until: beijingToday() }) },
+            }, '近 7 天'),
+            (range.since || range.until) && e('button', {
+              style: Object.assign({}, S.btn, { padding: '1px 8px' }),
+              title: '清除日期筛选，统计全部保留的样本',
+              onClick: function () { setRange({ since: '', until: '' }) },
+            }, '全部'),
+            (range.since || range.until) && e('span', { style: { fontSize: '11px', opacity: .5 } },
+              '已筛选，结果不含区间外的样本')),
           e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
             '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；并发 = 正在进行的请求 / 生效上限'
             + '（上限在「模型」页签的模型行上设置，对所有分组统一生效）。'),
@@ -1008,25 +1088,26 @@ window.__ModuleLoader__.load({
                       + (queued > 0 ? '\n排队中：' + queued : ''),
                   }, String(inflight) + '/' + effText),
                   concSubText && e('span', { style: S.metricsNumSub }, concSubText)),
+                // 状态：主行一个标签（失败 > 禁用 > 冷却 > 正常，只画最严重的那个，
+                // 避免一格里堆三枚胶囊把列撑爆），副行是错误码。两者都截断 + title。
                 e('div', { style: S.metricsTagCell },
-                  // 两个状态独立判定：一个模型可以既手动禁用又当日失败
-                  r.failed && e('span', { style: S.tag }, '当日失败'),
-                  r.disabled && e('span', { style: Object.assign({}, S.tag, { opacity: .75 }) }, '已禁用'),
-                  // 并发冷却：Host 因并发打满临时把它挡在路由之外，到期自动恢复。
-                  // 这是「临时切换」的可见证据，与「当日失败」必须能分辨。
-                  cooling && e('span', {
-                    style: Object.assign({}, S.tag, {
-                      background: 'var(--dsw-alias-state-warn-tertiary)',
-                      color: 'var(--dsw-alias-state-warn-label)',
-                    }),
-                    title: '并发已满被临时挡在路由之外，约 ' + coolLeft + 's 后自动恢复'
-                      + (r.capacityReason ? '：' + r.capacityReason : ''),
-                  }, '并发冷却 ' + coolLeft + 's'),
-                  !r.failed && !r.disabled && !cooling
-                    && e('span', { style: { fontSize: '11px', opacity: .45 } }, '正常'),
+                  r.failed
+                    ? e('span', { style: S.tag, title: '当日失败：不参与路由，日界线或成功一轮后自动恢复' }, '当日失败')
+                    : r.disabled
+                      ? e('span', { style: Object.assign({}, S.tag, { opacity: .8 }), title: '已手动禁用，不参与路由' }, '已禁用')
+                      : cooling
+                        ? e('span', {
+                          style: Object.assign({}, S.tag, {
+                            background: 'var(--dsw-alias-state-warn-tertiary)',
+                            color: 'var(--dsw-alias-state-warn-label)',
+                          }),
+                          title: '并发已满被临时挡在路由之外，约 ' + coolLeft + 's 后自动恢复'
+                            + (r.capacityReason ? '：' + r.capacityReason : ''),
+                        }, '冷却 ' + coolLeft + 's')
+                        : e('span', { style: { fontSize: '11px', opacity: .45 } }, '正常'),
                   r.lastErrorCode && e('span', {
-                    style: { fontSize: '10px', fontFamily: 'monospace', opacity: .7 },
-                    title: '最近一次错误码',
+                    style: S.metricsNumSub,
+                    title: '最近一次错误码：' + String(r.lastErrorCode),
                   }, String(r.lastErrorCode))))
             })))
       }

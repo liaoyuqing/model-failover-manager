@@ -634,10 +634,17 @@ export function apply(ctx, config = {}) {
   /**
    * 汇总某模型的看板数据：首字延迟、输出速度、排队等待的分位数。
    * @param {string} key - `provider/model`。
+   * @param {{since?: number, until?: number}} [window] - 采样时间窗（毫秒时间戳，两端包含）；
+   *   省略则统计全部保留的样本。日期筛选由这里做，而不是交给界面：缓冲区只有
+   *   最近 N 条，若先取分位数再筛，算出来的就是「最近 N 条」而不是「所选区间」。
    * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
    */
-  function speedStatsOf(key) {
-    const list = speedSamples.get(key) ?? []
+  function speedStatsOf(key, window) {
+    const all = speedSamples.get(key) ?? []
+    const list = window === undefined
+      ? all
+      : all.filter(s => (window.since === undefined || s.at >= window.since)
+        && (window.until === undefined || s.at <= window.until))
     const numbers = (pick) => list.map(pick).filter(v => typeof v === 'number')
     const ttfts = numbers(s => s.ttftMs)
     const tpss = numbers(s => s.speedTps)
@@ -2229,6 +2236,19 @@ export function apply(ctx, config = {}) {
 
     /* ----- 数据看板：各模型的首字延迟与输出速度 ----- */
     if (path === `${API_PATH}/metrics` && req.method === 'GET') {
+      // 日期筛选：`since` / `until` 为 YYYY-MM-DD（按北京时间整天，两端包含）。
+      // 在北京时间上取自然日，与「当日失败」的日界线口径一致；筛选在这里做，
+      // 因为缓冲区只有最近 N 条样本，界面拿不到被裁掉的更早数据。
+      const parseDay = (raw, endOfDay) => {
+        if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return undefined
+        // 北京时间 00:00:00 / 23:59:59.999 对应 UTC 前一天 16:00
+        const start = Date.parse(`${raw}T00:00:00+08:00`)
+        if (!Number.isFinite(start)) return undefined
+        return endOfDay ? start + 86_400_000 - 1 : start
+      }
+      const since = parseDay(url.searchParams.get('since'), false)
+      const until = parseDay(url.searchParams.get('until'), true)
+      const window = since === undefined && until === undefined ? undefined : { since, until }
       // 只列出「分组里出现过的」模型，避免把宿主里几百个模型全塞给界面。
       // 同一模型出现在多个分组时取第一条的 priority / groupName；并发上限来自
       // modelConcurrency，与出现在哪个分组无关。
@@ -2239,7 +2259,7 @@ export function apply(ctx, config = {}) {
           const key = `${m.provider}/${m.model}`
           if (seen.has(key)) continue
           seen.add(key)
-          const stats = speedStatsOf(key)
+          const stats = speedStatsOf(key, window)
           const limit = concurrencyLimitOf(m.provider, m.model)
           const cooldown = capacityCooldownOf(m.provider, m.model)
           rows.push({
@@ -2268,6 +2288,8 @@ export function apply(ctx, config = {}) {
         rows,
         sampledAt: Date.now(),
         sampleLimit: SPEED_SAMPLE_LIMIT,
+        // 筛选回显：界面据此知道结果对应哪个区间，而不是只信本地状态
+        window: { since: url.searchParams.get('since') || null, until: url.searchParams.get('until') || null },
         defaultConcurrency,
         concurrencyQueueTimeoutMs,
         capacityCooldownMs,
