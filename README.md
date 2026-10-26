@@ -269,8 +269,8 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 | POST | `/groups/model-disabled` | 禁用/启用某个模型参与路由（写 `disabled` 字段，覆盖所有含它的分组） |
 | POST | `/model-concurrency` | 设置/清除某个模型的并发上限（`concurrency` 正整数即设置，`null`/`0`/`""` 清除覆盖回落到 `defaultConcurrency`）；按模型索引，作用于所有分组 |
 | POST | `/groups/reorder-priority` | 按看板当前排序重设某个分组的优先级：`{groupId, start, order: [{provider, model}]}`，按 `order` 的顺序从 `start` 起连续写回（`start` 缺省 1，需 1..999）。不在该分组里的名字被忽略，重复条目只认第一次 |
-| GET | `/speedtest` | 一键测速的进度快照：`{running, startedAt, finishedAt, total, done, results}`；`results` 每项含 `provider/model/ok/ttftMs/tps/inTokens/outTokens/errorCode` |
-| POST | `/speedtest` | 启动一键测速：`{models: [{provider, model}]}` 或 `{groupId}`（后者跳过已禁用的模型），可选 `timeoutMs`（5s..120s，默认 45s）与 `parallel`（1..6，默认 2）。立即返回任务快照，任务在后台跑；已有任务在跑时返回 409 |
+| GET | `/speedtest` | 测速的进度快照：`{running, startedAt, finishedAt, total, done, targets, results}`；`targets` 是本次覆盖的模型清单（界面用它标出「哪几行正在测」），`results` 每项含 `provider/model/ok/ttftMs/tps/inTokens/outTokens/errorCode` |
+| POST | `/speedtest` | 启动一次测速：`{models: [{provider, model}]}`（整组或**单个模型**都走这里）或 `{groupId}`（整组，跳过已禁用的模型；显式点名的清单不排除禁用模型，方便排查一个被禁用的模型到底通不通），可选 `timeoutMs`（5s..120s，默认 45s）与 `parallel`（1..6，默认 2）。立即返回任务快照，任务在后台跑；已有任务在跑时返回 409 |
 | GET | `/session-info?sessionId=` | 单个会话解析后的有效分组、是否继承、当前模型覆盖 |
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
@@ -283,6 +283,7 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 - **token 列的大字是历史用量**：主行显示该模型**全部历史**的输入+输出合计（不随日期筛选变化），副行是 `↑输入 ↓输出`；区间内用量与「有多少条样本带 token」放在 tooltip 里。
 - **按当前排序重设优先级**：表格上方的操作条可选目标分组、填起始优先级，然后按当前排序把**有采样**的模型从起始序号连续编号；**没有数据的模型被排除**、保持原优先级不变（操作条上直接显示会有几个模型参与）。
 - **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
+- **单个模型单独测速**：每行模型名下方都有「测速」按钮，只测这一个模型，不牵连整组。它不受当前分组下拉的限制，**分组里已禁用的模型也能测**——单独点某一行的场景恰恰是排查「这个模型到底通不通」。要同时测整组还是用操作条上的「一键测速」。
 
 ## 数据文件
 
@@ -383,6 +384,10 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   background while the dialog polls its progress every 1.5s, showing first-token latency and tokens/s
   under each model; only one run may be active at a time, because measuring in parallel would report
   queueing as first-token latency.
+- Per-model speed test: every row has its own 测速 / *probe* button under the model name, measuring
+  just that model. It ignores the group selector and, unlike the group run, also probes a model the
+  group has disabled — checking whether a disabled model actually answers is exactly why you would
+  click a single row.
 - Some failures are neither network nor account nor quota: the upstream rejected the request itself.
   The common case is input beyond the model's context window (`prompt is too long`,
   `CONTEXT_WINDOW_EXCEEDED`), which adapters usually class as `400` / `code: client`. Swapping

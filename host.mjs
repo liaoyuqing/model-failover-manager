@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v70'
+const HOST_VERSION = 'v71'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -2511,13 +2511,16 @@ export function apply(ctx, config = {}) {
 
   /** 测速任务的对外快照（GET /speedtest 与启动响应共用）。 */
   function speedTestSnapshot() {
-    if (!speedTestJob) return { running: false, startedAt: null, finishedAt: null, total: 0, done: 0, results: [] }
+    if (!speedTestJob) return { running: false, startedAt: null, finishedAt: null, total: 0, done: 0, targets: [], results: [] }
     return {
       running: speedTestJob.finishedAt === null,
       startedAt: speedTestJob.startedAt,
       finishedAt: speedTestJob.finishedAt,
       total: speedTestJob.total,
       done: speedTestJob.done,
+      // targets 是本次任务覆盖的模型清单：results 只含已经测完的，界面要标出
+      // 「哪几行正在测」只能靠它；刷新页面后本地记不住，接上进度也靠它。
+      targets: speedTestJob.targets,
       // 结果按目标顺序占位，未测的槽是 null：界面据 done/total 画进度条
       results: speedTestJob.results.filter(Boolean),
     }
@@ -2671,6 +2674,9 @@ export function apply(ctx, config = {}) {
       finishedAt: null,
       total: targets.length,
       done: 0,
+      // 目标清单先落进任务：单个模型测速与整组测速共用一份快照，界面只有拿到
+      // 清单才知道该把哪几行标成「测速中」（results 是跑完一个才多一个）。
+      targets: targets.map(t => ({ provider: t.provider, model: t.model })),
       results: new Array(targets.length).fill(null),
       cancel: new AbortController(),
     }
@@ -3254,7 +3260,7 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    /* ----- 一键测速：对分组内的模型各打一次最小请求，测首字与速度 ----- */
+    /* ----- 一键测速：对给的模型清单各打一次最小请求，测首字与速度 ----- */
     if (path === `${API_PATH}/speedtest` && req.method === 'POST') {
       try {
         const body = JSON.parse((await readBody(req)) || '{}')

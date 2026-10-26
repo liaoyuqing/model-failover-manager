@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v9'
+    var VERSION = 'v10'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -337,6 +337,23 @@ window.__ModuleLoader__.load({
       },
       metricsModel: { fontWeight: 600 },
       metricsSub: { fontSize: '10px', opacity: .6, marginTop: '1px', whiteSpace: 'normal', wordBreak: 'break-word' },
+      // 模型名下的副行：分组名靠左，单模型「测速」按钮靠右。看板只有七列，
+      // 再加一列会把模型列压到看不清 provider，所以按钮挂在这一行上。
+      metricsSubLine: {
+        display: 'flex', alignItems: 'center', gap: '6px', marginTop: '1px', minWidth: 0,
+      },
+      metricsSubText: {
+        minWidth: 0, fontSize: '10px', opacity: .6,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      },
+      // 单模型测速：比操作条里的「一键测速」小一档，它只是这一行的动作
+      metricsProbeBtn: {
+        flexShrink: 0, marginLeft: 'auto', cursor: 'pointer',
+        padding: '0 6px', fontSize: '10px', lineHeight: '15px',
+        border: '0.5px solid var(--dsw-alias-border-l3)',
+        borderRadius: 'var(--dsw-radius-sm)',
+        background: 'transparent', color: 'var(--dsw-alias-label-secondary)',
+      },
       // 表头按钮：整格可点，▲/▼ 指示当前排序列与方向
       metricsSortBtn: {
         background: 'none', border: 'none', padding: 0, margin: 0, font: 'inherit',
@@ -540,8 +557,13 @@ window.__ModuleLoader__.load({
       var orderStartPair = React.useState('1'); var orderStart = orderStartPair[0]; var setOrderStart = orderStartPair[1]
       /** 重设优先级的目标分组；空串 = 用第一行所属分组（看板通常只展示一个分组） */
       var orderGroupPair = React.useState(''); var orderGroupId = orderGroupPair[0]; var setOrderGroupId = orderGroupPair[1]
-      /** 一键测速：进度来自 GET /speedtest，null = 还没点过 */
+      /** 测速进度（一键整组或单模型共用）：来自 GET /speedtest，null = 还没点过 */
       var speedTestPair = React.useState(null); var speedTest = speedTestPair[0]; var setSpeedTest = speedTestPair[1]
+      /**
+       * 本次测速覆盖了哪几行（provider/model 清单）。快照只给 done/total，
+       * 不说当前测到谁；界面上的「测速中」靠这份本地清单标出来。
+       */
+      var speedScopePair = React.useState([]); var speedScope = speedScopePair[0]; var setSpeedScope = speedScopePair[1]
       /** 重设优先级 / 启动测速的操作回执：{ ok, text }，只保留最近一条 */
       var orderNoticePair = React.useState(null); var orderNotice = orderNoticePair[0]; var setOrderNotice = orderNoticePair[1]
       /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
@@ -631,6 +653,7 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         if (tab === 'dashboard') return
         setSpeedTest(null)
+        setSpeedScope([])
       }, [tab])
 
       if (!props.available) return null
@@ -1143,17 +1166,26 @@ window.__ModuleLoader__.load({
         }
 
         /**
-         * 一键测速：对目标分组里所有未禁用的模型各打一次最小请求。
+         * 发起一次测速。`rows` 可以是一整组，也可以只是看板上的某一行——
+         * Host 的 POST /speedtest 收的都是 models 清单，两条路径共用同一份进度。
          * 立刻返回任务快照，进度由上面的 effect 轮询 GET /speedtest 推进。
+         *
+         * speedScope 是本地的「这次测了哪几行」：Host 的快照只说 done/total，
+         * 不说当前测到谁，界面上的「测速中」只能靠这份清单标出来。旧 Host 没有
+         * targets 字段时，它是唯一依据。
          */
-        function startSpeedTest() {
-          if (speedTargets.length === 0) {
-            setOrderNotice({ ok: false, text: '当前分组里没有可测速的模型（都被禁用了？）' })
+        function launchSpeedTest(rows) {
+          if (rows.length === 0) {
+            setOrderNotice({ ok: false, text: '没有可测速的模型（都被禁用了？）' })
             return
           }
-          setSpeedTest({ running: true, startedAt: Date.now(), finishedAt: null, total: speedTargets.length, done: 0, results: [] })
+          setSpeedScope(rows.map(function (r) { return keyOf(r.provider, r.model) }))
+          setSpeedTest({
+            running: true, startedAt: Date.now(), finishedAt: null,
+            total: rows.length, done: 0, results: [],
+          })
           apiSend(API + '/speedtest', 'POST', {
-            models: speedTargets.map(function (r) {
+            models: rows.map(function (r) {
               return { provider: r.provider, model: r.model, effort: r.effort || undefined }
             }),
           }).then(function (res) {
@@ -1167,10 +1199,36 @@ window.__ModuleLoader__.load({
           })
         }
 
+        /** 一键测速：目标分组里所有未禁用的模型 */
+        function startSpeedTest() {
+          if (speedTargets.length === 0) {
+            setOrderNotice({ ok: false, text: '当前分组里没有可测速的模型（都被禁用了？）' })
+            return
+          }
+          launchSpeedTest(speedTargets)
+        }
+
+        /**
+         * 单模型测速：只测这一行，不受「属于当前分组」「有没有采样」「是否被禁用」
+         * 限制——想单独点某一行的场景恰恰是排查一个可疑模型，禁用中的也要能测。
+         */
+        function startRowSpeedTest(r) {
+          launchSpeedTest([r])
+        }
+
         /** 测速结果按 provider/model 索引，行内直接标出本次实测值 */
         var probeByKey = {}
         if (speedTest && speedTest.results) {
           speedTest.results.forEach(function (p) { if (p) probeByKey[keyOf(p.provider, p.model)] = p })
+        }
+        // 本次任务覆盖的行：本地 scope 优先（点了哪几行最准），旧 Host 的快照里
+        // 没有 targets 时用它；两边都有则以本地为准。
+        var runningKeys = {}
+        if (speedTest && speedTest.running) {
+          var scopeKeys = speedScope.length > 0
+            ? speedScope
+            : (speedTest.targets || []).map(function (t) { return keyOf(t.provider, t.model) })
+          scopeKeys.forEach(function (k) { if (!probeByKey[k]) runningKeys[k] = true })
         }
 
 
@@ -1347,8 +1405,23 @@ window.__ModuleLoader__.load({
                     style: S.metricsModel,
                     title: r.provider + '/' + r.model + (it.groupName ? '\n分组：' + it.groupName : ''),
                   }, r.provider + '/' + r.model),
-                  e('div', { style: S.metricsSub },
-                    it.groupName ? it.groupName : '未分组'),
+                  e('div', { style: S.metricsSubLine },
+                    e('span', {
+                      style: S.metricsSubText,
+                      title: it.groupName ? '所属分组：' + it.groupName : '这个模型还没进任何分组',
+                    }, it.groupName ? it.groupName : '未分组'),
+                    // 单模型测速：整组测一次要打十几个请求，只想确认某一个模型时
+                    // 不该等整批。Host 同一时刻只跑一个任务，所以任务进行中整列
+                    // 按钮都按住（包括这一行自己）。
+                    e('button', {
+                      style: S.metricsProbeBtn,
+                      disabled: !!(speedTest && speedTest.running),
+                      title: (speedTest && speedTest.running)
+                        ? '已有测速在跑，等它结束（Host 同一时刻只跑一个，并发打上游会把账号池测成排队时间）'
+                        : '只测这一个模型：发一次最小请求，实测首字延迟与输出速度。'
+                          + '不受当前分组限制，禁用中的模型也能测（用来确认它是不是真挂了）',
+                      onClick: function () { startRowSpeedTest(r) },
+                    }, runningKeys[k] ? '测速中' : '测速')),
                   // 一键测速的本次实测结果：贴在模型名下，与看板的历史聚合值区分开。
                   // 失败只标错误码，不占一整行——表格里最要紧的是「通 / 不通」。
                   (function () {

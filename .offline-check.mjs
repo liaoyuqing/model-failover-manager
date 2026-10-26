@@ -1121,6 +1121,32 @@ ok('㉓ 没有可测模型时报 400（不是静默起一个空任务）',
   (await api('POST', '/speedtest', { models: [] })).status === 400)
 ok('㉓ 连分组也不给时报 400', (await api('POST', '/speedtest', {})).status === 400)
 
+// ── ㉗ 单模型测速 ──────────────────────────────────────────────────────────
+//     「一键测速」测整组，但用户经常只想确认某一个模型（刚报错的、刚换号的、
+//     甚至已经禁用的）。走的是同一个 models 清单入口，差别只在清单长度与
+//     「显式点名的不排除禁用模型」。
+const probeIdle = await api('GET', '/speedtest')
+ok('㉗ 快照带 targets 清单（界面标「哪几行在测」只能靠它，刷新页面也靠它接上）',
+  Array.isArray(probeIdle.body.targets) && probeIdle.body.targets.length === 1
+  && probeIdle.body.targets[0].model === 'm1', JSON.stringify(probeIdle.body.targets))
+const probeOne = await api('POST', '/speedtest', { models: [{ provider: 'p', model: 'm2' }] })
+ok('㉗ 单个模型可以单独发起（total=1，不牵连整组）',
+  probeOne.status === 200 && probeOne.body.total === 1 && probeOne.body.running === true,
+  JSON.stringify({ s: probeOne.status, t: probeOne.body.total, r: probeOne.body.running }))
+ok('㉗ 单模型任务的 targets 就是这一行',
+  JSON.stringify(probeOne.body.targets) === JSON.stringify([{ provider: 'p', model: 'm2' }]),
+  JSON.stringify(probeOne.body.targets))
+// m2 在分组 gs 里是 disabled:true：按分组测会跳过它，单独点名要照测——
+// 想单独点某一行的场景就是「它到底还通不通」，禁用状态不该挡掉这次排查。
+const probeOneDone = await waitNotRunning()
+ok('㉗ 单独点名的模型即使在分组里被禁用也照测',
+  probeOneDone.results?.length === 1 && probeOneDone.results[0].model === 'm2'
+  && probeOneDone.results[0].ok === true, JSON.stringify(probeOneDone.results))
+ok('㉗ 单模型结果与整组同一份字段（首字/速度/token 都在），界面复用同一行渲染',
+  probeOneDone.results?.[0]?.inTokens === 3 && probeOneDone.results?.[0]?.outTokens === 2
+  && typeof probeOneDone.results?.[0]?.ttftMs === 'number',
+  JSON.stringify(probeOneDone.results?.[0]))
+
 ctx.get = baseGet
 globalThis.fetch = baseFetch
 
