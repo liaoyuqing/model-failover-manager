@@ -216,7 +216,9 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`（并发占满、账号本身没坏），重启账号池只会打断正在跑的请求，所以按并发类失败临时换模型，不动账号池。只有池里确实全被禁用或冷却时才重启。
 
-「数据看板」页签（设置页与模型弹窗里都有，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、并发现场与冷却剩余，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。
+「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），错误码放在副行，列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。
+
+顶部有日期筛选：两个 `YYYY-MM-DD` 输入框 +「今天」「近 7 天」「全部」快捷项，按北京时间整天、两端包含。筛选在宿主侧做，因为每个模型只保留最近 200 条样本——如果在界面里筛汇总值，算出来的会是「保留的那一段」而不是所选区间。
 
 ## 切换不会暂停目标
 
@@ -244,7 +246,7 @@ codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
 | GET | `/debug/status-log?sessionId=&limit=` | 只读诊断：最近 200 条运行态事件（`agent/status`、转发给界面的 `api-session/status`、续跑排队与投递），带自增 `seq` 与毫秒时间戳 |
-| GET | `/metrics` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它 |
+| GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略 |
 
 ## 数据文件
 
@@ -312,6 +314,16 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
 - Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. A request that cannot get a slot waits up to `concurrencyQueueTimeoutMs` and then fails as `CAPACITY_TIMEOUT`.
 - Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.
+- The dashboard shows first-token latency, output speed, live concurrency, and state per model,
+  with click-to-sort headers (ascending, descending, then the default order; rows without data stay
+  last). The state column draws only the most severe state (failed today > disabled > cooling >
+  normal), puts the error code on a second line, and has a fixed width: an auto-width last column
+  let a row with an error code widen its own cell and squeeze the model name, which reads as
+  misaligned columns across the table.
+- A date filter sits above the table: two `YYYY-MM-DD` inputs plus today / last-7-days / clear
+  shortcuts, resolved to Beijing whole days with both ends inclusive. Filtering runs in the host
+  because each model retains only its latest 200 samples — filtering the summary in the browser
+  would compute percentiles over the retained slice rather than the range you picked.
 - A model switch must not pause an active goal. `goal-round-driver` disarms the current goal on any
   `agent/error`, and switching models requires ending the turn with an error (the step selection is
   frozen at pre-step), so every failover would otherwise leave an active goal disarmed — shown as a

@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v62'
+const HOST_VERSION = 'v63'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
