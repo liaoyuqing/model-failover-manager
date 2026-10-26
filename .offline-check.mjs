@@ -775,7 +775,77 @@ ok('⑮ /metrics 回显筛选区间',
 ok('⑮ 非法日期被忽略，等价于不筛',
   (await api('GET', '/metrics?since=not-a-date')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')?.samples >= 2)
 ok('⑮ 不传日期时 window 为 null（表示未筛选）',
-  (await api('GET', '/metrics')).body.window?.since === null)
+  (await api('GET', '/metrics')).body.window?.null === undefined && (await api('GET', '/metrics')).body.window?.since === null)
+
+// ⑯ 请求被拒（输入超长 / 按参数拒绝）也必须正确路由：
+//    这类 400 换号无效、原地重试也无效，唯一有效的是换模型；而且不能把它写成
+//    「当日失败」——模型本身没坏，只是这条请求超过它的上限。
+const rejectedMsg = 'workbuddy 上游失败：请求被上游拒绝（http 400）（code 11115，requestId 7dec406a）。'
+  + 'prompt is too long (upstream code 11115)。本次输入加上历史对话超过了模型上限。请精简内容、删掉大附件，或新建任务。'
+  + '该请求被上游按参数拒绝：与网络、账号、额度都无关，换账号也不会改变结果，请按上面的提示调整后重试'
+await api('POST', '/failed/reset', {})
+// 该会话绑到只有一个别的模型的组，便于断言「换到了谁」
+await api('POST', '/groups', { id: 'gr', name: 'GR', models: [
+  { provider: 'p', model: 'm1', priority: 1 },
+  { provider: 'p', model: 'm2', priority: 2 },
+] })
+const rejAgent = makeAgent('rejected-1', {}, 'm1')
+agents.push(rejAgent)
+await api('POST', '/session-group', { sessionId: 'rejected-1', groupId: 'gr', mode: 'route' })
+rejAgent.status = 'running'
+const rejAction = await errHandler(
+  { agent: rejAgent, turn: 1, provider: 'p', failure: { code: 'client', status: 400, message: rejectedMsg } },
+  () => Promise.resolve(undefined),
+)
+rejAgent.status = 'idle'
+const rejLog = await lastLogFor('rejected-1')
+ok('⑯ 请求被拒时照常进分组路由（而不是原地不动）',
+  rejLog?.outcome === 'rejected-switched', JSON.stringify(rejLog))
+ok('⑯ 换到了组内下一个模型',
+  String(rejLog?.detail ?? '').includes('p/m2'), JSON.stringify(rejLog))
+ok('⑯ 请求被拒不返回 retry（同一步重试还是同一个超限模型）',
+  rejAction?.kind !== 'retry', JSON.stringify(rejAction))
+ok('⑯ 请求被拒不写「当日失败」（模型没坏，只是这条请求太大）',
+  !(await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'm1'),
+  JSON.stringify((await api('GET', '/status')).body.failed))
+ok('⑯ 请求被拒不走换账号（换号改变不了上下文上限）',
+  !(await api('GET', '/status')).body.failureLog.some(
+    f => f.sessionId === 'rejected-1' && f.outcome === 'account-handoff'))
+
+// ⑯b 同一个超限模型不能被下一轮又选回来（否则每次续跑都白烧一次上游请求）。
+//     它没被标记当日失败，只能靠「本轮已试过」名单排除；组内没有别的可用模型时
+//     应当明确报 no-target，而不是回到原模型再失败一次。
+await api('POST', '/groups', { id: 'gr2', name: 'GR2', models: [
+  { provider: 'p', model: 'm9', priority: 1 },
+] })
+const soloAgent = makeAgent('rejected-solo', {}, 'm9')
+agents.push(soloAgent)
+await api('POST', '/session-group', { sessionId: 'rejected-solo', groupId: 'gr2', mode: 'route' })
+soloAgent.status = 'running'
+await errHandler(
+  { agent: soloAgent, turn: 1, provider: 'p', failure: { code: 'client', status: 400, message: rejectedMsg } },
+  () => Promise.resolve(undefined),
+)
+soloAgent.status = 'idle'
+ok('⑯b 组内只剩同一个超限模型时报 no-target（不回到它再失败一次）',
+  (await lastLogFor('rejected-solo'))?.outcome === 'no-target',
+  JSON.stringify(await lastLogFor('rejected-solo')))
+
+// ⑯c 纯文本没有超限字样、只是普通网关 400：仍按「真失败」处理（不被误判）
+await api('POST', '/failed/reset', {})
+const plainAgent = makeAgent('plain400', {}, 'm1')
+agents.push(plainAgent)
+await api('POST', '/session-group', { sessionId: 'plain400', groupId: 'gr', mode: 'route' })
+plainAgent.status = 'running'
+await errHandler(
+  { agent: plainAgent, turn: 1, provider: 'p', failure: { code: 'client', status: 400, message: 'bad gateway request shape' } },
+  () => Promise.resolve(undefined),
+)
+plainAgent.status = 'idle'
+ok('⑯c 普通 400 仍按当日失败处理（阈值不过宽）',
+  (await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'm1'),
+  JSON.stringify((await api('GET', '/status')).body.failed))
+await api('POST', '/failed/reset', {})
 
 ctx.get = baseGet
 globalThis.fetch = baseFetch

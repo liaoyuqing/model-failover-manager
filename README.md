@@ -220,6 +220,22 @@ codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`
 
 顶部有日期筛选：两个 `YYYY-MM-DD` 输入框 +「今天」「近 7 天」「全部」快捷项，按北京时间整天、两端包含。筛选在宿主侧做，因为每个模型只保留最近 200 条样本——如果在界面里筛汇总值，算出来的会是「保留的那一段」而不是所选区间。
 
+## 请求被拒也算失败，也要换模型
+
+有一类失败既不是网络问题、也不是账号或额度问题：上游按参数拒绝了这条请求。最典型的是**输入超过模型上下文上限**（`prompt is too long`、`本次输入加上历史对话超过了模型上限`、`CONTEXT_WINDOW_EXCEEDED`），adapter 通常会把它归成 `400` / `code: client`。
+
+这类失败的处置方向与其它失败相反：
+
+- **换账号没用**——同一个模型换个凭据，上限还是那个上限；
+- **原地重试也没用**——重发同一条请求只会得到同一个结果；
+- **不能标记当日失败**——模型本身是好的，只是这一条请求太大，停用一整天是错的。
+
+唯一有效的是**换一个上下文窗口更大的模型**。所以插件把这个失败单独识别出来（机器码 + 上游文案两条判据），跳过换账号分支，直接进分组路由，并且不写「当日失败」。
+
+代价是「不写当日失败」意味着下一轮按优先级还会选中它。为此插件按会话维护一份「本轮已因请求被拒跳过」的名单，选下一个模型时把这些排除掉；切到新模型后清空。否则同一轮会反复选中那个超限模型，每次都白烧一次上游请求。
+
+注意这类失败的**先后顺序由重试插件决定**：如果 `llm-error-retry` 给 `400` 配了规则，它会先把这条请求重试到预算耗尽（默认 5 次 × 5 秒 ≈ 25 秒），之后才轮到本插件路由。要减少这段等待，需要在重试插件的规则里放宽或去掉 `400`。本插件只负责在轮到它时把模型换对。
+
 ## 切换不会暂停目标
 
 `goal-round-driver` 监听 `agent/error`，任何 agent 错误都会让它 `disarm` 当前活跃目标；而本插件换模型的代价正是「让本轮以错误收尾」（selection 在 pre-step 已冻结，只能下一轮生效）。两个机制叠加的结果就是：每次故障转移都会把进行中的目标顺手改成 disarmed，界面上显示成「已暂停的目标」。
@@ -324,6 +340,17 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   shortcuts, resolved to Beijing whole days with both ends inclusive. Filtering runs in the host
   because each model retains only its latest 200 samples — filtering the summary in the browser
   would compute percentiles over the retained slice rather than the range you picked.
+- Some failures are neither network nor account nor quota: the upstream rejected the request itself.
+  The common case is input beyond the model's context window (`prompt is too long`,
+  `CONTEXT_WINDOW_EXCEEDED`), which adapters usually class as `400` / `code: client`. Swapping
+  credentials cannot change a context limit, retrying the same request reproduces the same
+  rejection, and the model is not broken — only this one request is too large. The plugin
+  recognizes the failure (machine code plus upstream wording), skips the account handoff, and
+  routes to another model without marking the model failed for the day. Because it is not marked
+  failed, a per-session list of "already rejected this round" keeps the next pick from choosing
+  the same over-limit model again; the list clears once the switch succeeds. Ordering is still
+  the retry plugin's call: if `llm-error-retry` has a rule for `400`, that request is retried to
+  budget exhaustion before this plugin sees it.
 - A model switch must not pause an active goal. `goal-round-driver` disarms the current goal on any
   `agent/error`, and switching models requires ending the turn with an error (the step selection is
   frozen at pre-step), so every failover would otherwise leave an active goal disarmed — shown as a

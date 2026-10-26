@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v63'
+const HOST_VERSION = 'v64'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -606,12 +606,54 @@ export function apply(ctx, config = {}) {
     return false
   }
 
+  /**
+   * 这个失败是不是「这条请求本身有问题」，换账号/原地重试都不会改变结果。
+   *
+   * 典型是上游按参数拒绝：输入超过模型上下文上限、请求体不合法、模型不支持该模态。
+   * 这类失败的唯一有效处置是**换一个模型**（更大的上下文窗口、支持该模态的模型），
+   * 所以本插件必须把它交给分组路由，并且跳过「换账号重试」——同一个模型换个账号，
+   * 上限还是那个上限，重试只会白等。
+   *
+   * 判据取机器码与上游文案两条，任一命中即算：
+   *  · 宿主规范化码：CONTEXT_WINDOW_EXCEEDED / INVALID_ARGS / EMPTY_RESPONSE 之外的
+   *    参数类错误；
+   *  · 上游文案：context/length 超限、prompt is too long、input too long、
+   *    以及 adapter 把 400 归成 `client` 时附带的那句「按参数拒绝」。
+   *
+   * @param {{code?: string, status?: number, message?: string}|undefined} failure - 宿主给出的失败事实。
+   * @returns {boolean} 命中则为 true。
+   */
+  function isRequestRejectedFailure(failure) {
+    if (!failure) return false
+    const code = String(failure.code ?? '').toUpperCase()
+    if (code === 'CONTEXT_WINDOW_EXCEEDED' || code === 'INVALID_ARGS') return true
+    const message = String(failure.message ?? '')
+    if (/prompt is too long|input (?:is )?too long|context[ _-](?:length|window)/i.test(message)) return true
+    // 「本次输入加上历史对话超过了模型上限」这类只有中文的上游文案
+    if (/超过(?:了)?模型(?:的)?上限|输入.{0,6}超.{0,4}上限/.test(message)) return true
+    // 被上游按参数拒绝：与网络/账号/额度无关，换号无效
+    if (/被上游按参数拒绝|该请求被上游(?:按参数)?拒绝/.test(message)) return true
+    return false
+  }
+
   /* ---- 临时换模型：谁被换走过、从哪个模型换走 ---- */
   //
   // sessionId -> { provider, model, at }：记录会话**原先用的**模型。并发恢复后由
   // rerouteForNewTurn 按 capacitySwitchRevertMs 的保护期切回去，让「临时切换」真的
   // 是临时的，而不是换走就再也回不来。
   const capacitySwitches = new Map()
+
+  /**
+   * 本轮里因「请求被拒」被跳过的模型：sessionId -> Set<`provider/model`>。
+   *
+   * 请求被拒（输入超限/参数不合法）不属于模型坏掉，所以**不写当日失败**；但没有这份
+   * 名单，下一条续跑会按优先级又选回同一个模型，再烧一次上游请求——用户看到的就是
+   * 「报错了，又回到同一个模型，再报同样的错」。切到新模型的那一轮会清空。
+   *
+   * 只在内存里：它描述的是「这一轮试过谁」，重启后重新开始筛选是正确行为。
+   */
+  const rejectedBySession = new Map()
+
 
   /** 速度采样环形缓冲（每个模型最多留 N 条，供看板求分位数） */
   const SPEED_SAMPLE_LIMIT = 200
@@ -943,9 +985,28 @@ export function apply(ctx, config = {}) {
   }
 
   /** 组内除 exclude 外的下一个可路由模型（按优先级顺序；优先压缩代理看得见的） */
-  function nextInGroup(groupId, exclude) {
-    return pickCandidate(sortedModels(groupId)
-      .filter(m => !(m.provider === exclude.provider && m.model === exclude.model)))
+  function nextInGroup(groupId, exclude, alsoSkip) {
+    return pickCandidate(sortedModels(groupId).filter((m) => {
+      if (m.provider === exclude.provider && m.model === exclude.model) return false
+      // alsoSkip：本轮已因「请求被拒」跳过的模型（它们没被标记当日失败，只能靠这里排除）
+      if (alsoSkip !== undefined && alsoSkip.has(failKey(m.provider, m.model))) return false
+      return true
+    }))
+  }
+
+  /**
+   * 失败后选下一个模型：绑定了分组就在组内选，否则按「同组、优先级不高于当前」兜底。
+   *
+   * @param {{id: string}|undefined} group - 会话绑定的启用分组；undefined 表示未绑定。
+   * @param {{provider: string, model: string}} exclude - 刚失败的那个模型。
+   * @param {Set<string>|undefined} alsoSkip - 本轮已因请求被拒跳过的 `provider/model`。
+   * @returns {{provider: string, model: string, effort?: string}|null} 选中的目标。
+   */
+  function pickNext(group, exclude, alsoSkip) {
+    if (group !== undefined) return nextInGroup(group.id, exclude, alsoSkip)
+    const fallback = findFailover(exclude.provider, exclude.model)
+    if (fallback === null || alsoSkip === undefined) return fallback
+    return alsoSkip.has(failKey(fallback.provider, fallback.model)) ? null : fallback
   }
 
   /**
@@ -1908,32 +1969,56 @@ export function apply(ctx, config = {}) {
       ctx.logger.warn(`[model-failover] ${provider}/${model} 并发已满（${failure?.code ?? 'unknown'}），临时冷却 ${Math.round(capacityCooldownMs / 1000)}s 并切换到组内其它模型`)
     }
 
+    // 请求本身被拒（输入超过上下文上限、参数不合法、模态不支持…）：
+    // 换账号没用、原地重试也没用，唯一有效的是换模型。所以先记下来，
+    // 下面跳过换号分支，直接进分组路由；并且对这类失败做「保留」处理——
+    // 模型本身是好的（只是这条请求太大），不该被标成当日失败而停用一整天。
+    const requestRejected = isRequestRejectedFailure(failure)
+    if (requestRejected) {
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 的失败是请求被拒（${failure?.code ?? 'unknown'}），换号无意义，直接换模型`)
+    }
+
     // Our Free Model 的模型：不论错误类型，一律先试换账号重试。
     // 换的是同一 provider/model 背后的凭据，selection 没变，所以同一步 retry 安全。
     // 哪些 provider 算「Our Free Model 的」由 config.ofmHandoffExcludeProviders 判定：
     // 名单内（默认 codearts）直接落到下面的分组路由。
     //
     // 并发类失败不换号：账号池打满时换号拿到的还是同一个池，换模型才有意义。
-    const handedTo = capacityFailure ? null : await handoffToFreeModelAccount(provider, model, failure)
+    // 请求被拒也不换号：模型上限/参数问题与凭据无关，换号只会白等一轮。
+    const handedTo = (capacityFailure || requestRejected)
+      ? null
+      : await handoffToFreeModelAccount(provider, model, failure)
     if (handedTo) {
       noteFailure(agent, provider, failure, 'account-handoff', { model, detail: '账号 ' + handedTo })
       return { kind: 'retry' }
     }
 
-    if (!capacityFailure) {
+    // 请求被拒不写当日失败：这个模型换个请求还能用，停用一整天是错的。
+    // 但它必须参与「别的模型为何被跳过」的判断，所以只记 errorTurns 并继续切模型。
+    if (!capacityFailure && !requestRejected) {
       markFailed(provider, model, failure)
       ctx.logger.warn(`[model-failover] ${provider}/${model} 彻底失败（${failure?.code ?? 'unknown'}），已标记为当日失败`)
     }
     errorTurns.set(id, turn)
 
+    // 这一轮里已经因为「请求被拒」被淘汰的模型：请求被拒不写当日失败（模型本身没坏），
+    // 所以下一条续跑必须靠这份名单把它排除掉，否则同一个超限模型会被反复选中，
+    // 每次都要白烧一次上游请求。切到新模型后清空，下一轮重新开始。
+    if (requestRejected) {
+      const tried = rejectedBySession.get(id) ?? new Set()
+      tried.add(failKey(provider, model))
+      rejectedBySession.set(id, tried)
+    }
+    const rejectedNow = rejectedBySession.get(id)
+
     // 绑定：先看自己，子代理沿 parentSession 继承父会话的分组
     const inherited = effectiveBinding(agent.session)
     const binding = inherited?.binding
     const group = binding ? groups.find(g => g.id === binding.groupId && g.enabled) : undefined
-    const target = group ? nextInGroup(group.id, { provider, model }) : findFailover(provider, model)
+    const target = pickNext(group, { provider, model }, rejectedNow)
     if (!target) {
       const why = binding
-        ? (group ? '分组内无其它可路由模型（全部当日失败/不在时段/已过期）' : '绑定的分组已停用或不存在')
+        ? (group ? '分组内无其它可路由模型（全部当日失败/不在时段/已过期/本轮已因请求被拒跳过）' : '绑定的分组已停用或不存在')
         : '该会话未绑定分组，且该模型不在任何启用分组内'
       ctx.logger.info(`[model-failover] ${provider}/${model} 失败后不切换：${why}`)
       noteFailure(agent, provider, failure, 'no-target', { model, detail: why, uncompressed: compressionGap !== null })
@@ -1954,7 +2039,12 @@ export function apply(ctx, config = {}) {
     const ok = await applyActiveModel(agent, target)
     // 并发切换要记住「原来用的是什么」，rerouteForNewTurn 才能在执行期过后切回去。
     if (ok && capacityFailure) capacitySwitches.set(id, { provider, model, at: Date.now() })
-    noteFailure(agent, provider, failure, ok ? (capacityFailure ? 'capacity-switched' : 'switched') : 'switch-failed', {
+    // 切成功就清空本轮的被拒名单：已经离开那个模型了，下一轮从干净的候选集开始。
+    // 不清会让名单无限增长，也会在用户换分组/换模型后挡住本来可用的模型。
+    if (ok) rejectedBySession.delete(id)
+    noteFailure(agent, provider, failure, ok
+      ? (capacityFailure ? 'capacity-switched' : requestRejected ? 'rejected-switched' : 'switched')
+      : 'switch-failed', {
       model, detail: `→ ${target.provider}/${target.model}${ok ? '' : '（切换失败）'}`,
       uncompressed: compressionGap !== null,
     })
