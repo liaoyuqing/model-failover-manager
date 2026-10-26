@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v61'
+const HOST_VERSION = 'v62'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -1954,9 +1954,68 @@ export function apply(ctx, config = {}) {
     if (!ok) return action
     // 已经 select 了新模型，但本步 selection 已冻结：等本轮收尾后排队续跑。
     // 不返回 retry：让这一轮以错误收尾，续跑消息开下一轮。
-    queueContinuation(agent, provider, model, target)
+    queueContinuation(agent, provider, model, target, goalRevivalOf(agent))
     return action
   }, { prepend: true })
+
+  /**
+   * 读出该会话此刻的 goal（若有），供并发/失败切换后恢复它的自动续跑授权。
+   *
+   * 为什么需要记：goal-round-driver 监听 `agent/error`，**任何** agent 错误都会让它
+   * `ctx.goals.disarm(agent)`；而本插件切换模型的代价正是「让本轮以错误收尾」，
+   * 所以每次 failover 都会顺手把活跃 goal 的 activation 从 armed 改成 disarmed。
+   * 界面把 active+disarmed 显示成「已暂停的目标」——用户看到的就是「重新路由时
+   * 目标被暂停了」。这是本插件造成的副作用，必须在续跑时把它恢复。
+   *
+   * 只记 armed 的活跃 goal：paused/blocked/complete 是用户或模型自己的决定，
+   * 本插件绝不越权复活。revision 一并记下，恢复时用它做 CAS，避免把期间被用户
+   * 改过（edit/resume/complete）的目标按旧 ref 写回去。
+   *
+   * @param {any} agent - 即将收尾的 Agent。
+   * @returns {{id: string, revision: number}|null} 需要恢复的 goal ref；没有则 null。
+   */
+  function goalRevivalOf(agent) {
+    try {
+      const goals = ctx.get('goals')
+      const view = goals?.get?.(agent)
+      if (!view || view.phase !== 'active' || view.activation !== 'armed') return null
+      return { id: String(view.id), revision: Number(view.revision) }
+    } catch { /* 未安装 goal 插件或服务不可读时静默跳过 */ }
+    return null
+  }
+
+  /**
+   * 把被 failover 顺手 disarmed 的 goal 重新 arm。
+   *
+   * `resume()` 对 active 且已 armed 的目标会抛 GOAL_INVALID_TRANSITION，因此先读
+   * 现场：已经 armed 就什么都不做；只有 active+disarmed 才 resume。revision 不匹配
+   * （期间被用户 edit / resume / complete 过）同样放弃——那是别人的决定，不该被
+   * 一次模型切换覆盖。
+   *
+   * @param {any} agent - 该会话的 Agent。
+   * @param {{id: string, revision: number}|null} ref - 切换前记下的 goal ref。
+   * @returns {boolean} 是否真的恢复了自动续跑授权。
+   */
+  function reviveGoalAfterSwitch(agent, ref) {
+    if (!ref) return false
+    try {
+      const goals = ctx.get('goals')
+      if (!goals?.resume) return false
+      const view = goals.get?.(agent)
+      if (!view || String(view.id) !== ref.id) return false
+      // 已经恢复（或被用户恢复）过了
+      if (view.phase === 'active' && view.activation === 'armed') return false
+      if (view.phase !== 'active') return false
+      if (Number(view.revision) !== ref.revision) return false
+      goals.resume(agent, { id: ref.id, revision: ref.revision })
+      ctx.logger.info(`[model-failover] 会话 ${agent?.session?.id} 的 goal ${ref.id} 已随切换恢复自动续跑`)
+      return true
+    } catch (e) {
+      // 恢复 goal 是附带的善意行为：失败只记日志，绝不能挡住续跑本身。
+      ctx.logger.warn(`[model-failover] 恢复 goal 自动续跑失败：${e?.message || e}`)
+      return false
+    }
+  }
 
   /**
    * 待续跑的会话：sessionId -> { provider, model, target }。
@@ -1978,10 +2037,11 @@ export function apply(ctx, config = {}) {
    * @param {string} fromProvider - 失败请求实际用的 provider。
    * @param {string} fromModel - 失败请求实际用的模型。
    * @param {{provider: string, model: string}} target - 已 select 的新模型。
+   * @param {{id: string, revision: number}|null} goalRevival - 切换前被 disarm 的 goal（见 goalRevivalOf）。
    */
-  function queueContinuation(agent, fromProvider, fromModel, target) {
+  function queueContinuation(agent, fromProvider, fromModel, target, goalRevival = null) {
     const id = String(agent.session.id)
-    pendingContinuations.set(id, { agent, fromProvider, fromModel, target })
+    pendingContinuations.set(id, { agent, fromProvider, fromModel, target, goalRevival })
     ctx.logger.info(`[model-failover] ${fromProvider}/${fromModel} → ${target.provider}/${target.model}，等待本轮收尾后自动续跑`)
     // 已经空闲（异常路径下可能直接是 idle）：立刻安排投递。
     if (agent.status === 'idle') scheduleContinuation(id)
@@ -2019,6 +2079,10 @@ export function apply(ctx, config = {}) {
     pendingContinuations.delete(sessionId)
     if (disposed) return
     logStatus('continuation/delivered', sessionId, null)
+    // 先恢复 goal 再投递：goal-round-driver 在 agent 回到 idle 时，如果发现本轮的
+    // 预留消息还在队列里且 goal 仍 armed，会主动 pause 它。所以必须在 followup 之前
+    // 把 activation 恢复回来，否则用户会看到目标被这次切换「暂停」。
+    reviveGoalAfterSwitch(pending.agent, pending.goalRevival)
     try {
       pending.agent.followup(createContinuationMessage(pending.fromProvider, pending.fromModel, pending.target))
       ctx.logger.info(`[model-failover] ${sessionId} 已排队续跑（${pending.target.provider}/${pending.target.model}）`)

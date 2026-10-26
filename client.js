@@ -58,9 +58,10 @@ window.__ModuleLoader__.load({
         background: 'var(--dsw-alias-bg-mask-1)',
         backdropFilter: 'var(--dsw-mask-blur)', WebkitBackdropFilter: 'var(--dsw-mask-blur)',
       },
+      // 宽度给到 860：右栏在看板页签要放 6 列数值表，720 时模型名只剩 40px
       dialog: {
-        display: 'flex', flexDirection: 'column', width: 'min(92vw, 720px)',
-        height: 'min(82vh, 540px)', borderRadius: 'var(--dsw-radius-md)', overflow: 'hidden',
+        display: 'flex', flexDirection: 'column', width: 'min(94vw, 860px)',
+        height: 'min(84vh, 600px)', borderRadius: 'var(--dsw-radius-md)', overflow: 'hidden',
         background: 'var(--dsw-alias-bg-layer-2)',
         boxShadow: 'var(--dsw-elevation-prominent)',
         color: 'var(--dsw-alias-label-primary)',
@@ -220,6 +221,16 @@ window.__ModuleLoader__.load({
         background: 'var(--dsw-alias-state-business-tertiary)',
         color: 'var(--dsw-alias-state-business-primary)',
       },
+      /** 模型行上的并发上限输入：贴着分组徽标，只对已入组的模型显示 */
+      modelConcWrap: { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: '2px' },
+      modelConcInput: {
+        width: '34px', textAlign: 'center', boxSizing: 'border-box',
+        background: 'var(--dsw-alias-bg-base)',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        borderRadius: '4px', padding: '1px 2px', fontSize: '11px',
+        color: 'var(--dsw-alias-label-primary)', outline: 'none',
+      },
+      modelConcLabel: { fontSize: '10px', opacity: .55, whiteSpace: 'nowrap' },
       addMenu: {
         margin: '2px 0 6px 12px', padding: '4px 6px',
         border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 'var(--dsw-radius-sm)',
@@ -255,10 +266,12 @@ window.__ModuleLoader__.load({
         background: 'var(--dsw-alias-bg-layer-1)',
       },
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
+      // 六列：模型 / 首字 / 速度 / 并发 / 排队 / 状态。样本并进首字与速度的
+      // 副行、等待并进并发的副行，省下的宽度全部让给模型名。
       metricsRow: {
         display: 'grid',
-        gridTemplateColumns: 'minmax(0, 1.9fr) 54px 78px 50px 88px 40px minmax(0, 1.2fr) 72px',
-        alignItems: 'center', gap: '6px', padding: '4px 8px',
+        gridTemplateColumns: 'minmax(120px, 1fr) 66px 82px 76px minmax(64px, auto)',
+        alignItems: 'center', gap: '8px', padding: '6px 10px',
         borderTop: '0.5px solid var(--dsw-alias-border-l1)',
         fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
       },
@@ -272,14 +285,23 @@ window.__ModuleLoader__.load({
       metricsRowFailed: { opacity: .6 },
       metricsRowDisabled: { opacity: .7 },
       metricsCell: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-      metricsCellNum: {
-        minWidth: 0, textAlign: 'right', fontVariantNumeric: 'tabular-nums',
-        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      // 数值列的两行写法：主值 + 淡色副值（P90、样本、等槽）。并成一列是为了
+      // 让出宽度给模型名——两行文本比两列数字窄得多。
+      metricsNumCell: {
+        minWidth: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end',
+        gap: '1px', lineHeight: '1.3',
+      },
+      metricsNumMain: {
+        fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+        overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%',
+      },
+      metricsNumSub: {
+        fontSize: '10px', opacity: .55, fontVariantNumeric: 'tabular-nums',
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%',
       },
       // 模型名：允许折行（break-word 兜住没有空格的长 id）
       metricsCellModel: { minWidth: 0, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: '1.35' },
       metricsTagCell: { minWidth: 0, display: 'flex', flexWrap: 'wrap', gap: '2px', alignItems: 'center' },
-      metricsDim: { opacity: .4 },
       metricsModel: { fontWeight: 600 },
       metricsSub: { fontSize: '10px', opacity: .6, marginTop: '1px', whiteSpace: 'normal', wordBreak: 'break-word' },
       // 表头按钮：整格可点，▲/▼ 指示当前排序列与方向
@@ -292,17 +314,6 @@ window.__ModuleLoader__.load({
       metricsSortBtnOn: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600 },
       metricsSortMark: { fontSize: '9px', lineHeight: 1, flexShrink: 0 },
       // 并发列：显式配置输入框 + 生效上限
-      metricsConcCell: { minWidth: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '1px' },
-      metricsConcLine: { display: 'flex', alignItems: 'center', gap: '2px', justifyContent: 'flex-end', minWidth: 0 },
-      metricsConcInput: {
-        width: '38px', textAlign: 'center', boxSizing: 'border-box',
-        background: 'var(--dsw-alias-bg-base)',
-        border: '0.5px solid var(--dsw-alias-border-l4)',
-        borderRadius: '4px', padding: '1px 2px', fontSize: '11px',
-        color: 'var(--dsw-alias-label-primary)', outline: 'none',
-      },
-      metricsConcEff: { fontSize: '10px', opacity: .7, whiteSpace: 'nowrap' },
-      metricsConcBusy: { fontSize: '10px', opacity: .55, whiteSpace: 'nowrap' },
     }
 
     /* ----------------------------------------------------------- helpers -- */
@@ -436,6 +447,19 @@ window.__ModuleLoader__.load({
       var sortPair = React.useState(null); var sort = sortPair[0]; var setSort = sortPair[1]
       /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
       var concPair = React.useState({}); var concDraft = concPair[0]; var setConcDraft = concPair[1]
+
+      /** 默认并发上限：status.defaultConcurrency 是分组级默认，null = 未配置 */
+      var defaultConc = status && typeof status.defaultConcurrency === 'number' ? status.defaultConcurrency : null
+      var defaultConcHint = defaultConc === null ? '' : (defaultConc === 0 ? '当前默认不限' : '当前默认 ' + defaultConc)
+      /** 输入框占位：显示“跟随”的默认值，让留空和写死都一眼可辨 */
+      function defaultConcText() { return defaultConc === 0 ? '不限' : (defaultConc === null ? '' : String(defaultConc)) }
+
+      /** 某模型的显式并发配置；0/缺省视为未配置，返回 null */
+      function explicitConcOf(provider, model) {
+        var map = (status && status.modelConcurrency) || {}
+        var v = map[keyOf(provider, model)]
+        return Number.isInteger(v) && v > 0 ? v : null
+      }
 
       React.useEffect(function () {
         function sync() { setSnap(props.store.getSnapshot()) }
@@ -620,6 +644,31 @@ window.__ModuleLoader__.load({
                 style: S.groupTag,
                 title: '所属分组：' + inGroups.map(function (g) { return g.name }).join('、'),
               }, inGroups.map(function (g) { return g.name }).join('、')),
+              // 并发上限：只对已进分组的模型有意义（分组才是路由单位）。
+              // 空 = 跟随默认上限；写数字 = 该模型显式上限，对所有分组统一生效。
+              inGroups.length > 0 && e('span', {
+                style: S.modelConcWrap,
+                onClick: function (ev) { ev.stopPropagation() },
+              },
+                e('input', {
+                  type: 'number', min: '1', max: '999',
+                  style: S.modelConcInput,
+                  value: concDraft[k] !== undefined
+                    ? concDraft[k]
+                    : (explicitConcOf(providerGroup.id, m.id) === null ? '' : String(explicitConcOf(providerGroup.id, m.id))),
+                  placeholder: defaultConcText(),
+                  title: '该模型同时最多几个请求，对所有分组统一生效；留空 = 跟随默认上限'
+                    + (defaultConcHint ? '（' + defaultConcHint + '）' : '')
+                    + '。达到上限时会先尝试切到组内其它空闲模型，都满才排队。',
+                  onChange: function (ev) { commitConcurrency(providerGroup.id, m.id, ev.target.value) },
+                  onBlur: function () {
+                    // 失焦即放弃本地草稿，输入框回到服务端记录的真实值
+                    var nxt = Object.assign({}, concDraft)
+                    delete nxt[k]
+                    setConcDraft(nxt)
+                  },
+                }),
+                e('span', { style: S.modelConcLabel }, '并发')),
               // 快捷加入分组
               e('button', {
                 style: S.addBtn, title: '加入路由分组',
@@ -770,8 +819,8 @@ window.__ModuleLoader__.load({
        * 输入框是受控的本地草稿：合法正整数即提交，空/0 即传 null 回落到默认上限。
        * 回写草稿前比对当前值，避免响应回来时抹掉用户刚敲的新数字。
        */
-      function commitConcurrency(row, raw) {
-        var k = keyOf(row.provider, row.model)
+      function commitConcurrency(provider, model, raw) {
+        var k = keyOf(provider, model)
         var next = Object.assign({}, concDraft)
         next[k] = raw
         setConcDraft(next)
@@ -779,7 +828,7 @@ window.__ModuleLoader__.load({
         var blank = String(raw).trim() === '' || Number(raw) === 0
         if (limit === null && !blank) return
         apiSend(API + '/model-concurrency', 'POST', {
-          provider: row.provider, model: row.model, concurrency: limit,
+          provider: provider, model: model, concurrency: limit,
         }).catch(function () { }).then(function () {
           setConcDraft(function (prev) {
             if (prev[k] !== raw) return prev
@@ -848,10 +897,8 @@ window.__ModuleLoader__.load({
         if (key === 'model') return r.provider + '/' + r.model
         if (key === 'ttft') return isNum(r.ttftP50) ? r.ttftP50 : null
         if (key === 'tps') return isNum(r.tpsP50) ? r.tpsP50 : null
-        if (key === 'samples') return isNum(r.samples) ? r.samples : 0
+        // 并发列按「生效上限」排：不限（null）垫底，与显示一致
         if (key === 'conc') return Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
-        if (key === 'queued') return isNum(r.queued) ? r.queued : 0
-        if (key === 'wait') return isNum(r.waitP50) ? r.waitP50 : null
         return metricsStatusRank(r)
       }
 
@@ -868,8 +915,6 @@ window.__ModuleLoader__.load({
         var now = Date.now()
         var defaultHint = defConc === null ? '' : (defConc === 0 ? '当前默认不限' : '当前默认 ' + defConc)
 
-        var cell = S.metricsCell
-        var num = S.metricsCellNum
 
         /** 表头：点击切 升序 → 降序 → 默认序；▲/▼ 标出当前排序列与方向 */
         function sortHead(key, label, numeric) {
@@ -899,10 +944,10 @@ window.__ModuleLoader__.load({
                 onClick: function () { refreshMetrics() },
               }, '刷新'))),
           e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
-            '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
-            + '并发上限在下表「并发」列按模型配置，对所有分组统一生效；默认并发为 0 时表示分组未配置即不限。'),
+            '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；并发 = 正在进行的请求 / 生效上限'
+            + '（上限在「模型」页签的模型行上设置，对所有分组统一生效）。'),
           e('div', { style: S.metricsNote },
-            '等待 = 等并发槽位的排队时间；样本 = 当日成功/总采样数；状态里的「当日失败」不参与路由。'),
+            '副行灰字是该列的补充：首字与速度给 P90，并发给等槽时间与排队数，模型给所属分组与当日采样。'),
           noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
           metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
           metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
@@ -912,11 +957,8 @@ window.__ModuleLoader__.load({
               sortHead('model', '模型', false),
               sortHead('ttft', '首字', true),
               sortHead('tps', '速度', true),
-              sortHead('samples', '样本', true),
               sortHead('conc', '并发', true),
-              sortHead('queued', '排队', true),
-              sortHead('status', '状态', false),
-              sortHead('wait', '等待', true)),
+              sortHead('status', '状态', false)),
             sorted.map(function (it) {
               var r = it.row
               var k = keyOf(r.provider, r.model)
@@ -931,6 +973,17 @@ window.__ModuleLoader__.load({
               var coolLeft = cooling ? Math.max(1, Math.round((r.capacityUntil - now) / 1000)) : 0
               var style = Object.assign({}, S.metricsRow,
                 r.failed ? S.metricsRowFailed : {}, r.disabled ? S.metricsRowDisabled : {})
+              // 副行只在有值时才画：没采样的行单行显示，不拿「P90 —」白占高度
+              function p90Cell(p50, p90, fmt) {
+                var has90 = isNum(p90)
+                return e('div', { style: S.metricsNumCell },
+                  e('span', { style: S.metricsNumMain }, fmt(p50)),
+                  has90 && e('span', { style: S.metricsNumSub, title: 'P90 ' + fmt(p90) }, 'P90 ' + fmt(p90)))
+              }
+              // 并发副行：等槽时间优先，其次排队数；都没有就不画
+              var concSub = isNum(r.waitP50) && r.waitP50 > 0 ? '等槽 ' + fmtMs(r.waitP50) : null
+              var queueSub = queued > 0 ? '排队 ' + queued : null
+              var concSubText = [concSub, queueSub].filter(Boolean).join(' · ')
               return e('div', { key: k, style: style },
                 // 模型列允许折行：provider/model 再长也看全，title 兜底完整值
                 e('div', { style: S.metricsCellModel },
@@ -938,46 +991,19 @@ window.__ModuleLoader__.load({
                     style: S.metricsModel,
                     title: r.provider + '/' + r.model + (it.groupName ? '\n分组：' + it.groupName : ''),
                   }, r.provider + '/' + r.model),
-                  it.groupName && e('div', { style: S.metricsSub }, it.groupName)),
-                e('span', {
-                  style: num,
-                  title: r.ttftP90 === null || r.ttftP90 === undefined ? '' : 'P90 ' + fmtMs(r.ttftP90),
-                }, fmtMs(r.ttftP50)),
-                e('span', {
-                  style: num,
-                  title: r.tpsP90 === null || r.tpsP90 === undefined ? '' : 'P90 ' + fmtTps(r.tpsP90),
-                }, fmtTps(r.tpsP50)),
-                e('span', {
-                  style: num,
-                  title: isNum(r.samples) && r.samples > 0 ? '成功 ' + r.okSamples + ' / 共 ' + r.samples : '暂无采样',
-                }, (isNum(r.okSamples) ? String(r.okSamples) : '0') + '/' + (isNum(r.samples) ? String(r.samples) : '0')),
-                // 并发：可编辑——这里写的是「显式配置」，空 = 跟随 defaultConcurrency
-                e('div', { style: S.metricsConcCell, onClick: function (ev) { ev.stopPropagation() } },
-                  e('div', { style: S.metricsConcLine },
-                    e('input', {
-                      type: 'number', min: '1', max: '999',
-                      style: S.metricsConcInput,
-                      value: concDraft[k] !== undefined
-                        ? concDraft[k]
-                        : (explicit === null ? '' : String(explicit)),
-                      placeholder: effText,
-                      title: '该模型同时最多几个请求，对所有分组统一生效；留空 = 跟随默认上限'
-                        + (defaultHint ? '（' + defaultHint + '）' : '')
-                        + '。达到上限时会先尝试切到组内其它空闲模型，都满才排队。',
-                      onClick: function (ev) { ev.stopPropagation() },
-                      onChange: function (ev) { commitConcurrency(r, ev.target.value) },
-                      onBlur: function () {
-                        // 失焦即放弃本地草稿，输入框回到服务端记录的真实值
-                        var nxt = Object.assign({}, concDraft)
-                        delete nxt[k]
-                        setConcDraft(nxt)
-                      },
-                    }),
-                    e('span', {
-                      style: S.metricsConcBusy,
-                      title: '正在进行的请求 / 生效上限' + (explicit === null ? '（跟随默认）' : '（本模型显式配置）'),
-                    }, String(inflight) + '/' + effText))),
-                e('span', { style: queued > 0 ? num : Object.assign({}, num, S.metricsDim) }, String(queued)),
+                  e('div', { style: S.metricsSub },
+                    (it.groupName ? it.groupName : '未分组')
+                    + ' · ' + (isNum(r.okSamples) ? r.okSamples : 0) + '/' + (isNum(r.samples) ? r.samples : 0) + ' 成功')),
+                p90Cell(r.ttftP50, r.ttftP90, fmtMs),
+                p90Cell(r.tpsP50, r.tpsP90, fmtTps),
+                // 并发：只读展示「进行中 / 上限」，上限在模型页签改
+                e('div', { style: S.metricsNumCell },
+                  e('span', {
+                    style: S.metricsNumMain,
+                    title: '正在进行的请求 / 生效上限' + (explicit === null ? '（跟随默认上限）' : '（本模型显式配置）')
+                      + (queued > 0 ? '\n排队中：' + queued : ''),
+                  }, String(inflight) + '/' + effText),
+                  concSubText && e('span', { style: S.metricsNumSub }, concSubText)),
                 e('div', { style: S.metricsTagCell },
                   // 两个状态独立判定：一个模型可以既手动禁用又当日失败
                   r.failed && e('span', { style: S.tag }, '当日失败'),
@@ -997,11 +1023,7 @@ window.__ModuleLoader__.load({
                   r.lastErrorCode && e('span', {
                     style: { fontSize: '10px', fontFamily: 'monospace', opacity: .7 },
                     title: '最近一次错误码',
-                  }, String(r.lastErrorCode))),
-                e('span', { style: cell },
-                  isNum(r.waitP50) && r.waitP50 > 0
-                    ? e('span', { style: { fontSize: '11px' } }, '排队 ' + fmtMs(r.waitP50))
-                    : e('span', { style: Object.assign({}, S.metricsDim, { fontSize: '11px' }) }, '—')))
+                  }, String(r.lastErrorCode))))
             })))
       }
 

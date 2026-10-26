@@ -216,7 +216,13 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`（并发占满、账号本身没坏），重启账号池只会打断正在跑的请求，所以按并发类失败临时换模型，不动账号池。只有池里确实全被禁用或冷却时才重启。
 
-「数据看板」页签（设置页与模型弹窗里都有，打开时每 3 秒刷新）显示每个模型的首字延迟（P50/P90）、输出速度（P50/P90）、排队等槽时间、样本数、并发现场与冷却剩余。
+「数据看板」页签（设置页与模型弹窗里都有，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、并发现场与冷却剩余，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。
+
+## 切换不会暂停目标
+
+`goal-round-driver` 监听 `agent/error`，任何 agent 错误都会让它 `disarm` 当前活跃目标；而本插件换模型的代价正是「让本轮以错误收尾」（selection 在 pre-step 已冻结，只能下一轮生效）。两个机制叠加的结果就是：每次故障转移都会把进行中的目标顺手改成 disarmed，界面上显示成「已暂停的目标」。
+
+插件在切换时记下该会话当时的活跃 goal ref（只记 `phase=active && activation=armed` 的），在投递续跑消息**之前**用 `goals.resume()` 把授权恢复回去。恢复用记下的 `revision` 做 CAS：期间被用户 edit / resume / complete 过就放弃，用户主动 pause 的目标也绝不复活——只有被这次切换误伤的目标会被救回。goal 插件未安装或恢复失败时只记日志，不影响续跑本身。
 
 ## HTTP 接口
 
@@ -306,6 +312,13 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
 - Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. A request that cannot get a slot waits up to `concurrencyQueueTimeoutMs` and then fails as `CAPACITY_TIMEOUT`.
 - Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.
+- A model switch must not pause an active goal. `goal-round-driver` disarms the current goal on any
+  `agent/error`, and switching models requires ending the turn with an error (the step selection is
+  frozen at pre-step), so every failover would otherwise leave an active goal disarmed — shown as a
+  paused goal. The plugin records the goal ref before switching (`phase=active && activation=armed`
+  only) and calls `goals.resume()` before delivering the continuation. The recorded `revision` is a
+  CAS guard: a goal edited, resumed, or completed meanwhile is left alone, and a goal the user paused
+  is never revived. An absent goal service or a failed resume only logs; the continuation still runs.
 - A `429` from codearts whose pool accounts are all merely `capped` switches models temporarily rather than restarting the account pool, because restarting would abort the requests that are still running.
 - The dashboard tab (in both the settings page and the model dialog; polls every 3s while open) shows per-model time to first token and output speed (P50/P90), slot wait time, sample counts, live concurrency, and cooldown remaining.
 

@@ -154,10 +154,32 @@ const accountPool = {
     poolCalls.push(['updateModelRateLimit', accountId, model, resetAt])
   },
 }
+/** 假的 goal 服务：记录 resume 调用，并可预置某个会话的 goal 现场 */
+const goalCalls = []
+const goalState = new Map() // sessionId -> { id, revision, phase, activation }
+const goalsService = {
+  get(agent) {
+    const st = goalState.get(String(agent?.session?.id))
+    return st === undefined ? undefined : { ...st }
+  },
+  resume(agent, ref) {
+    const sid = String(agent?.session?.id)
+    goalCalls.push({ sid, ref: { ...ref } })
+    const st = goalState.get(sid)
+    if (st === undefined) throw new Error('no current goal')
+    if (st.id !== ref.id || st.revision !== ref.revision) throw new Error('stale goal ref')
+    if (st.phase === 'active' && st.activation === 'armed') throw new Error('already active and armed')
+    if (st.phase !== 'active') throw new Error(`invalid phase ${st.phase}`)
+    goalState.set(sid, { ...st, activation: 'armed' })
+    return { ...goalState.get(sid) }
+  },
+}
+
 const ctx = {
   logger: { info() {}, warn() {}, error() {} },
   get(name) {
     if (name === 'accountPool') return accountPool
+    if (name === 'goals') return goalsService
     if (name === 'agents') return { list: () => agents, get: (id) => agents.find(a => a.id === id) }
     if (name === 'sessionController') {
       return {
@@ -352,6 +374,70 @@ const logResp2 = await api('GET', '/debug/status-log?sessionId=sub-explicit&limi
 ok('⑨ 诊断同时记录转发给 GUI 的 api-session/status',
   (logResp2.body.entries ?? []).some(e => e.kind === 'api-session/status' && e.running === true),
   JSON.stringify((logResp2.body.entries ?? []).at(-1)))
+
+// ⑨b 切换不得把活跃 goal 暂停：goal-round-driver 见到 agent/error 就 disarm，
+//     而 failover 正是靠「让本轮以错误收尾」换模型，所以必须在续跑前把授权恢复。
+//     界面把 active+disarmed 显示成「已暂停的目标」——这就是用户报的现象。
+const goalSid = 'goal-sess'
+const goalAgent = makeAgent(goalSid, {}, 'm1')
+agents.push(goalAgent)
+await api('POST', '/session-group', { sessionId: goalSid, groupId: 'g2', mode: 'route' })
+goalState.set(goalSid, { id: 'goal-a', revision: 3, phase: 'active', activation: 'armed' })
+goalCalls.length = 0
+goalAgent.status = 'running'
+await errHandler(
+  { agent: goalAgent, turn: 1, provider: 'p', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 } },
+  () => Promise.resolve(undefined),
+)
+// 模拟宿主：切换时 goal 被 goal-round-driver disarm（我们只关心续跑阶段能否恢复）
+goalState.set(goalSid, { id: 'goal-a', revision: 3, phase: 'active', activation: 'disarmed' })
+goalAgent.status = 'idle'
+for (const fn of handlers.getAll('agent/status')) fn({ agent: goalAgent, status: 'idle' })
+await new Promise(resolve => setTimeout(resolve, 5))
+ok('⑨b 切换后把被 disarm 的活跃 goal 重新 arm',
+  goalState.get(goalSid)?.activation === 'armed',
+  JSON.stringify(goalState.get(goalSid)))
+ok('⑨b 恢复用的是切换前记下的 ref（revision 做 CAS）',
+  goalCalls.some(c => c.sid === goalSid && c.ref.id === 'goal-a' && c.ref.revision === 3),
+  JSON.stringify(goalCalls))
+// 已经 armed 的 goal 不该被重复 resume（resume 会抛 GOAL_INVALID_TRANSITION）
+goalState.set('goal-armed-2', { id: 'goal-b', revision: 1, phase: 'active', activation: 'armed' })
+const armedAgent = makeAgent('goal-armed-2', {}, 'm1')
+agents.push(armedAgent)
+await api('POST', '/session-group', { sessionId: 'goal-armed-2', groupId: 'g2', mode: 'route' })
+goalCalls.length = 0
+armedAgent.status = 'running'
+await errHandler(
+  { agent: armedAgent, turn: 1, provider: 'p', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 } },
+  () => Promise.resolve(undefined),
+)
+armedAgent.status = 'idle'
+for (const fn of handlers.getAll('agent/status')) fn({ agent: armedAgent, status: 'idle' })
+await new Promise(resolve => setTimeout(resolve, 5))
+ok('⑨b 本来就 armed 的 goal 不会被重复 resume',
+  goalCalls.every(c => c.sid !== 'goal-armed-2'),
+  JSON.stringify(goalCalls))
+// 用户主动 pause 的 goal 绝不能被切换复活
+goalState.set('goal-paused-3', { id: 'goal-c', revision: 2, phase: 'paused', activation: 'disarmed' })
+const pausedAgent = makeAgent('goal-paused-3', {}, 'm1')
+agents.push(pausedAgent)
+await api('POST', '/session-group', { sessionId: 'goal-paused-3', groupId: 'g2', mode: 'route' })
+goalCalls.length = 0
+pausedAgent.status = 'running'
+await errHandler(
+  { agent: pausedAgent, turn: 1, provider: 'p', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 } },
+  () => Promise.resolve(undefined),
+)
+pausedAgent.status = 'idle'
+for (const fn of handlers.getAll('agent/status')) fn({ agent: pausedAgent, status: 'idle' })
+await new Promise(resolve => setTimeout(resolve, 5))
+ok('⑨b 用户 pause 的 goal 不被切换复活',
+  goalState.get('goal-paused-3')?.phase === 'paused'
+  && goalState.get('goal-paused-3')?.activation === 'disarmed',
+  JSON.stringify(goalState.get('goal-paused-3')))
+// 三个 goal 用例各自切换都会在本子上记一条「当日失败」；清干净再跑后面的用例，
+// 否则 ⑫ 会因为 g2 组内模型全被标记而找不到目标。
+await api('POST', '/failed/reset', {})
 
 // 离线自检不碰线上：任何 codearts 状态查询都返回空池、无签名证据。
 // ⑪ 会按用例改写这个桩。
