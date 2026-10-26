@@ -180,7 +180,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```yaml
 - insert:
     - id: model-failover-manager
-      name: ./plugins/model-failover-manager/host.v58.mjs
+      name: ./plugins/model-failover-manager/host.mjs
 ```
 
 ### DSH 版本要求
@@ -206,6 +206,18 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
    - 组内没有可用模型（都失败 / 不在时段 / 已过期）时不切换，只记录。
 6. 切换成功即让同一轮继续；失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
 
+## 并发与临时切换
+
+每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。
+
+占不到槽位就排队，排队超过 `concurrencyQueueTimeoutMs` 判成 `CAPACITY_TIMEOUT`。**并发类失败不写「当日失败」**——它只说明此刻排队太长，模型本身没坏，停一整天不合理。取而代之的是一次短冷却（`capacityCooldownMs`，默认 30 秒）：冷却期间 `pickCandidate` 跳过它，到期自动回到候选队列。
+
+被换走的会话记在 `capacitySwitches` 里。当原模型重新空闲、且距离换走已超过 `capacitySwitchRevertMs`（默认 30 秒），下一轮会自动切回原模型。这个保护期避免两个模型在边界处来回跳。
+
+codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`（并发占满、账号本身没坏），重启账号池只会打断正在跑的请求，所以按并发类失败临时换模型，不动账号池。只有池里确实全被禁用或冷却时才重启。
+
+「数据看板」页签（设置页与模型弹窗里都有，打开时每 3 秒刷新）显示每个模型的首字延迟（P50/P90）、输出速度（P50/P90）、排队等槽时间、样本数、并发现场与冷却剩余。
+
 ## HTTP 接口
 
 宿主半在 `/api/model-failover` 下提供（界面自身使用）：
@@ -221,10 +233,12 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | POST | `/failed/mark` | 手动把某个模型标成当日失败（`code=MANUAL`） |
 | POST | `/failed/reset` | 恢复一个模型的失败状态 |
 | POST | `/groups/model-disabled` | 禁用/启用某个模型参与路由（写 `disabled` 字段，覆盖所有含它的分组） |
+| POST | `/model-concurrency` | 设置/清除某个模型的并发上限（`concurrency` 正整数即设置，`null`/`0`/`""` 清除覆盖回落到 `defaultConcurrency`）；按模型索引，作用于所有分组 |
 | GET | `/session-info?sessionId=` | 单个会话解析后的有效分组、是否继承、当前模型覆盖 |
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
 | GET | `/debug/status-log?sessionId=&limit=` | 只读诊断：最近 200 条运行态事件（`agent/status`、转发给界面的 `api-session/status`、续跑排队与投递），带自增 `seq` 与毫秒时间戳 |
+| GET | `/metrics` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它 |
 
 ## 数据文件
 
@@ -237,6 +251,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | `default-binding.json` | 新会话沿用的默认绑定 |
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
 | `settings.json` | 界面设置 |
+| `model-concurrency.json` | 按模型记录的并发上限（`provider/model` → 上限），对所有分组生效 |
 
 ## 配置
 
@@ -249,6 +264,10 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 | `ofmHandoffExcludeProviders` | `["codearts"]` | 不走 Our Free Model 换号的 provider；这些 provider 失败后直接进分组路由。写成 `[]` 表示不排除任何 provider |
 | `compactionGuard` | `true` | 压缩旁路守卫总开关：bili 生效时把 `uncompressedProviders` 里、且未被 shim 接管的 provider 降为分组兜底候选，并在失败时写压缩旁路诊断 |
 | `uncompressedProviders` | `["qoder", "qodercn"]` | 端点注定绕过 bili 压缩的 provider 名单（见「与 billion-context 的配合」）。写成 `[]` 等同于关掉守卫 |
+| `defaultConcurrency` | `0` | 模型没在 `model-concurrency.json` 里配置上限时沿用的并发上限；`0` = 不限。见「并发与临时切换」 |
+| `concurrencyQueueTimeoutMs` | `180000` | 占不到并发槽位时最多排队多久；超时判 `CAPACITY_TIMEOUT` 并临时换模型。`0` = 无限等 |
+| `capacityCooldownMs` | `30000` | 并发类失败后的临时冷却时长：期间该模型不参与路由挑选，到期自动恢复 |
+| `capacitySwitchRevertMs` | `30000` | 因并发临时切走后，至少待这么久才允许切回原模型（防止两个模型来回抖） |
 
 所有时间口径固定按**北京时间**计算，与宿主机时区、`TZ`、`LANG` 无关。路由时段（`windows` 的 `from`/`to`）的小时也按北京时间解释；截止日 `until` 按自然日比较。
 
@@ -258,18 +277,18 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.v58.mjs` | 宿主半，也是 `package.json` 的 `main`（内含 codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线） |
+| `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回 |
-| `client.js` | 浏览器半（DSH dynamic client bundle） |
+| `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」页签 |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
-| `host.mjs`、`host.v2.mjs` … `host.v56.mjs` | 历史版本，只留在仓库里供回溯；不进 tarball，运行时只加载 `host.v58.mjs`。宿主文件内容一变就换文件名，因为 Loader 按路径缓存 ESM |
+
 
 ## 已知限制
 
 - 依赖 DSH 的 `slots`、`modelDirectories`、`sessions`、`remote`、`remote.session` 服务与 `agent/request-error` 事件；宿主接口变动时需同步跟进。
-- 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。
+- 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。并发类失败不进这套状态，走的是几十秒的临时冷却。
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 
@@ -285,6 +304,10 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
 - Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
+- Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. A request that cannot get a slot waits up to `concurrencyQueueTimeoutMs` and then fails as `CAPACITY_TIMEOUT`.
+- Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.
+- A `429` from codearts whose pool accounts are all merely `capped` switches models temporarily rather than restarting the account pool, because restarting would abort the requests that are still running.
+- The dashboard tab (in both the settings page and the model dialog; polls every 3s while open) shows per-model time to first token and output speed (P50/P90), slot wait time, sample counts, live concurrency, and cooldown remaining.
 
 ## License
 

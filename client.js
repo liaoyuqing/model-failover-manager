@@ -4,8 +4,10 @@
  * 1. 接管 composer 的模型选择位（conversation.input.model，priority -1 遮蔽原实现）：
  *    - 设置项 dialogMode 开启时，点击弹左右分区弹窗（左：提供商，右：模型）
  *    - 关闭时，紧凑下拉列表
- *    - 弹窗内含「路由分组」「失败模型」页签；分组可绑定到当前会话
+ *    - 弹窗内含「路由分组」「数据看板」「失败模型」页签；分组可绑定到当前会话
  * 2. 设置页「模型故障转移」：dialogMode 开关 + 分组 CRUD（含优先级）+ 失败模型恢复
+ * 3. 数据看板：读 /metrics 展示每个模型的首字延迟、输出速度、并发占用与排队，
+ *    表头可点击排序；并发上限在这里按模型配置，对所有分组统一生效
  *
  * 数据来自 Host 半的 /api/model-failover 接口。
  */
@@ -22,7 +24,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v5'
+    var VERSION = 'v7'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -238,6 +240,69 @@ window.__ModuleLoader__.load({
         borderRadius: 'var(--dsw-radius-sm)', padding: '4px 8px', fontSize: '12px',
         color: 'var(--dsw-alias-label-primary)', outline: 'none', cursor: 'pointer',
       },
+      /* ---- 数据看板：div 网格表格（本文件不引入任何表格库） ---- */
+      metricsHead: {
+        display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
+        padding: '2px 0 8px',
+      },
+      metricsNote: {
+        fontSize: '11px', lineHeight: '1.6', color: 'var(--dsw-alias-label-tertiary)',
+        padding: '0 2px 8px',
+      },
+      metricsTable: {
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: 'var(--dsw-radius-sm)', overflow: 'hidden',
+        background: 'var(--dsw-alias-bg-layer-1)',
+      },
+      // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
+      metricsRow: {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(0, 1.9fr) 54px 78px 50px 88px 40px minmax(0, 1.2fr) 72px',
+        alignItems: 'center', gap: '6px', padding: '4px 8px',
+        borderTop: '0.5px solid var(--dsw-alias-border-l1)',
+        fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
+      },
+      metricsRowHead: {
+        borderTop: 'none',
+        fontSize: '10px', letterSpacing: '.3px',
+        color: 'var(--dsw-alias-label-caption)',
+        background: 'var(--dsw-alias-bg-layer-3)',
+      },
+      // 行级压暗要留住编辑能力：并发列是输入框，压太狠会看着像禁用
+      metricsRowFailed: { opacity: .6 },
+      metricsRowDisabled: { opacity: .7 },
+      metricsCell: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      metricsCellNum: {
+        minWidth: 0, textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      },
+      // 模型名：允许折行（break-word 兜住没有空格的长 id）
+      metricsCellModel: { minWidth: 0, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: '1.35' },
+      metricsTagCell: { minWidth: 0, display: 'flex', flexWrap: 'wrap', gap: '2px', alignItems: 'center' },
+      metricsDim: { opacity: .4 },
+      metricsModel: { fontWeight: 600 },
+      metricsSub: { fontSize: '10px', opacity: .6, marginTop: '1px', whiteSpace: 'normal', wordBreak: 'break-word' },
+      // 表头按钮：整格可点，▲/▼ 指示当前排序列与方向
+      metricsSortBtn: {
+        background: 'none', border: 'none', padding: 0, margin: 0, font: 'inherit',
+        color: 'inherit', cursor: 'pointer', minWidth: 0, textAlign: 'left',
+        display: 'flex', alignItems: 'center', gap: '2px', overflow: 'hidden',
+      },
+      metricsSortBtnNum: { justifyContent: 'flex-end' },
+      metricsSortBtnOn: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600 },
+      metricsSortMark: { fontSize: '9px', lineHeight: 1, flexShrink: 0 },
+      // 并发列：显式配置输入框 + 生效上限
+      metricsConcCell: { minWidth: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '1px' },
+      metricsConcLine: { display: 'flex', alignItems: 'center', gap: '2px', justifyContent: 'flex-end', minWidth: 0 },
+      metricsConcInput: {
+        width: '38px', textAlign: 'center', boxSizing: 'border-box',
+        background: 'var(--dsw-alias-bg-base)',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        borderRadius: '4px', padding: '1px 2px', fontSize: '11px',
+        color: 'var(--dsw-alias-label-primary)', outline: 'none',
+      },
+      metricsConcEff: { fontSize: '10px', opacity: .7, whiteSpace: 'nowrap' },
+      metricsConcBusy: { fontSize: '10px', opacity: .55, whiteSpace: 'nowrap' },
     }
 
     /* ----------------------------------------------------------- helpers -- */
@@ -318,6 +383,25 @@ window.__ModuleLoader__.load({
       return h === null ? '每天自动重置' : '每天北京时间 ' + h + ':00 自动重置'
     }
 
+    /* ------------------------------------------------------ 看板格式化 -- */
+    // 看板接口（GET /metrics）拿到的都是「可能为 null」的聚合值：
+    // 没样本时所有分位数为 null，concurrency 为 null 表示不限并发。
+    function isNum(v) { return typeof v === 'number' && isFinite(v) }
+    function fmtMs(v) { return isNum(v) ? Math.round(v) + 'ms' : '—' }
+    function fmtTps(v) { return isNum(v) ? (Math.round(v * 10) / 10).toFixed(1) + ' tok/s' : '—' }
+    function fmtConcLimit(v) { return Number.isInteger(v) && v > 0 ? String(v) : '不限' }
+    /** 合法的并发上限：正整数；其余（空、0、非整数）都表示「没配，跟随默认」 */
+    function validConc(v) {
+      var n = Math.floor(Number(v))
+      return isFinite(n) && n >= 1 ? n : null
+    }
+
+    function loadMetrics() {
+      return fetch(API + '/metrics', { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (r) { return r.json() })
+        .catch(function () { return null })
+    }
+
     /**
      * 可选模型池：优先用完整模型目录（与内置选择器同源），
      * 目录不可用时回落到 status.allModels；失败标记取自 status.failed。
@@ -346,6 +430,12 @@ window.__ModuleLoader__.load({
       var catPair = React.useState(catalogCache); var catalog = catPair[0]; var setCatalog = catPair[1]
       // 子代理会话：有效分组与当前模型由 Host 算出（继承父会话），本地拿不到
       var infoPair = React.useState(null); var subInfo = infoPair[0]; var setSubInfo = infoPair[1]
+      /** 数据看板：GET /metrics 的结果；只在看板页签可见时才轮询 */
+      var metPair = React.useState(null); var metrics = metPair[0]; var setMetrics = metPair[1]
+      /** 看板排序：{ key, dir }；null = 默认序（分组名 → 优先级 → provider/model） */
+      var sortPair = React.useState(null); var sort = sortPair[0]; var setSort = sortPair[1]
+      /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
+      var concPair = React.useState({}); var concDraft = concPair[0]; var setConcDraft = concPair[1]
 
       React.useEffect(function () {
         function sync() { setSnap(props.store.getSnapshot()) }
@@ -370,6 +460,16 @@ window.__ModuleLoader__.load({
           .then(function (d) { if (d && d.ok) setSubInfo(d) })
           .catch(function () { })
       }, [props.sessionId, props.subagent, status, open])
+
+      // 数据看板：弹窗打开且停在看板页签时每 3 秒拉一次 metrics；离开即停。
+      // 依赖 [open, tab] 保证其它页签不会额外轮询。
+      React.useEffect(function () {
+        if (!open || tab !== 'dashboard') return
+        function tick() { loadMetrics().then(function (d) { if (d) setMetrics(d) }) }
+        tick()
+        var t = setInterval(tick, 3000)
+        return function () { clearInterval(t) }
+      }, [open, tab])
 
       if (!props.available) return null
       // 内置模型目录对有归属的子代理会话不给快照；子代理位改用 Host 的
@@ -584,15 +684,33 @@ window.__ModuleLoader__.load({
                 var k = keyOf(m.provider, m.model)
                 var f = failedMap[k] === true
                 var off = m.disabled === true
+                // 并发冷却：Host 因并发打满把它挡了几十秒，到期自动恢复。与「失败/禁用」
+                // 三者互不覆盖——冷却中的模型并没有坏，不该被执行线划掉。
+                var cd = m.capacityCooldown || null
+                var cdLeft = cd && typeof cd.until === 'number' ? Math.max(0, Math.round((cd.until - Date.now()) / 1000)) : 0
+                var cooling = cdLeft > 0
                 // 已失效的块整体压暗；两类原因分别标注，便于分辨
                 var chipStyle = Object.assign({}, S.chip, f ? S.chipFailed : {}, off ? S.chipDisabled : {})
                 return e('span', {
                   key: k,
                   style: Object.assign({}, chipStyle, { gap: '3px' }),
-                  title: [f ? '当日失败（不参与路由）' : '', off ? '已手动禁用（不参与路由）' : '']
+                  title: [
+                    f ? '当日失败（不参与路由）' : '',
+                    off ? '已手动禁用（不参与路由）' : '',
+                    cooling ? '并发已满，临时不参与路由（约 ' + cdLeft + 's 后自动恢复）' + (cd.reason ? '：' + cd.reason : '') : '',
+                  ]
                     .filter(Boolean).join('；') || '点击右侧按钮可标记失败或禁用',
                 },
-                  'P' + (m.priority ?? 99) + (m.effort ? ' · ' + m.effort : '') + ' ' + m.provider + '/' + m.model,
+                  'P' + (m.priority ?? 99) + (m.effort ? ' · ' + m.effort : '')
+                    + (Number.isInteger(m.concurrency) && m.concurrency > 0 ? ' · 并发 ' + m.concurrency : '')
+                    + ' ' + m.provider + '/' + m.model,
+                  cooling && e('span', {
+                    style: {
+                      fontSize: '10px', padding: '0 4px', borderRadius: '3px',
+                      background: 'var(--dsw-alias-state-warn-tertiary)',
+                      color: 'var(--dsw-alias-state-warn-label)',
+                    },
+                  }, '并发 ' + cdLeft + 's'),
                   f && e('span', { style: { fontSize: '10px', opacity: .8 } }, '✕'),
                   // 失败：已失败则提供恢复，否则提供手动标记
                   f
@@ -627,6 +745,264 @@ window.__ModuleLoader__.load({
                   }, off ? '启用' : '禁用'))
               })))
           }))
+      }
+
+      /**
+       * 表头点击：升序 → 降序 → 回到默认序。
+       * 三态循环让用户不必猜「再点一次会怎样」，也能明确退出排序。
+       */
+      function toggleSort(key) {
+        if (!sort || sort.key !== key) { setSort({ key: key, dir: 'asc' }); return }
+        if (sort.dir === 'asc') { setSort({ key: key, dir: 'desc' }); return }
+        setSort(null)
+      }
+
+      /** 看板与分组页签共用的刷新：metrics 与 status 一起重取（并发上限两边都显示） */
+      function refreshMetrics() {
+        return Promise.all([loadMetrics(), loadStatus()]).then(function (res) {
+          if (res[0]) setMetrics(res[0])
+          if (res[1]) setStatus(res[1])
+        }).catch(function () { })
+      }
+
+      /**
+       * 并发上限按模型持久化（POST /model-concurrency，对所有分组统一生效）。
+       * 输入框是受控的本地草稿：合法正整数即提交，空/0 即传 null 回落到默认上限。
+       * 回写草稿前比对当前值，避免响应回来时抹掉用户刚敲的新数字。
+       */
+      function commitConcurrency(row, raw) {
+        var k = keyOf(row.provider, row.model)
+        var next = Object.assign({}, concDraft)
+        next[k] = raw
+        setConcDraft(next)
+        var limit = validConc(raw)
+        var blank = String(raw).trim() === '' || Number(raw) === 0
+        if (limit === null && !blank) return
+        apiSend(API + '/model-concurrency', 'POST', {
+          provider: row.provider, model: row.model, concurrency: limit,
+        }).catch(function () { }).then(function () {
+          setConcDraft(function (prev) {
+            if (prev[k] !== raw) return prev
+            var cleared = Object.assign({}, prev)
+            delete cleared[k]
+            return cleared
+          })
+          return refreshMetrics()
+        })
+      }
+
+      /**
+       * 数据看板：把 /metrics 的每个模型摊平成一行，默认按分组 + 优先级排序。
+       * metrics 行里没有 priority，用 status.groups 里的分组条目补齐；
+       * 补不到时退化成 groupName/provider/model 排序，保证顺序稳定。
+       *
+       * sort 为 { key, dir } 时按该列覆盖默认序：同值由稳定排序保持默认序，
+       * 而 null（无采样、不限并发）无论升降序都排在最后，避免空行挤走有用的行。
+       */
+      function metricsSortedRows(rawRows, sort) {
+        var byKey = {}
+        routeGroups.forEach(function (g) {
+          var gm = g.models || []
+          for (var i = 0; i < gm.length; i++) {
+            byKey[keyOf(gm[i].provider, gm[i].model)] = { groupName: g.name, priority: gm[i].priority }
+          }
+        })
+        var items = rawRows.map(function (r) {
+          var meta = byKey[keyOf(r.provider, r.model)] || {}
+          return {
+            row: r,
+            groupName: r.groupName || meta.groupName || '',
+            priority: typeof meta.priority === 'number' ? meta.priority : 99,
+          }
+        }).sort(function (a, b) {
+          if (a.groupName !== b.groupName) return a.groupName < b.groupName ? -1 : 1
+          if (a.priority !== b.priority) return a.priority - b.priority
+          if (a.row.provider !== b.row.provider) return a.row.provider < b.row.provider ? -1 : 1
+          return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0
+        })
+        if (!sort || !sort.key) return items
+        var dir = sort.dir === 'desc' ? -1 : 1
+        return items.sort(function (a, b) {
+          var av = metricsSortValue(a.row, sort.key)
+          var bv = metricsSortValue(b.row, sort.key)
+          var an = av === null || av === undefined
+          var bn = bv === null || bv === undefined
+          if (an && bn) return 0
+          if (an) return 1
+          if (bn) return -1
+          if (av === bv) return 0
+          return (av < bv ? -1 : 1) * dir
+        })
+      }
+
+      /** 状态列权重：0 正常 → 1 已禁用 → 2 当日失败 → 3 并发冷却（▲ 健康在前，▼ 异常在前） */
+      function metricsStatusRank(r) {
+        if (isNum(r.capacityUntil) && r.capacityUntil > Date.now()) return 3
+        if (r.failed) return 2
+        if (r.disabled) return 1
+        return 0
+      }
+
+      /** 某一列的排序值；null 表示「没有数据」，排序时恒定垫底 */
+      function metricsSortValue(r, key) {
+        if (key === 'model') return r.provider + '/' + r.model
+        if (key === 'ttft') return isNum(r.ttftP50) ? r.ttftP50 : null
+        if (key === 'tps') return isNum(r.tpsP50) ? r.tpsP50 : null
+        if (key === 'samples') return isNum(r.samples) ? r.samples : 0
+        if (key === 'conc') return Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
+        if (key === 'queued') return isNum(r.queued) ? r.queued : 0
+        if (key === 'wait') return isNum(r.waitP50) ? r.waitP50 : null
+        return metricsStatusRank(r)
+      }
+
+      function dashboardTab() {
+        var rows = (metrics && metrics.rows) || []
+        // defaultConcurrency 以 metrics 为准，旧版 Host 没有该字段时回落到 status
+        var fallbackConc = status && typeof status.defaultConcurrency === 'number' ? status.defaultConcurrency : null
+        var defConc = metrics && typeof metrics.defaultConcurrency === 'number' ? metrics.defaultConcurrency : fallbackConc
+        // 显式配置（按模型、对所有分组生效）在 status.modelConcurrency；
+        // metrics 行里的 concurrency 是「生效上限」（已并入 defaultConcurrency）。
+        var configured = (status && status.modelConcurrency) || {}
+        var sorted = metricsSortedRows(rows, sort)
+        var noneSampled = rows.length > 0 && rows.every(function (r) { return !(r.samples > 0) })
+        var now = Date.now()
+        var defaultHint = defConc === null ? '' : (defConc === 0 ? '当前默认不限' : '当前默认 ' + defConc)
+
+        var cell = S.metricsCell
+        var num = S.metricsCellNum
+
+        /** 表头：点击切 升序 → 降序 → 默认序；▲/▼ 标出当前排序列与方向 */
+        function sortHead(key, label, numeric) {
+          var on = !!sort && sort.key === key
+          return e('button', {
+            style: Object.assign({}, S.metricsSortBtn,
+              numeric ? S.metricsSortBtnNum : {}, on ? S.metricsSortBtnOn : {}),
+            title: on
+              ? (sort.dir === 'desc' ? '已按' + label + '降序；点击切回升序' : '已按' + label + '升序；点击切为降序')
+              : '点击按' + label + '排序（无数据的行恒排最后）',
+            onClick: function () { toggleSort(key) },
+          },
+            e('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, label),
+            on && e('span', { style: S.metricsSortMark }, sort.dir === 'desc' ? '▼' : '▲'))
+        }
+
+        return e('div', { style: S.pane },
+          e('div', { style: S.metricsHead },
+            e('span', { style: { fontSize: '12px', fontWeight: 600 } }, '数据看板'),
+            e('span', { style: { fontSize: '11px', opacity: .6 } },
+              '默认并发上限：' + (defConc === null ? '—' : (defConc === 0 ? '不限（0）' : String(defConc)))),
+            metrics && isNum(metrics.sampledAt) && e('span', { style: { fontSize: '11px', opacity: .5 } },
+              '采样于 ' + new Date(metrics.sampledAt).toLocaleTimeString()),
+            e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px' } },
+              e('button', {
+                style: S.btn,
+                onClick: function () { refreshMetrics() },
+              }, '刷新'))),
+          e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
+            '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
+            + '并发上限在下表「并发」列按模型配置，对所有分组统一生效；默认并发为 0 时表示分组未配置即不限。'),
+          e('div', { style: S.metricsNote },
+            '等待 = 等并发槽位的排队时间；样本 = 当日成功/总采样数；状态里的「当日失败」不参与路由。'),
+          noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
+          metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
+          metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
+
+          rows.length > 0 && e('div', { style: S.metricsTable },
+            e('div', { style: Object.assign({}, S.metricsRow, S.metricsRowHead) },
+              sortHead('model', '模型', false),
+              sortHead('ttft', '首字', true),
+              sortHead('tps', '速度', true),
+              sortHead('samples', '样本', true),
+              sortHead('conc', '并发', true),
+              sortHead('queued', '排队', true),
+              sortHead('status', '状态', false),
+              sortHead('wait', '等待', true)),
+            sorted.map(function (it) {
+              var r = it.row
+              var k = keyOf(r.provider, r.model)
+              // 生效上限（已含默认值）：null = 不限
+              var effConc = Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
+              var effText = fmtConcLimit(effConc)
+              // 显式配置：只有在这里配过的模型才非空
+              var explicit = Number.isInteger(configured[k]) && configured[k] > 0 ? configured[k] : null
+              var inflight = isNum(r.inflight) ? r.inflight : 0
+              var queued = isNum(r.queued) ? r.queued : 0
+              var cooling = isNum(r.capacityUntil) && r.capacityUntil > now
+              var coolLeft = cooling ? Math.max(1, Math.round((r.capacityUntil - now) / 1000)) : 0
+              var style = Object.assign({}, S.metricsRow,
+                r.failed ? S.metricsRowFailed : {}, r.disabled ? S.metricsRowDisabled : {})
+              return e('div', { key: k, style: style },
+                // 模型列允许折行：provider/model 再长也看全，title 兜底完整值
+                e('div', { style: S.metricsCellModel },
+                  e('div', {
+                    style: S.metricsModel,
+                    title: r.provider + '/' + r.model + (it.groupName ? '\n分组：' + it.groupName : ''),
+                  }, r.provider + '/' + r.model),
+                  it.groupName && e('div', { style: S.metricsSub }, it.groupName)),
+                e('span', {
+                  style: num,
+                  title: r.ttftP90 === null || r.ttftP90 === undefined ? '' : 'P90 ' + fmtMs(r.ttftP90),
+                }, fmtMs(r.ttftP50)),
+                e('span', {
+                  style: num,
+                  title: r.tpsP90 === null || r.tpsP90 === undefined ? '' : 'P90 ' + fmtTps(r.tpsP90),
+                }, fmtTps(r.tpsP50)),
+                e('span', {
+                  style: num,
+                  title: isNum(r.samples) && r.samples > 0 ? '成功 ' + r.okSamples + ' / 共 ' + r.samples : '暂无采样',
+                }, (isNum(r.okSamples) ? String(r.okSamples) : '0') + '/' + (isNum(r.samples) ? String(r.samples) : '0')),
+                // 并发：可编辑——这里写的是「显式配置」，空 = 跟随 defaultConcurrency
+                e('div', { style: S.metricsConcCell, onClick: function (ev) { ev.stopPropagation() } },
+                  e('div', { style: S.metricsConcLine },
+                    e('input', {
+                      type: 'number', min: '1', max: '999',
+                      style: S.metricsConcInput,
+                      value: concDraft[k] !== undefined
+                        ? concDraft[k]
+                        : (explicit === null ? '' : String(explicit)),
+                      placeholder: effText,
+                      title: '该模型同时最多几个请求，对所有分组统一生效；留空 = 跟随默认上限'
+                        + (defaultHint ? '（' + defaultHint + '）' : '')
+                        + '。达到上限时会先尝试切到组内其它空闲模型，都满才排队。',
+                      onClick: function (ev) { ev.stopPropagation() },
+                      onChange: function (ev) { commitConcurrency(r, ev.target.value) },
+                      onBlur: function () {
+                        // 失焦即放弃本地草稿，输入框回到服务端记录的真实值
+                        var nxt = Object.assign({}, concDraft)
+                        delete nxt[k]
+                        setConcDraft(nxt)
+                      },
+                    }),
+                    e('span', {
+                      style: S.metricsConcBusy,
+                      title: '正在进行的请求 / 生效上限' + (explicit === null ? '（跟随默认）' : '（本模型显式配置）'),
+                    }, String(inflight) + '/' + effText))),
+                e('span', { style: queued > 0 ? num : Object.assign({}, num, S.metricsDim) }, String(queued)),
+                e('div', { style: S.metricsTagCell },
+                  // 两个状态独立判定：一个模型可以既手动禁用又当日失败
+                  r.failed && e('span', { style: S.tag }, '当日失败'),
+                  r.disabled && e('span', { style: Object.assign({}, S.tag, { opacity: .75 }) }, '已禁用'),
+                  // 并发冷却：Host 因并发打满临时把它挡在路由之外，到期自动恢复。
+                  // 这是「临时切换」的可见证据，与「当日失败」必须能分辨。
+                  cooling && e('span', {
+                    style: Object.assign({}, S.tag, {
+                      background: 'var(--dsw-alias-state-warn-tertiary)',
+                      color: 'var(--dsw-alias-state-warn-label)',
+                    }),
+                    title: '并发已满被临时挡在路由之外，约 ' + coolLeft + 's 后自动恢复'
+                      + (r.capacityReason ? '：' + r.capacityReason : ''),
+                  }, '并发冷却 ' + coolLeft + 's'),
+                  !r.failed && !r.disabled && !cooling
+                    && e('span', { style: { fontSize: '11px', opacity: .45 } }, '正常'),
+                  r.lastErrorCode && e('span', {
+                    style: { fontSize: '10px', fontFamily: 'monospace', opacity: .7 },
+                    title: '最近一次错误码',
+                  }, String(r.lastErrorCode))),
+                e('span', { style: cell },
+                  isNum(r.waitP50) && r.waitP50 > 0
+                    ? e('span', { style: { fontSize: '11px' } }, '排队 ' + fmtMs(r.waitP50))
+                    : e('span', { style: Object.assign({}, S.metricsDim, { fontSize: '11px' }) }, '—')))
+            })))
       }
 
       function groupEditor(avail) {
@@ -744,6 +1120,8 @@ window.__ModuleLoader__.load({
             (!active || active.models.length === 0) && e('div', { style: S.hint }, query.trim() ? '没有匹配的模型。' : '该提供商暂无可用模型。'))
         } else if (tab === 'groups') {
           right = groupTab()
+        } else if (tab === 'dashboard') {
+          right = dashboardTab()
         } else {
           right = failedTab()
         }
@@ -763,7 +1141,10 @@ window.__ModuleLoader__.load({
                   var isActive = g.id === activeId
                   return e('div', {
                     key: g.id, style: Object.assign({}, S.providerRow, isActive ? S.providerActive : {}),
-                    onClick: function () { setProvider(g.id) },
+                    // 左栏是「按提供商挑模型」的入口：在任何页签点它都回到模型页，
+                    // 否则点了供应商却看不到它的模型（改动落在别的页签里）。
+                    title: '查看 ' + providerName(g) + ' 的模型',
+                    onClick: function () { setProvider(g.id); setTab('models') },
                   },
                     e('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, providerName(g)),
                     e('span', { style: S.count }, String(g.models.length)))
@@ -772,6 +1153,7 @@ window.__ModuleLoader__.load({
                 e('div', { style: S.tabs },
                   e('button', { style: Object.assign({}, S.tab, tab === 'models' ? S.tabActive : {}), onClick: function () { setTab('models') } }, '模型'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'groups' ? S.tabActive : {}), onClick: function () { setTab('groups') } }, '路由分组'),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'dashboard' ? S.tabActive : {}), onClick: function () { setTab('dashboard') } }, '数据看板'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'failed' ? S.tabActive : {}), onClick: function () { setTab('failed') } }, '失败模型' + (failedList.length ? ' (' + failedList.length + ')' : ''))),
                 right))),
           // 编辑器提到弹窗根层级：从任意页签（含模型页签的 ＋ 快捷入组）触发都能显示
@@ -913,6 +1295,7 @@ window.__ModuleLoader__.load({
                 patchModelAt(index, { priority: Math.max(1, Math.min(999, Number(ev.target.value) || 99)) })
               },
             }),
+            // 并发上限不在这里配：它按模型、对所有分组统一生效，配置入口在数据看板
             e('span', {
               style: { flex: 1, fontSize: '12px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
               title: entry.provider + '/' + entry.model,

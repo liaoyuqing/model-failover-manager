@@ -21,7 +21,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from './host.v14.mjs'
+import { apply } from './host.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'mfm-offline-'))
 // 与宿主同一套判据：北京时间当前小时，造一个「此刻必然不在窗内」的时段
@@ -480,6 +480,184 @@ const heal = (await api('GET', '/status')).body.codeartsSelfHeal
 ok('⑪ /status 回传 codeartsSelfHeal 现场快照',
   heal && typeof heal.loaderAvailable === 'boolean' && typeof heal.blockedBySignature === 'boolean',
   JSON.stringify(heal))
+
+// ⑫ 并发打满（capped）不能当成「账号故障」去重启，必须落给分组路由。
+//    这正是用户报的「选了路由，但模型报错没有正确路由」：旧判定只数 disabled/cooling，
+//    capped 不计，于是既不自愈也不换模型，直接把它们当成不可恢复放弃。
+globalThis.fetch = async (url) => {
+  if (String(url).includes('/api/codearts/status')) {
+    return { ok: true, async json() { return codeartsStatus } }
+  }
+  return { ok: false, async json() { return {} } }
+}
+await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
+restartCalls = 0
+// 两个账号都没坏，只是并发满：active 达到 max，state=capped
+codeartsStatus = { usage: { slots: [
+  { id: 'a1', active: 2, max: 2, state: 'capped', detail: 'upstream session cap hit' },
+  { id: 'a2', active: 2, max: 2, state: 'capped', detail: 'upstream session cap hit' },
+] } }
+const cappedAction = await failOnCodearts('codearts-capped-1', { code: 'soft_rate', status: 429, message: poolEmptyMsg })
+ok('⑫ 并发打满时绝不重启账号池（重启只会打断在跑的请求）', restartCalls === 0, `restartCalls=${restartCalls}`)
+ok('⑫ 并发打满时照常进分组路由（换模型，而不是放弃）',
+  (await lastLogFor('codearts-capped-1'))?.outcome === 'capacity-switched',
+  JSON.stringify(await lastLogFor('codearts-capped-1')))
+ok('⑫ 并发打满不算不可恢复（action 不是被 codearts 分支拦下的 undefined）',
+  cappedAction?.kind !== 'retry', JSON.stringify(cappedAction))
+const cappedDiag = (await api('GET', '/status')).body.codeartsSelfHeal.lastDiagnosis
+ok('⑫ 诊断给出 capped 而非 unknown', cappedDiag?.kind === 'capped', JSON.stringify(cappedDiag))
+
+// ⑫b 并发类失败必须**临时**处置：写短冷却，不写当日失败。
+//     这是用户报的「触发到模型并发时，临时切换到路由中其他模型」的核心契约。
+const cappedStatus = (await api('GET', '/status')).body
+ok('⑫b 并发失败不写进当日失败列表（否则一整天不参与路由）',
+  !cappedStatus.failed.some(f => f.provider === 'codearts' && f.model === 'm1'),
+  JSON.stringify(cappedStatus.failed))
+const cooldownRow = cappedStatus.capacityCooldowns.find(c => c.key === 'codearts/m1')
+ok('⑫b 并发失败写进 capacityCooldowns（短冷却）',
+  cooldownRow !== undefined && cooldownRow.until > Date.now(), JSON.stringify(cooldownRow))
+ok('⑫b capacityCooldowns 带可读原因',
+  typeof cooldownRow?.reason === 'string' && cooldownRow.reason.length > 0, JSON.stringify(cooldownRow))
+ok('⑫b 记录会话被从原模型临时换走（provider/model 是原模型）',
+  (() => {
+    const sw = cappedStatus.capacitySwitches.find(s => s.sessionId === 'codearts-capped-1')
+    return sw?.provider === 'codearts' && sw?.model === 'm1'
+  })(), JSON.stringify(cappedStatus.capacitySwitches))
+ok('⑫b /status 回传并发三参数（冷却/排队超时/回切保护）',
+  typeof cappedStatus.capacityCooldownMs === 'number'
+  && typeof cappedStatus.concurrencyQueueTimeoutMs === 'number'
+  && typeof cappedStatus.capacitySwitchRevertMs === 'number',
+  JSON.stringify({
+    cooldown: cappedStatus.capacityCooldownMs,
+    queueTimeout: cappedStatus.concurrencyQueueTimeoutMs,
+    revert: cappedStatus.capacitySwitchRevertMs,
+  }))
+// 冷却中的模型必须被排除出路由候选：这才是「临时切换到组内其它模型」的实际效果。
+// 用一个同时含 codearts/m1 与 p/m5 的分组验证（g2 里没有 codearts/m1）。
+await api('POST', '/groups', { id: 'gk', name: 'GK', models: [
+  { provider: 'codearts', model: 'm1', priority: 1 },
+  { provider: 'p', model: 'm5', priority: 2 },
+] })
+await api('POST', '/capacity/reset', {})
+await api('POST', '/failed/reset', {})
+const kSwitch = await (async () => {
+  const a = makeAgent('capacity-pick-1', {}, 'm1')
+  agents.push(a)
+  await api('POST', '/session-group', { sessionId: 'capacity-pick-1', groupId: 'gk', mode: 'route' })
+  a.status = 'running'
+  const act = await errHandler({ agent: a, turn: 1, provider: 'codearts', failure: { code: 'soft_rate', status: 429, message: poolEmptyMsg } }, () => Promise.resolve(undefined))
+  a.status = 'idle'
+  return act
+})()
+const kSwitchLog = await lastLogFor('capacity-pick-1')
+ok('⑫b 并发满时切到组内下一个模型（而不是原地不动）',
+  kSwitchLog?.outcome === 'capacity-switched' && String(kSwitchLog.detail).includes('p/m5'),
+  JSON.stringify(kSwitchLog))
+ok('⑫b 并发满时不返回 retry（同一步重试仍会用同一个满模型）',
+  kSwitch?.kind !== 'retry', JSON.stringify(kSwitch))
+const kStatus = (await api('GET', '/status')).body
+const kRow = kStatus.groups.find(g => g.id === 'gk')?.models?.find(m => m.provider === 'codearts' && m.model === 'm1')
+ok('⑫b /status 的分组条目带 capacityCooldown（界面可显示冷却中）',
+  kRow?.capacityCooldown !== null && typeof kRow?.capacityCooldown?.until === 'number',
+  JSON.stringify(kRow))
+// 冷却期内组内挑选必须避开它，直接命中 p/m5
+ok('⑫b 冷却期内再挑一次仍然避开它', (() => {
+  const pick = kStatus.activeModels.find(m => m.sessionId === 'capacity-pick-1')
+  return pick?.provider === 'p' && pick?.model === 'm5'
+})(), JSON.stringify(kStatus.activeModels))
+await api('POST', '/capacity/reset', {})
+await api('POST', '/failed/reset', {})
+ok('⑫b 手动解除并发冷却后回到候选',
+  (await api('GET', '/status')).body.capacityCooldowns.every(c => c.key !== 'codearts/m1'))
+await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+
+// ⑬ 模型并发上限：按模型（全局）配置生效，且 llm/stream 闸门按它排队。
+await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
+await api('POST', '/groups', { id: 'gc', name: 'GC', models: [
+  { provider: 'pc', model: 'mc', priority: 1 },
+] })
+// 并发以模型为单位配置；分组条目上的 concurrency 不再生效
+const concSet = await api('POST', '/model-concurrency', { provider: 'pc', model: 'mc', concurrency: 1 })
+ok('⑬ POST /model-concurrency 生效', concSet.status === 200 && concSet.body?.concurrency === 1,
+  JSON.stringify(concSet.body))
+const gcStatus = (await api('GET', '/status')).body.groups.find(g => g.id === 'gc')
+ok('⑬ 分组条目回传生效的并发上限', gcStatus?.models?.[0]?.concurrency === 1, JSON.stringify(gcStatus?.models?.[0]))
+ok('⑬ /status.modelConcurrency 带按模型配置',
+  (await api('GET', '/status')).body.modelConcurrency?.['pc/mc'] === 1,
+  JSON.stringify((await api('GET', '/status')).body.modelConcurrency))
+ok('⑬ 分组条目回传当前 inflight',
+  typeof gcStatus?.models?.[0]?.inflight === 'number', JSON.stringify(gcStatus?.models?.[0]))
+// 同一模型出现在第二个分组时，上限仍然来自按模型的配置，不随分组漂移
+await api('POST', '/groups', { id: 'gc2', name: 'GC2', models: [
+  { provider: 'pc', model: 'mc', priority: 1 },
+] })
+const gc2Status = (await api('GET', '/status')).body.groups.find(g => g.id === 'gc2')
+ok('⑬ 同一模型在其它分组沿用同一上限', gc2Status?.models?.[0]?.concurrency === 1,
+  JSON.stringify(gc2Status?.models?.[0]))
+// 清除覆盖后回落到 defaultConcurrency（本用例默认 0 = 不限 → null）
+const concCleared = await api('POST', '/model-concurrency', { provider: 'pc', model: 'mc', concurrency: null })
+ok('⑬ 清除覆盖后回落默认（不限）',
+  concCleared.status === 200 && concCleared.body?.concurrency === null && concCleared.body?.effective === null,
+  JSON.stringify(concCleared.body))
+ok('⑬ 非法并发值被拒绝',
+  (await api('POST', '/model-concurrency', { provider: 'pc', model: 'mc', concurrency: -3 })).status === 400)
+// 恢复 1，供后面的闸门与看板断言使用
+await api('POST', '/model-concurrency', { provider: 'pc', model: 'mc', concurrency: 1 })
+// 直接驱动 llm/stream 闸门：连开两个流，第二个必须等第一个结束才拿到首字。
+const streamHandler = handlers.getAll('llm/stream').at(-1)
+ok('⑬ 插件注册了 llm/stream（并发闸门与速度采样挂在这里）', typeof streamHandler === 'function',
+  `listeners=${handlers.getAll('llm/stream').length}`)
+/** 造一个可控的假流：yield 几个 delta 与 usage，再由 releaseFlag 决定何时结束 */
+function fakeStream(gate) {
+  return (async function* () {
+    yield { type: 'text-delta', index: 0, text: 'hel' }
+    yield { type: 'text-delta', index: 0, text: 'lo' }
+    yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 8 } }
+    if (gate !== undefined) await gate
+    yield { type: 'finish', reason: 'stop' }
+  })()
+}
+const gateA = Promise.withResolvers()
+const gateB = Promise.withResolvers()
+const outA = []
+const outB = []
+const iterA = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream(gateA.promise))
+const iterB = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream(gateB.promise))
+// 两个流的 gate 都由测试外部放开；流自己绝不 resolve 自己的 gate（否则会自我死锁）。
+gateB.resolve()
+const finishedA = (async () => { for await (const c of iterA) outA.push(c.type) })()
+const finishedB = (async () => { for await (const c of iterB) outB.push(c.type) })()
+await new Promise(r => setTimeout(r, 40))
+ok('⑬ 并发=1 时第二个流必须排队（首字还没到）', outB.length === 0, `outB=${JSON.stringify(outB)}`)
+// 放开 A：它跑完 → 释放槽位 → B 才被唤醒
+gateA.resolve()
+await Promise.all([finishedA, finishedB])
+ok('⑬ 第一个流跑完后第二个才拿到首字', outB.length > 0, `outA=${JSON.stringify(outA)} outB=${JSON.stringify(outB)}`)
+ok('⑬ 两个流都完整透传（闸门不改写 chunk）',
+  outA.join(',') === 'text-delta,text-delta,usage,finish'
+  && outB.join(',') === 'text-delta,text-delta,usage,finish',
+  `outA=${outA.join(',')} outB=${outB.join(',')}`)
+
+// ⑭ 数据看板：首字延迟与输出速度
+const metrics = (await api('GET', '/metrics')).body
+ok('⑭ /metrics 返回分组内模型的看板行', Array.isArray(metrics?.rows) && metrics.rows.length > 0,
+  `rows=${metrics?.rows?.length}`)
+const mcRow = metrics.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+ok('⑭ 看板行带首字延迟与速度字段',
+  mcRow !== undefined && 'ttftP50' in mcRow && 'tpsP50' in mcRow && 'samples' in mcRow,
+  JSON.stringify(mcRow))
+ok('⑭ 采集到了样本（两次调用）', mcRow?.samples >= 2, `samples=${mcRow?.samples}`)
+ok('⑭ 首字延迟是正数（毫秒）', typeof mcRow?.ttftP50 === 'number' && mcRow.ttftP50 >= 0, `ttftP50=${mcRow?.ttftP50}`)
+ok('⑭ 输出速度按 usage.outputTokens 算出正数（token/s）',
+  typeof mcRow?.tpsP50 === 'number' && mcRow.tpsP50 > 0, `tpsP50=${mcRow?.tpsP50}`)
+ok('⑭ 看板行同时带并发现场（上限/占用/排队）',
+  mcRow?.concurrency === 1 && typeof mcRow?.inflight === 'number' && typeof mcRow?.queued === 'number',
+  JSON.stringify({ concurrency: mcRow?.concurrency, inflight: mcRow?.inflight, queued: mcRow?.queued }))
+ok('⑭ 未采集过的模型也有行（样本 0，字段为 null）', (() => {
+  const empty = metrics.rows.find(r => r.samples === 0)
+  return empty !== undefined && empty.ttftP50 === null && empty.tpsP50 === null
+})(), JSON.stringify(metrics.rows.find(r => r.samples === 0)))
+
 ctx.get = baseGet
 globalThis.fetch = baseFetch
 
