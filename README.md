@@ -23,7 +23,8 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - **两种绑定模式**
   - `route`：用绑定分组里的模型（会实际改变会话当前模型）。
   - `failover`：保持会话当前模型，只有它彻底失败后才兜底切到组内下一个。
-- **失败后自动续跑**：监听 `agent/request-error`，以 prepend 注册并先 `await next()`，因此**一定是在所有重试策略都表态放弃之后**才接手（包括 `llm-error-retry` 预算耗尽后直接短路整条链的情况）。接手后标记失败、切换到组内下一个可用模型，并自动续跑，不用你重发。
+- **失败后自动续跑**：监听 `agent/request-error`，以 prepend 注册并先 `await next()`，因此**一定是在所有重试策略都表态放弃之后**才接手。接手后标记失败、切换到组内下一个可用模型，并自动续跑，不用你重发。
+  - 两条入口都接：`agent/request-error`（流开起来后以 error/aborted 结束）与 `agent/error`（请求还没发出就抛，例如 `UNKNOWN_MODEL`、适配器同步报错）。任一条处置过的轮次，另一条按 `turn` 认出并跳过，不会一次失败连跳两个模型——所以本插件不依赖「自己恰好是最外层」这个前提，内层重试插件即使短路了整条瀑布链，失败仍会从 `agent/error` 那条入口被路由出去。
   - 续跑不是「同一轮内重试」：新版 dsh 在**步骤准备（pre-step）**时就把本步用于请求的 `provider/model/effort` 固定下来，`agent/request` 已废弃，在那里改模型会让宿主直接报错并让整轮崩掉。所以失败后切换走 `agent.model.select()`（写一条 durable `model/selection`，从下一个步骤生效），并在该会话回到 `idle` 后补一条续跑消息开下一轮。
 - **每轮健康检查**：每次发消息（驱动器刚启动、尚未进入 `pre-step` 的窗口）都判定一次「这个会话此刻要用的模型现在还能不能用」——仍可用就保留（不覆盖你手选的模型），只有它此刻在分组内不可用（被标记当日失败、超出北京时间时段、过了截止日）才切到组内下一个可用模型；当前模型压根不在分组里时不插手。判据都是「此刻」的，时段与截止日随时间变化、失败标记会被重置或过期。
 - **子代理继承路由（默认行为）**：「子代理跑什么模型」由宿主在创建时决定——它把父会话请求头里的 `provider/model/effort` 复制成子代理的 AgentOptions。本插件**不写任何选择去覆盖它**，所以子代理天然继承父会话当前实际在用的模型（父会话切到组内第 2 个，子代理也跑第 2 个，不会被拽回第 1 个）。分组绑定同样沿 `session.header.parentSession` 向上继承；只有继承来的模型此刻不可路由（已失败/不在时段/过截止日）时才按组内优先级换一个。
@@ -206,7 +207,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
    - `failover`：同样取组内下一个可用模型作为兜底；
    - 未绑定分组：在该模型所属的**每一个**启用分组里找替代者，先找优先级不差于它的，找不到就放宽到整组（宁可降级也不原地不动）；
    - 真的一个都找不到时不切换，只记录。
-7. 切换成功即让同一轮继续；续跑消息等 agent 回到 idle 后投递，若 30 秒还没等到那条边沿则补投一次（卸载时丢弃会记 `continuation/dropped`）。失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
+7. 切换成功即让同一轮继续；续跑消息等 agent 回到 idle 后投递，若 30 秒还没等到那条边沿则补投一次（投递失败时条目留在队列里等下一个窗口再试，卸载时丢弃会记 `continuation/dropped`）。失败状态在日界线（默认北京时间 08:00）过后清除，该会话成功完成一轮时也会立即清除。
 
 ## 并发与临时切换
 
@@ -218,11 +219,13 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`（并发占满、账号本身没坏），重启账号池只会打断正在跑的请求，所以按并发类失败临时换模型，不动账号池。只有池里确实全被禁用或冷却时才重启。
 
-「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、token 用量、成功率、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），错误码放在副行，列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。
+「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、token 用量、成功率、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。状态列的副行常驻显示**错误码**（过长时截断），**鼠标放上去看完整报错文案**：当日失败的行取失败记录里的原因（那是「所有重试耗尽后」的最终结论），没有失败记录时取最近一次采样失败的信息。错误码与文案必须成对——只有码看不出上游到底说了什么，只有文案又没法归类；两者都没有就不显示，不拿空壳糊弄。「恢复」按钮紧跟在状态标签后面（与「当日失败」同一行），错误码独占副行——两者挤在一行会把错误码压成省略号。模型名下方的副行除了所属分组，还挂着这一行自己的动作（单个模型测速、从路由移除）。「并发」列的主值位置是输入框，改上限不用再切到「模型」页签。
 
 成功率列：主行是区间内成功调用 / 区间内全部采样，副行写「成功数/采样数」。样本少于 5 条时只显示数值、不标黄，避免 2 条错 1 条就把整行染红；失败多到 90% 以下才转成警示色。
 
-token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输入**用量合计。两者都只累加适配器报了 `usage` 的调用，所以悬停提示同时给「有 token 数据的样本 / 总样本」——没有 usage 的 provider 会一直显示 `—`，而不是 0（0 会被读成「确实没用量」，与「没记」是两件事）。
+token 列：主行是**所选区间内的总用量**（输入 + 输出 + 缓存命中 + 缓存写入），**跟着日期筛选走**——筛到某一天，这个数就只算那一天。副行把拆分**一行一个数**摊开：`↑输入` / `缓存命中` / `缓存写入` / `↓输出`，一行一个是因为挤在一行里会被列宽截掉，而缓存命中恰恰是最该看见的那个数。历史总量（不随筛选变化）放在悬停提示里，和「有 token 数据的样本 / 总样本」一起给。缓存命中的 token 是**输入**的一部分——DSH 的 `TokenUsage` 把它们拆成 `cacheReadTokens` / `cacheWriteTokens` 单独报（billed input = 三者之和，见 `packages/llm/llm/src/types.ts`），只看 `inputTokens` 会把命中缓存的那部分整段丢掉。四者都只累加适配器报了 `usage` 的调用，所以悬停提示标明样本覆盖范围——没有 usage 的 provider 会一直显示 `—`，而不是 0（0 会被读成「确实没用量」，与「没记」是两件事）。
+
+token 列的排序键跟大字是同一个数（区间内总量），不按历史总量排：否则点表头排出来的序和肉眼看到的数不一致。
 
 顶部有日期筛选：两个 `YYYY-MM-DD` 输入框 +「今天」「近 7 天」「全部」快捷项，按北京时间整天、两端包含。筛选在宿主侧做：成功率、分位数、token 合计都要按所选区间算，不能先在界面里取一段缓冲再汇总。
 
@@ -260,7 +263,7 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 | --- | --- | --- |
 | GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`） |
 | POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`） |
-| GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组 |
+| GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组。`PUT` 的 `models` 是**整体替换**：看板的「移除」用它把某个模型从所属分组的清单里摘掉，其余模型与优先级保持不变 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
 | GET / POST | `/default-group` | 读取 / 设置新会话默认分组 |
@@ -275,15 +278,18 @@ token 列：主行是区间内的**输出**用量合计，副行 `↑` 是**输�
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
 | GET | `/debug/status-log?sessionId=&limit=` | 只读诊断：最近 200 条运行态事件（`agent/status`、转发给界面的 `api-session/status`、续跑排队与投递），带自增 `seq` 与毫秒时间戳 |
-| GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略。每行另带 `lifetimeInTokens`/`lifetimeOutTokens`/`lifetimeTokenSamples`——该模型的**全量历史**用量，不随筛选变化 |
+| GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略。每行另带 `lifetimeInTokens`/`lifetimeOutTokens`/`lifetimeCacheReadTokens`/`lifetimeCacheWriteTokens`/`lifetimeTokenSamples`——该模型的**全量历史**用量（含缓存命中），不随筛选变化；`lastErrorCode`/`lastErrorMessage` 是区间内最后一次失败的错误码与完整报错文案（看板上悬停显示的就是它） |
 
 ### 数据看板
 
 - **排序会被记住**：点表头（升序 → 降序 → 回到默认序）后写回 `settings.json`，刷新页面、换个浏览器、甚至重启宿主之后打开看板，仍是上次那一列与方向；认不出的旧值回落成默认序，不会让插件带病启动。
-- **token 列的大字是历史用量**：主行显示该模型**全部历史**的输入+输出合计（不随日期筛选变化），副行是 `↑输入 ↓输出`；区间内用量与「有多少条样本带 token」放在 tooltip 里。
+- **token 列的大字是所选区间内的用量**：主行显示该模型**区间内**的输入+输出+缓存命中+缓存写入合计，**跟着日期筛选走**；副行一行一个数（`↑输入` / `缓存命中` / `缓存写入` / `↓输出`），一行一个是因为挤在一行会被列宽截掉，而缓存命中最不该被截。历史总量（不随筛选变化）与「有多少条样本带 token」放在悬停提示里。表头排序用的是同一个区间内数值。
 - **按当前排序重设优先级**：表格上方的操作条可选目标分组、填起始优先级，然后按当前排序把**有采样**的模型从起始序号连续编号；**没有数据的模型被排除**、保持原优先级不变（操作条上直接显示会有几个模型参与）。
 - **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
 - **单个模型单独测速**：每行模型名下方都有「测速」按钮，只测这一个模型，不牵连整组。它不受当前分组下拉的限制，**分组里已禁用的模型也能测**——单独点某一行的场景恰恰是排查「这个模型到底通不通」。要同时测整组还是用操作条上的「一键测速」。
+- **恢复失败模型**：当日失败的行在状态列直接给「恢复」按钮（只清这一个模型的失败记录）；操作条上的「恢复本组失败 (N)」只清当前分组里的失败模型——不带模型名的 `/failed/reset` 会清掉全天全部失败，跨了分组就是越权。
+- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。输入框右边仍贴着「进行中 / 生效上限」，副行给等槽与排队。
+- **从路由移除**：模型名下方的「移除」按钮把这个模型从它所属分组里摘掉，分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。同一模型在两个分组里会出现两行，要彻底离开路由就两行都移除。
 
 ## 数据文件
 
@@ -344,7 +350,12 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector (dialog mode or a compact dropdown).
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
-- On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model.
+- On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.
+- The switch takes effect from the next step, and the interrupted work continues on its own: the
+  plugin queues a continuation message once the session is idle again. If that idle edge never
+  arrives, a 30-second failsafe delivers it, and a delivery that throws keeps the message queued
+  for the next window instead of dropping it — a switched model with a silent session is the one
+  outcome a user cannot fix by hand.
 - For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
 - Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
@@ -354,9 +365,16 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - The dashboard shows first-token latency, output speed, token usage, live concurrency, and state
   per model, with click-to-sort headers (ascending, descending, then the default order; rows without
   data stay last). The state column draws only the most severe state (failed today > disabled > cooling >
-  normal), puts the error code on a second line, and has a fixed width: an auto-width last column
+  normal) and has a fixed width: an auto-width last column
   let a row with an error code widen its own cell and squeeze the model name, which reads as
   misaligned columns across the table.
+- The state column's second line always shows the **error code** (truncated when long), and hovering
+  it reveals the **full error message**: a row that failed today uses the reason from the failure
+  record (the verdict after every retry was exhausted), a row that only saw failed calls uses its
+  most recent sample failure. Code and message travel together — the code alone does not say what
+  the upstream said, and the message alone cannot be categorised; when neither exists nothing is
+  drawn rather than an empty shell. The *restore* button sits right behind the state label on the
+  same line, so the error code keeps the second line to itself.
 - A success-rate column shows successful calls over all samples in the selected range, with the raw
   counts underneath. Ratings stay neutral below five samples — one failure out of two should not
   paint a whole row — and turn to the warning colour only under 90%.
@@ -366,10 +384,16 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Samples have **no count cap**: every model keeps every call it has seen since the plugin started.
   A cap would quietly redefine the statistics as "the latest N" — a range that starts earlier, or a
   model busy enough to pass the cap in a day, would report only the tail of what was asked for.
-- The token column's large number is the model's **lifetime** usage — input plus output over every
-  sample, unaffected by the date filter — with `↑input ↓output` underneath; the range total and the
-  sampled-call coverage live in the tooltip. A provider that never reports `usage` shows `—` rather
-  than 0, which would read as "used nothing" instead of "not recorded". Samples persist to
+- The token column's large number is the usage **inside the selected range** — input plus cache hits
+  plus cache writes plus output — so it follows the date filter. Underneath, each figure gets its own
+  line (`↑input` / `cache hits` / `cache writes` / `↓output`): one number per line, because sharing a
+  line gets them truncated by the column width and the cache hits are the last thing to lose. The
+  lifetime total (unaffected by the filter) and the sampled-call coverage live in the tooltip, and
+  the column header sorts by the same range total the large number shows. Cached input is part of the
+  input: DSH's `TokenUsage` reports `cacheReadTokens` / `cacheWriteTokens` separately from
+  `inputTokens` (billed input = the three summed, see `packages/llm/llm/src/types.ts`), so summing
+  only `inputTokens` drops the cache-hit portion entirely. A provider that never reports `usage` shows
+  `—` rather than 0, which would read as "used nothing" instead of "not recorded". Samples persist to
   `dataDir/metrics.json` in full (debounced 1.5s and flushed on unmount), so the dashboard survives
   a restart; older samples without token fields count as no data rather than 0.
 - The dashboard remembers its sort: clicking a header (ascending, descending, then the default order)
@@ -388,6 +412,20 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   just that model. It ignores the group selector and, unlike the group run, also probes a model the
   group has disabled — checking whether a disabled model actually answers is exactly why you would
   click a single row.
+- Restore failed models from the dashboard: a row that failed today gets a *恢复 / restore* button in
+  the state column (clears that model's failure record only), and the action bar gets a
+  *恢复本组失败 (N)* / *restore this group's failures (N)* button that clears the failures of the
+  models in the selected group only — an unqualified `/failed/reset` clears every failure of the day,
+  which would overreach into other groups.
+- The concurrency cap is editable right on the dashboard: the 并发 / concurrency column's main value is
+  an input box sharing the model row's submit logic (persisted per model, applying to every group): a
+  positive integer sets it, empty or 0 follows `defaultConcurrency`. The input box keeps the live
+  `in-flight / effective cap` text beside it, with the wait and queue detail on the second line.
+- Remove from routing: the *移除 / remove* button under the model name drops that model from the group
+  the row belongs to, leaving the other models and their priorities alone. It differs from
+  *禁用 / disable*: disabling keeps the entry and only bars it from routing, while removing deletes the
+  entry, and re-adding it later needs the ＋ on the model tab. A model in two groups appears as two
+  rows, so removing it from routing means removing it from every row it has.
 - Some failures are neither network nor account nor quota: the upstream rejected the request itself.
   The common case is input beyond the model's context window (`prompt is too long`,
   `CONTEXT_WINDOW_EXCEEDED`), which adapters usually class as `400` / `code: client`. Swapping

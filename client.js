@@ -7,7 +7,9 @@
  *    - 弹窗内含「路由分组」「数据看板」「失败模型」页签；分组可绑定到当前会话
  * 2. 设置页「模型故障转移」：dialogMode 开关 + 分组 CRUD（含优先级）+ 失败模型恢复
  * 3. 数据看板：读 /metrics 展示每个模型的首字延迟、输出速度、并发占用与排队，
- *    表头可点击排序；并发上限在这里按模型配置，对所有分组统一生效
+ *    表头可点击排序（结果被记住）；并发上限在并发列直接改；模型行可单独测速、
+ *    从路由移除，当日失败的行可恢复；排序顺眼时可按当前排序重设路由优先级，
+ *    也能对整组一键测速。
  *
  * 数据来自 Host 半的 /api/model-failover 接口。
  */
@@ -24,7 +26,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v10'
+    var VERSION = 'v12'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -293,11 +295,12 @@ window.__ModuleLoader__.load({
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
       // 七列：模型 / 成功率 / 首字 / 速度 / token / 并发 / 状态。状态列固定宽，否则「当日失败 +
       // 错误码」会把 auto 列撑宽、把模型列从 308px 压到 248px，整张表看着就乱了。
-      // token 列比速度列宽一点：它要放「1.2K / 8.4K」这种两个数。
+      // token 列比速度列宽一点：它要放「1.2M」大字加「↑输入 12.3K」这种一行一个的小字。
       // 成功率列只放「98.5%」加副行「166/168」：主值够宽就够，副行靠 10px 字号塞进同一格。
+      // 状态列 120px：副行要同时放下错误码与「恢复」按钮（错误码截断，完整报错走悬停）。
       metricsRow: {
         display: 'grid',
-        gridTemplateColumns: 'minmax(120px, 1fr) 56px 66px 82px 96px 76px 92px',
+        gridTemplateColumns: 'minmax(120px, 1fr) 56px 66px 82px 108px 76px 120px',
         alignItems: 'center', gap: '8px', padding: '6px 10px',
         borderTop: '0.5px solid var(--dsw-alias-border-l1)',
         fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
@@ -335,6 +338,16 @@ window.__ModuleLoader__.load({
         minWidth: 0, display: 'flex', flexDirection: 'column',
         alignItems: 'flex-start', gap: '1px', lineHeight: '1.3',
       },
+      // 状态列的副行：错误码占满剩余宽度（截断显示，悬停给完整报错）。
+      metricsErrCode: {
+        minWidth: 0, width: '100%', maxWidth: '100%', fontSize: '10px', fontFamily: 'monospace',
+        opacity: .75, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+      },
+      // 状态标签与「恢复」按钮同一行：按钮紧跟在「当日失败」标签后面，
+      // 副行留给错误码——两者挤在一行会把错误码挤成省略号。
+      metricsTagLine: {
+        minWidth: 0, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: '4px',
+      },
       metricsModel: { fontWeight: 600 },
       metricsSub: { fontSize: '10px', opacity: .6, marginTop: '1px', whiteSpace: 'normal', wordBreak: 'break-word' },
       // 模型名下的副行：分组名靠左，单模型「测速」按钮靠右。看板只有七列，
@@ -353,6 +366,30 @@ window.__ModuleLoader__.load({
         border: '0.5px solid var(--dsw-alias-border-l3)',
         borderRadius: 'var(--dsw-radius-sm)',
         background: 'transparent', color: 'var(--dsw-alias-label-secondary)',
+      },
+      // 行内的次级动作（从路由移除、恢复失败）：与测速按钮同一套观感，但不带
+      // marginLeft:auto——它左边还有分组名，贴住即可。
+      metricsMiniBtn: {
+        flexShrink: 0, cursor: 'pointer',
+        padding: '0 5px', fontSize: '10px', lineHeight: '15px',
+        border: '0.5px solid var(--dsw-alias-border-l3)',
+        borderRadius: 'var(--dsw-radius-sm)',
+        background: 'transparent', color: 'var(--dsw-alias-label-secondary)',
+      },
+      // 并发列的编辑态：上限输入框 + 「进行中 / 上限」占用文字并排。
+      // 看板这一列原来只读，改上限要切到「模型」页签；直接给输入框，提交逻辑
+      // 与模型页签共用同一份（按模型持久化，对所有分组生效）。
+      metricsConcEdit: {
+        display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
+        gap: '4px', width: '100%',
+      },
+      metricsConcInput: {
+        width: '38px', textAlign: 'center', boxSizing: 'border-box', flexShrink: 0,
+        background: 'var(--dsw-alias-bg-base)',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        borderRadius: '4px', padding: '1px 2px', fontSize: '11px',
+        color: 'var(--dsw-alias-label-primary)', outline: 'none',
+        fontVariantNumeric: 'tabular-nums',
       },
       // 表头按钮：整格可点，▲/▼ 指示当前排序列与方向
       metricsSortBtn: {
@@ -693,6 +730,12 @@ window.__ModuleLoader__.load({
       var failedMap = {}
       var failedList = (status && status.failed) || []
       failedList.forEach(function (f) { failedMap[keyOf(f.provider, f.model)] = true })
+      // 当日失败的详情（错误码 + 完整报错文案）：看板上悬停要看的就是它。
+      // 单独的 map，不改 failedMap 的布尔语义——模型列表只关心「失败没失败」。
+      var failedDetail = {}
+      failedList.forEach(function (f) {
+        failedDetail[keyOf(f.provider, f.model)] = { code: f.code || null, reason: f.reason || null }
+      })
       var routeGroups = (status && status.groups) || []
       var boundGroup = binding ? routeGroups.find(function (g) { return g.id === binding }) : undefined
       // 默认分组：新会话自动沿用；null = 用户从未选过（不给新会话硬塞分组）
@@ -824,12 +867,7 @@ window.__ModuleLoader__.load({
                   placeholder: defaultConcText(),
                   'aria-label': '并发上限',
                   onChange: function (ev) { commitConcurrency(providerGroup.id, m.id, ev.target.value) },
-                  onBlur: function () {
-                    // 失焦即放弃本地草稿，输入框回到服务端记录的真实值
-                    var nxt = Object.assign({}, concDraft)
-                    delete nxt[k]
-                    setConcDraft(nxt)
-                  },
+                  onBlur: function () { concBlur(k) },
                 })),
               // 快捷加入分组
               e('button', {
@@ -1011,6 +1049,74 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 失焦即放弃本地草稿，输入框回到服务端记录的真实值。
+       * 看板与「模型」页签共用同一个草稿 state，所以清除逻辑也共用这一份。
+       */
+      function concBlur(k) {
+        var nxt = Object.assign({}, concDraft)
+        delete nxt[k]
+        setConcDraft(nxt)
+      }
+
+      /**
+       * 恢复一个模型的当日失败：/failed/reset 带 provider/model 时只清这一个模型，
+       * 不会连带清掉其它分组里也在失败名单上的模型。看板与「失败模型」页签共用。
+       */
+      function restoreFailed(provider, model) {
+        apiSend(API + '/failed/reset', 'POST', { provider: provider, model: model })
+          .then(function () { return refreshMetrics() })
+          .then(function () { return refreshStatus() })
+      }
+
+      /**
+       * 看板操作条上的批量恢复：只清当前分组（分组下拉选的那个）里的失败模型。
+       * 不带 body 的 /failed/reset 会清掉全天全部失败，跨了分组就是越权，所以这里
+       * 逐个模型调。
+       */
+      function restoreFailedInScope(rows) {
+        if (rows.length === 0) return
+        setOrderNotice({ ok: true, text: '正在恢复 ' + rows.length + ' 个模型的失败状态…' })
+        Promise.all(rows.map(function (r) {
+          return apiSend(API + '/failed/reset', 'POST', { provider: r.provider, model: r.model })
+        })).then(function () {
+          setOrderNotice({ ok: true, text: '已恢复 ' + rows.length + ' 个模型，立即重新参与路由' })
+          return refreshMetrics()
+        }).then(function () { return refreshStatus() })
+          .catch(function (e) {
+            setOrderNotice({ ok: false, text: '恢复失败：' + String(e && e.message ? e.message : e) })
+          })
+      }
+
+      /**
+       * 从路由移除：把这个模型从所在分组的模型清单里摘掉，分组里其余模型与
+       * 它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；
+       * 移除连条目一起删，想加回来得从「模型」页签重新 ＋。
+       *
+       * 看板一行对应一个分组（同一模型在两个分组里会有两行），所以只动这一行
+       * 所属的分组；要让某个模型彻底离开路由，就把它所在的每一行都移除。
+       */
+      function removeFromRouting(provider, model, groupId) {
+        var g = routeGroups.find(function (x) { return x.id === groupId })
+        if (!g) { setOrderNotice({ ok: false, text: '分组信息已过期，刷新后再试' }); return }
+        var models = g.models || []
+        var rest = models.filter(function (m) { return !(m.provider === provider && m.model === model) })
+        if (rest.length === models.length) return
+        setOrderNotice({ ok: true, text: '正在把 ' + provider + '/' + model + ' 从「' + g.name + '」移除…' })
+        apiSend(API + '/groups', 'PUT', { id: groupId, models: rest })
+          .then(function (res) {
+            if (res && res.ok) {
+              setOrderNotice({ ok: true, text: '已从「' + g.name + '」移除 ' + provider + '/' + model })
+              return refreshMetrics()
+            }
+            setOrderNotice({ ok: false, text: (res && res.error) || '移除失败' })
+          })
+          .then(function () { return refreshStatus() })
+          .catch(function (e) {
+            setOrderNotice({ ok: false, text: '移除失败：' + String(e && e.message ? e.message : e) })
+          })
+      }
+
+      /**
        * 数据看板：把 /metrics 的每个模型摊平成一行，默认按分组 + 优先级排序。
        * metrics 行里没有 priority，用 status.groups 里的分组条目补齐；
        * 补不到时退化成 groupName/provider/model 排序，保证顺序稳定。
@@ -1023,7 +1129,7 @@ window.__ModuleLoader__.load({
         routeGroups.forEach(function (g) {
           var gm = g.models || []
           for (var i = 0; i < gm.length; i++) {
-            byKey[keyOf(gm[i].provider, gm[i].model)] = { groupName: g.name, priority: gm[i].priority }
+            byKey[keyOf(gm[i].provider, gm[i].model)] = { groupName: g.name, priority: gm[i].priority, groupId: g.id }
           }
         })
         var items = rawRows.map(function (r) {
@@ -1032,6 +1138,9 @@ window.__ModuleLoader__.load({
             row: r,
             groupName: r.groupName || meta.groupName || '',
             priority: typeof meta.priority === 'number' ? meta.priority : 99,
+            // 这一行属于哪个分组：看板的「从路由移除」只动这一行所属的分组。
+            // metrics 行自带 groupId；补不到时用分组目录里的记录兜底。
+            groupId: r.groupId || meta.groupId || '',
           }
         }).sort(function (a, b) {
           if (a.groupName !== b.groupName) return a.groupName < b.groupName ? -1 : 1
@@ -1069,32 +1178,99 @@ window.__ModuleLoader__.load({
         if (key === 'rate') return rateOf(r)
         if (key === 'ttft') return isNum(r.ttftP50) ? r.ttftP50 : null
         if (key === 'tps') return isNum(r.tpsP50) ? r.tpsP50 : null
-        // token 列看的是「历史总用量」（表格里的大字就是它），所以按同一个数排，
-        // 而不是按区间内的用量——否则点这个表头排出来的序和肉眼看到的数不一致。
-        if (key === 'tokens') return lifetimeTokensOf(r)
+        // token 列看的是「所选区间内的总量」（表格里的大字就是它），所以按同一个数
+        // 排，而不是按历史总量——否则点这个表头排出来的序和肉眼看到的数不一致。
+        if (key === 'tokens') return rangeTokensOf(r)
         // 并发列按「生效上限」排：不限（null）垫底，与显示一致
         if (key === 'conc') return Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
         return metricsStatusRank(r)
       }
 
       /**
-       * 某行的历史 token 总量（输入 + 输出），null = 一次 usage 都没报过。
+       * 某行**所选区间内**的 token 总量（输入 + 输出，**含缓存命中**），
+       * null = 区间内没有采样。
        *
-       * 「历史」指不随日期筛选变化的全量样本，由 Host 的 lifetimeInTokens /
-       * lifetimeOutTokens 提供；旧版 Host 没有这两个字段时回落到区间内的合计，
-       * 至少不会一片空白。
+       * Host 在同一批样本上算好区间内的合计（inTokens / outTokens /
+       * cacheReadTokens / cacheWriteTokens），所以它跟着日期筛选走：筛到某一天，
+       * 这个数就只算那一天的用量。
+       *
+       * DSH 的 usage 把缓存命中拆成 cacheReadTokens / cacheWriteTokens 单独报，
+       * 它们是**输入**的一部分（billed input = 三者之和，见
+       * packages/llm/llm/src/types.ts 的 TokenUsage 注释）。只加 inputTokens
+       * 会把命中缓存的那部分整段丢掉，所以这里必须一并计入。
+       */
+      function rangeTokensOf(r) {
+        // 区间内没有一条样本报了 usage，就当「没记」而不是「用了 0」：0 会被读成
+        // 「这个模型今天确实没烧 token」，与「provider 不报 usage」是两件事。
+        var tokenSamples = isNum(r.tokenSamples) ? r.tokenSamples : 0
+        if (tokenSamples <= 0) return null
+        var inT = isNum(r.inTokens) ? r.inTokens : 0
+        var outT = isNum(r.outTokens) ? r.outTokens : 0
+        var crT = isNum(r.cacheReadTokens) ? r.cacheReadTokens : 0
+        var cwT = isNum(r.cacheWriteTokens) ? r.cacheWriteTokens : 0
+        return inT + outT + crT + cwT
+      }
+
+      /**
+       * 某行的历史 token 总量（输入 + 输出，**含缓存命中**），null = 一次 usage 都没报过。
+       *
+       * 「历史」指不随日期筛选变化的全量样本，由 Host 的 lifetime*Tokens 提供；
+       * 旧版 Host 没有这些字段时回落到区间内的合计，至少不会一片空白。
        */
       function lifetimeTokensOf(r) {
         var inT = isNum(r.lifetimeInTokens) ? r.lifetimeInTokens : r.inTokens
         var outT = isNum(r.lifetimeOutTokens) ? r.lifetimeOutTokens : r.outTokens
+        var crT = isNum(r.lifetimeCacheReadTokens) ? r.lifetimeCacheReadTokens : r.cacheReadTokens
+        var cwT = isNum(r.lifetimeCacheWriteTokens) ? r.lifetimeCacheWriteTokens : r.cacheWriteTokens
         var hasIn = isNum(inT)
         var hasOut = isNum(outT)
-        if (!hasIn && !hasOut) return null
-        return (hasIn ? inT : 0) + (hasOut ? outT : 0)
+        var hasCache = isNum(crT) || isNum(cwT)
+        if (!hasIn && !hasOut && !hasCache) return null
+        return (hasIn ? inT : 0) + (hasOut ? outT : 0) + (hasCache ? crT : 0) + (hasCache ? cwT : 0)
+      }
+
+      /** 某行历史输入里命中缓存的比例（0~1），null = 不知道 / 没有输入量 */
+      function lifetimeCacheHitRatioOf(r) {
+        var inT = isNum(r.lifetimeInTokens) ? r.lifetimeInTokens : r.inTokens
+        var crT = isNum(r.lifetimeCacheReadTokens) ? r.lifetimeCacheReadTokens : r.cacheReadTokens
+        var cwT = isNum(r.lifetimeCacheWriteTokens) ? r.lifetimeCacheWriteTokens : r.cacheWriteTokens
+        if (!isNum(inT) || !isNum(crT) && !isNum(cwT)) return null
+        var cacheT = isNum(crT) ? crT : 0
+        var writeT = isNum(cwT) ? cwT : 0
+        var billedInput = inT + cacheT + writeT
+        if (billedInput <= 0) return null
+        return (cacheT + writeT) / billedInput
       }
 
       /** 某行是否有任何采样（决定它是否参与「按当前排序重设优先级」） */
       function hasSamples(r) { return isNum(r.samples) && r.samples > 0 }
+
+      /**
+       * 这一行的错误详情：错误码 + 完整报错文案（悬停看）。
+       *
+       * 当日失败的模型优先用失败记录里的原因（那是「所有重试耗尽后」的最终结论），
+       * 没有失败记录时用最近一次采样失败的信息。两处都没有就返回 null——
+       * 与其显示一个空壳错误码，不如什么都不显示。
+       */
+      function errorDetailOf(r, k) {
+        var det = failedDetail[k]
+        var code = null
+        var message = null
+        var source = null
+        if (det && det.code) {
+          code = String(det.code)
+          message = det.reason ? String(det.reason) : null
+          source = '当日失败记录'
+        } else if (r.lastErrorCode) {
+          code = String(r.lastErrorCode)
+          message = r.lastErrorMessage ? String(r.lastErrorMessage) : null
+          source = '最近一次采样失败'
+        }
+        if (!code) return null
+        var title = source + '：' + code
+        if (message) title += '\n\n' + message
+        return { code: code, message: message, source: source, title: title }
+      }
 
       function dashboardTab() {
         var rows = (metrics && metrics.rows) || []
@@ -1132,6 +1308,11 @@ window.__ModuleLoader__.load({
         // 还没采样的模型补数据，所以这里不按 samples 过滤，只排除已禁用的。
         var speedTargets = sorted.filter(function (it) {
           return it.row.groupId === effOrderGroupId && it.row.disabled !== true
+        }).map(function (it) { return it.row })
+        // 当前分组里当日失败的行：操作条上的批量「恢复」只清这些模型。
+        // 不带 body 的 /failed/reset 会清掉全天全部失败，跨了分组就是越权。
+        var failedInScope = sorted.filter(function (it) {
+          return it.row.groupId === effOrderGroupId && it.row.failed === true
         }).map(function (it) { return it.row })
 
         /**
@@ -1296,12 +1477,14 @@ window.__ModuleLoader__.load({
           e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
             '成功率 = 区间内成功调用 / 区间内全部采样（历史全部保留，不按条数截断）；'
             + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
-            + 'token = 区间内该模型的输入/输出用量合计（只统计适配器报了 usage 的调用）；'
-            + '并发 = 正在进行的请求 / 生效上限'
-            + '（上限在「模型」页签的模型行上设置，对所有分组统一生效）。'),
+            + 'token = 所选区间内该模型的输入/输出/缓存用量合计（只统计适配器报了 usage 的调用）；'
+            + '并发 = 正在进行的请求 / 生效上限（上限直接在「并发」列改，按模型持久化、对所有分组统一生效）。'),
           e('div', { style: S.metricsNote },
-            '副行灰字是该列的补充：成功率给成功数 / 采样数，首字与速度给 P90，token 给输入用量，'
-            + '并发给等槽时间与排队数，模型给所属分组。采样与 token 用量会落盘，重启后仍在。'),
+            '副行灰字是该列的补充：成功率给成功数 / 采样数，首字与速度给 P90，'
+            + 'token 一行一个数给输入 / 缓存命中 / 缓存写入 / 输出（鼠标悬停大字看历史总量），'
+            + '并发给等槽时间与排队数，模型给所属分组。'
+            + '模型行的「移除」把这个模型从它所属分组里摘掉；当日失败的行点状态列的「恢复」立即重新参与路由。'
+            + '采样与 token 用量会落盘，重启后仍在。'),
           noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
           metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
           metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
@@ -1314,7 +1497,7 @@ window.__ModuleLoader__.load({
               ? e('select', {
                 style: S.metricsDate,
                 value: effOrderGroupId,
-                title: '重设优先级与一键测速都作用于这个分组',
+                title: '重设优先级、一键测速与批量恢复都作用于这个分组',
                 onChange: function (ev) { setOrderGroupId(ev.target.value) },
               }, groupOptions.map(function (g) {
                 return e('option', { key: g.id, value: g.id }, g.name)
@@ -1344,6 +1527,16 @@ window.__ModuleLoader__.load({
             }, '按当前排序重设优先级'),
             e('span', { style: { fontSize: '10px', opacity: .45 } },
               orderTargets.length > 0 ? orderTargets.length + ' 个有数据' : '无带数据模型'),
+            e('span', { style: { opacity: .3, fontSize: '11px' } }, '|'),
+            e('button', {
+              style: S.btn,
+              disabled: failedInScope.length === 0,
+              title: failedInScope.length === 0
+                ? '当前分组里没有当日失败的模型'
+                : '把当前分组里 ' + failedInScope.length + ' 个当日失败的模型立即恢复参与路由'
+                  + '（逐个清除，只清这些模型，其它分组的失败记录不受影响）',
+              onClick: function () { restoreFailedInScope(failedInScope) },
+            }, failedInScope.length > 0 ? '恢复本组失败 (' + failedInScope.length + ')' : '本组无失败'),
             e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' } },
               speedTest && speedTest.running && e('span', { style: { fontSize: '11px', opacity: .7 } },
                 '测速中 ' + (speedTest.done || 0) + '/' + (speedTest.total || 0)),
@@ -1410,6 +1603,14 @@ window.__ModuleLoader__.load({
                       style: S.metricsSubText,
                       title: it.groupName ? '所属分组：' + it.groupName : '这个模型还没进任何分组',
                     }, it.groupName ? it.groupName : '未分组'),
+                    // 从路由移除：这一行属于哪个分组就从哪个分组里摘掉它。
+                    // 同一模型在两个分组里会有两行，要彻底离开路由就两行都移除。
+                    it.groupId && e('button', {
+                      style: S.metricsMiniBtn,
+                      title: '把 ' + r.provider + '/' + r.model + ' 从「' + (it.groupName || '分组')
+                        + '」移除：不再参与路由，分组里其它模型与优先级不变（想加回来从「模型」页签重新 ＋）',
+                      onClick: function () { removeFromRouting(r.provider, r.model, it.groupId) },
+                    }, '移除'),
                     // 单模型测速：整组测一次要打十几个请求，只想确认某一个模型时
                     // 不该等整批。Host 同一时刻只跑一个任务，所以任务进行中整列
                     // 按钮都按住（包括这一行自己）。
@@ -1460,62 +1661,117 @@ window.__ModuleLoader__.load({
                 })(),
                 p90Cell(r.ttftP50, r.ttftP90, fmtMs),
                 p90Cell(r.tpsP50, r.tpsP90, fmtTps),
-                // token：大字是**历史总用量**（不随日期筛选变化，输入 + 输出），
-                // 副行给输入/输出的拆分。区间内用量放在 title 里——用户要的是
-                // 「这个模型一共烧了多少 token」，区间数字只在排查某天时才有用。
+                // token：大字是**所选区间内**的总量（输入 + 输出，含缓存命中），
+                // 跟着日期筛选走——筛到某一天，这个数就只算那一天。副行把拆分
+                // 摊成一行一个数：命中缓存是省钱的关键信号，挤在一行里会被
+                // 省略号吃掉。历史总量放进 title，供「这个模型一共烧了多少」用。
                 (function () {
+                  var rangeTotal = rangeTokensOf(r)
+                  var rangeIn = isNum(r.inTokens) ? r.inTokens : null
+                  var rangeOut = isNum(r.outTokens) ? r.outTokens : null
+                  var rangeRead = isNum(r.cacheReadTokens) ? r.cacheReadTokens : null
+                  var rangeWrite = isNum(r.cacheWriteTokens) ? r.cacheWriteTokens : null
                   var lifetimeTotal = lifetimeTokensOf(r)
                   var lifetimeIn = isNum(r.lifetimeInTokens) ? r.lifetimeInTokens : r.inTokens
                   var lifetimeOut = isNum(r.lifetimeOutTokens) ? r.lifetimeOutTokens : r.outTokens
+                  var lifetimeRead = isNum(r.lifetimeCacheReadTokens) ? r.lifetimeCacheReadTokens : r.cacheReadTokens
+                  var lifetimeWrite = isNum(r.lifetimeCacheWriteTokens) ? r.lifetimeCacheWriteTokens : r.cacheWriteTokens
                   var tokenSamples = isNum(r.lifetimeTokenSamples) ? r.lifetimeTokenSamples : r.tokenSamples
+                  var cacheHitRatio = lifetimeCacheHitRatioOf(r)
+                  // 一行一个数：小字按「输入 / 缓存命中 / 缓存写入 / 输出」排。
                   var split = []
-                  if (isNum(lifetimeIn) && lifetimeIn > 0) split.push('↑' + fmtTokens(lifetimeIn))
-                  if (isNum(lifetimeOut) && lifetimeOut > 0) split.push('↓' + fmtTokens(lifetimeOut))
+                  if (isNum(rangeIn) && rangeIn > 0) split.push({ label: '↑输入', value: rangeIn })
+                  if (isNum(rangeRead) && rangeRead > 0) split.push({ label: '缓存命中', value: rangeRead })
+                  if (isNum(rangeWrite) && rangeWrite > 0) split.push({ label: '缓存写入', value: rangeWrite })
+                  if (isNum(rangeOut) && rangeOut > 0) split.push({ label: '↓输出', value: rangeOut })
+                  var cacheTitle = cacheHitRatio !== null
+                    ? '\n历史缓存命中率：' + Math.round(cacheHitRatio * 100) + '%（'
+                      + (isNum(lifetimeRead) ? fmtTokens(lifetimeRead) : '0') + ' 命中 / '
+                      + (isNum(lifetimeWrite) ? fmtTokens(lifetimeWrite) : '0') + ' 写入）'
+                    : ''
                   return e('div', { style: S.metricsNumCell },
                     e('span', {
                       style: Object.assign({}, S.metricsNumMain, S.metricsNumBig),
-                      title: '历史 token 总用量（全部样本，输入 + 输出）：'
-                        + (lifetimeTotal === null ? '—' : fmtTokens(lifetimeTotal))
-                        + '\n输入 ' + (isNum(lifetimeIn) ? fmtTokens(lifetimeIn) : '—')
+                      title: '所选区间内的 token 总量（输入 + 输出，含缓存命中）：'
+                        + (rangeTotal === null ? '—' : fmtTokens(rangeTotal))
+                        + '\n区间内输入 ' + (isNum(rangeIn) ? fmtTokens(rangeIn) : '—')
+                        + ' / 缓存命中 ' + (isNum(rangeRead) ? fmtTokens(rangeRead) : '—')
+                        + ' / 缓存写入 ' + (isNum(rangeWrite) ? fmtTokens(rangeWrite) : '—')
+                        + ' / 输出 ' + (isNum(rangeOut) ? fmtTokens(rangeOut) : '—')
+                        + '\n历史总量（全部样本）：' + (lifetimeTotal === null ? '—' : fmtTokens(lifetimeTotal))
+                        + '\n历史输入 ' + (isNum(lifetimeIn) ? fmtTokens(lifetimeIn) : '—')
+                        + ' / 缓存命中 ' + (isNum(lifetimeRead) ? fmtTokens(lifetimeRead) : '—')
+                        + ' / 缓存写入 ' + (isNum(lifetimeWrite) ? fmtTokens(lifetimeWrite) : '—')
                         + ' / 输出 ' + (isNum(lifetimeOut) ? fmtTokens(lifetimeOut) : '—')
-                        + (isNum(tokenSamples) ? '\n有 token 数据的样本：' + tokenSamples + ' / ' + (isNum(r.samples) ? r.samples : 0) : '')
-                        + '\n当前日期区间内：↑' + (isNum(r.inTokens) ? fmtTokens(r.inTokens) : '—')
-                        + ' ↓' + (isNum(r.outTokens) ? fmtTokens(r.outTokens) : '—'),
-                    }, lifetimeTotal === null ? '—' : fmtTokens(lifetimeTotal)),
-                    split.length > 0 && e('span', {
-                      style: S.metricsNumSub,
-                      title: '历史输入 / 输出 token 拆分（不受日期筛选影响）',
-                    }, split.join(' ')))
+                        + cacheTitle
+                        + (isNum(tokenSamples) ? '\n有 token 数据的样本：' + tokenSamples + ' / ' + (isNum(r.samples) ? r.samples : 0) : ''),
+                    }, rangeTotal === null ? '—' : fmtTokens(rangeTotal)),
+                    split.map(function (part, idx) {
+                      return e('span', {
+                        key: part.label,
+                        style: S.metricsNumSub,
+                        title: '区间内' + part.label + ' token：' + fmtTokens(part.value),
+                      }, part.label + ' ' + fmtTokens(part.value))
+                    }))
                 })(),
-                // 并发：只读展示「进行中 / 上限」，上限在模型页签改
+                // 并发：上限直接在这一列改（与「模型」页签同一份提交逻辑，按模型
+                // 持久化、对所有分组统一生效）；输入框右边贴「进行中 / 生效上限」。
                 e('div', { style: S.metricsNumCell },
-                  e('span', {
-                    style: S.metricsNumMain,
-                    title: '正在进行的请求 / 生效上限' + (explicit === null ? '（跟随默认上限）' : '（本模型显式配置）')
-                      + (queued > 0 ? '\n排队中：' + queued : ''),
-                  }, String(inflight) + '/' + effText),
+                  e('span', { style: S.metricsConcEdit },
+                    e('input', {
+                      type: 'number', min: 1, max: 999, style: S.metricsConcInput,
+                      value: concDraft[k] !== undefined
+                        ? concDraft[k]
+                        : (explicit === null ? '' : String(explicit)),
+                      placeholder: defaultConcText(),
+                      'aria-label': '并发上限',
+                      title: '并发上限：正整数即写死（对所有分组统一生效）；留空或 0 = 跟随默认上限'
+                        + (defaultHint ? '（' + defaultHint + '）' : '')
+                        + (queued > 0 ? '\n排队中：' + queued : '')
+                        + '。达到上限时先尝试切到组内其它空闲模型，都满才排队',
+                      onChange: function (ev) { commitConcurrency(r.provider, r.model, ev.target.value) },
+                      onBlur: function () { concBlur(k) },
+                    }),
+                    e('span', { style: { fontSize: '11px', opacity: .65, whiteSpace: 'nowrap' } },
+                      String(inflight) + '/' + effText)),
                   concSubText && e('span', { style: S.metricsNumSub }, concSubText)),
                 // 状态：主行一个标签（失败 > 禁用 > 冷却 > 正常，只画最严重的那个，
-                // 避免一格里堆三枚胶囊把列撑爆），副行是错误码。两者都截断 + title。
+                // 避免一格里堆三枚胶囊把列撑爆），副行给错误码 + 「恢复」按钮。
+                // 错误码一直要看得见（用户要判断「是不是同一个错」），完整报错
+                // 放在 title 里——悬停就能看到上游到底说了什么，不必去「失败模型」
+                // 页签翻。
+                // 「恢复」按钮紧跟在状态标签后面（同一行），错误码独占副行：
+                // 挤在一行会让错误码被按钮压成省略号。
                 e('div', { style: S.metricsTagCell },
-                  r.failed
-                    ? e('span', { style: S.tag, title: '当日失败：不参与路由，日界线或成功一轮后自动恢复' }, '当日失败')
-                    : r.disabled
-                      ? e('span', { style: Object.assign({}, S.tag, { opacity: .8 }), title: '已手动禁用，不参与路由' }, '已禁用')
-                      : cooling
-                        ? e('span', {
-                          style: Object.assign({}, S.tag, {
-                            background: 'var(--dsw-alias-state-warn-tertiary)',
-                            color: 'var(--dsw-alias-state-warn-label)',
-                          }),
-                          title: '并发已满被临时挡在路由之外，约 ' + coolLeft + 's 后自动恢复'
-                            + (r.capacityReason ? '：' + r.capacityReason : ''),
-                        }, '冷却 ' + coolLeft + 's')
-                        : e('span', { style: { fontSize: '11px', opacity: .45 } }, '正常'),
-                  r.lastErrorCode && e('span', {
-                    style: S.metricsNumSub,
-                    title: '最近一次错误码：' + String(r.lastErrorCode),
-                  }, String(r.lastErrorCode))))
+                  e('div', { style: S.metricsTagLine },
+                    r.failed
+                      ? e('span', {
+                        style: S.tag,
+                        title: '当日失败：不参与路由，日界线或成功一轮后自动恢复',
+                      }, '当日失败')
+                      : r.disabled
+                        ? e('span', { style: Object.assign({}, S.tag, { opacity: .8 }), title: '已手动禁用，不参与路由' }, '已禁用')
+                        : cooling
+                          ? e('span', {
+                            style: Object.assign({}, S.tag, {
+                              background: 'var(--dsw-alias-state-warn-tertiary)',
+                              color: 'var(--dsw-alias-state-warn-label)',
+                            }),
+                            title: '并发已满被临时挡在路由之外，约 ' + coolLeft + 's 后自动恢复'
+                              + (r.capacityReason ? '：' + r.capacityReason : ''),
+                          }, '冷却 ' + coolLeft + 's')
+                          : e('span', { style: { fontSize: '11px', opacity: .45 } }, '正常'),
+                    r.failed && e('button', {
+                      style: S.metricsMiniBtn,
+                      title: '恢复这个模型的失败状态（立即重新参与路由；只清这一个模型）',
+                      onClick: function () { restoreFailed(r.provider, r.model) },
+                    }, '恢复')),
+                  (function () {
+                    var det = errorDetailOf(r, k)
+                    return det
+                      ? e('span', { style: S.metricsErrCode, title: det.title }, det.code)
+                      : null
+                  })()))
             })))
       }
 

@@ -1147,6 +1147,43 @@ ok('㉗ 单模型结果与整组同一份字段（首字/速度/token 都在）�
   && typeof probeOneDone.results?.[0]?.ttftMs === 'number',
   JSON.stringify(probeOneDone.results?.[0]))
 
+  // ㉘ 缓存命中的 token 是输入的一部分：看板的大字必须把它算进去
+  //     （DSH 的 usage 把 cacheReadTokens/cacheWriteTokens 拆开报，billed input
+  //       = 三者之和；只看 inputTokens 会把命中缓存的那部分整段丢掉）。
+  //     /metrics 只列分组里出现过的模型，所以先给它一个分组。
+  await api('POST', '/groups', { id: 'gc', name: 'GC', models: [
+    { provider: 'pc', model: 'cache-mc', priority: 1 },
+  ] })
+  const cacheStream = async function* () {
+    yield { type: 'text-delta', text: 'hi' }
+    yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 8, cacheReadTokens: 400, cacheWriteTokens: 100 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  {
+    const s = await streamHandler({ provider: 'pc', model: 'cache-mc' }, () => cacheStream())
+    for await (const _c of s) { /* 只驱动，不改写 */ }
+  }
+  const cacheRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'cache-mc')
+  ok('㉘ 看板行带缓存命中的字段（输入拆分成未命中 + 命中 + 写入）',
+    cacheRow !== undefined
+    && cacheRow.cacheReadTokens === 400 && cacheRow.cacheWriteTokens === 100
+    && cacheRow.inTokens === 10 && cacheRow.outTokens === 8,
+    JSON.stringify(cacheRow && { i: cacheRow.inTokens, o: cacheRow.outTokens, r: cacheRow.cacheReadTokens, w: cacheRow.cacheWriteTokens }))
+  ok('㉘ 历史 token 总用量含缓存命中（400 + 100 + 10 + 8）',
+    cacheRow?.lifetimeInTokens === 10 && cacheRow?.lifetimeCacheReadTokens === 400 && cacheRow?.lifetimeCacheWriteTokens === 100,
+    JSON.stringify(cacheRow && { li: cacheRow.lifetimeInTokens, lr: cacheRow.lifetimeCacheReadTokens, lw: cacheRow.lifetimeCacheWriteTokens }))
+  // 区间筛选：缓存字段与其它 token 字段一起随窗口变化，历史字段原地不动
+  const cacheEmpty = (await api('GET', '/metrics?since=1990-01-01&until=1990-01-02')).body.rows.find(r => r.provider === 'pc' && r.model === 'cache-mc')
+  ok('㉘ 换到空区间：缓存字段随区间归零，但历史缓存用量原地不动',
+    cacheEmpty?.cacheReadTokens === 0 && cacheEmpty?.cacheWriteTokens === 0
+    && cacheEmpty?.lifetimeCacheReadTokens === 400 && cacheEmpty?.lifetimeCacheWriteTokens === 100,
+    JSON.stringify(cacheEmpty && { r: cacheEmpty.cacheReadTokens, w: cacheEmpty.cacheWriteTokens, lr: cacheEmpty.lifetimeCacheReadTokens, lw: cacheEmpty.lifetimeCacheWriteTokens }))
+  // 没有缓存字段的旧样本：缓存字段显示 0 而不是 null（与既有 inTokens/outTokens 口径一致）
+  const legacyRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+  ok('㉘ 没有缓存字段的调用：缓存字段显示 0（不拿 null 冒充未知，与 inTokens 口径一致）',
+    legacyRow !== undefined && legacyRow.cacheReadTokens === 0 && legacyRow.cacheWriteTokens === 0,
+    JSON.stringify(legacyRow && { r: legacyRow.cacheReadTokens, w: legacyRow.cacheWriteTokens }))
+
 ctx.get = baseGet
 globalThis.fetch = baseFetch
 
@@ -1260,6 +1297,189 @@ if (typeof agentErrorHandler !== 'function') throw new Error('agent/error 没有
     goalCalls.some(c => c.sid === sid && c.ref.id === 'goal-d' && c.ref.revision === 5),
     JSON.stringify(goalCalls))
 }
+
+// ── ㉘ 看板的行级动作：恢复失败 / 改并发 / 从路由移除 ─────────────────────
+//     界面新加的三个按钮都落在既有 HTTP 接口上（/failed/reset、/model-concurrency、
+//     /groups PUT）。这里守住它们的口径，避免界面以为「只清这个模型」而接口实际清了
+//     全部（/failed/reset 不带 provider/model 就是清全天），或以为「移除只动这一行」
+//     而 PUT 把整份分组清单顶掉。
+{
+  // 先造两个当日失败：m1 在分组 go 里、m3 在分组 go 里，另一个分组 g2 里的 m2
+  await api('POST', '/failed/mark', { provider: 'p', model: 'm1' })
+  await api('POST', '/failed/mark', { provider: 'p', model: 'm3' })
+  await api('POST', '/failed/mark', { provider: 'p', model: 'm2' })
+  await api('POST', '/groups', { id: 'g3', name: 'G3', models: [
+    { provider: 'q', model: 'n1', priority: 1 },
+    { provider: 'q', model: 'n2', priority: 2, disabled: true },
+  ] })
+  // 看板「移除」走 PUT /groups 的整体替换：n2 被禁用、n1 优先级 1，都不许被动到
+  const g3Before = (await api('GET', '/groups')).body.groups.find(g => g.id === 'g3')
+  const g3Kept = g3Before.models.filter(m => m.model !== 'n1').map(m => ({
+    provider: m.provider, model: m.model, priority: m.priority ?? 99, disabled: m.disabled === true,
+  }))
+  const removed = await api('PUT', '/groups', { id: 'g3', models: g3Kept })
+  const g3After = (await api('GET', '/groups')).body.groups.find(g => g.id === 'g3')
+  ok('㉘ 从分组移除：整体替换后目标模型不在分组里了',
+    removed.status === 200 && g3After.models.every(m => m.model !== 'n1'),
+    JSON.stringify(g3After.models))
+  ok('㉘ 移除只动被摘掉的那一行：其余模型的优先级与禁用状态原样保留',
+    g3After.models.length === 1 && g3After.models[0].model === 'n2'
+    && g3After.models[0].priority === 2 && g3After.models[0].disabled === true,
+    JSON.stringify(g3After.models))
+  ok('㉘ 移除后该模型不在任何分组里（不再参与路由）',
+    (await api('GET', '/status')).body.groups.every(g => g.models.every(m => m.model !== 'n1')))
+  // 看板「恢复」走带 provider/model 的 /failed/reset：只清这一个模型
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+  const failedNow = (await api('GET', '/status')).body.failed
+  ok('㉘ 恢复单个失败模型：只清这一个，同组其它模型仍留在失败名单里',
+    !failedNow.some(f => f.provider === 'p' && f.model === 'm1')
+    && failedNow.some(f => f.provider === 'p' && f.model === 'm3'),
+    JSON.stringify(failedNow.map(f => f.model)))
+  ok('㉘ 恢复后该模型重新参与路由（不再被标 failed）',
+    // failed / concurrency 都是 /status 上的派生字段；/groups 返回的是原始分组
+    (await api('GET', '/status')).body.groups
+      .find(g => g.id === 'go').models.find(m => m.model === 'm1').failed === false)
+  // 看板「并发」列的提交与「模型」页签同一份：/model-concurrency 按模型持久化
+  await api('POST', '/model-concurrency', { provider: 'p', model: 'm2', concurrency: 2 })
+  ok('㉘ 看板上改并发上限：按模型记录、对所有分组生效',
+    (await api('GET', '/status')).body.modelConcurrency['p/m2'] === 2)
+  // 生效上限是分组条目上看不到的派生值（/status 才算出来）：所有分组里 m2 必须一致
+  const m2Status = (await api('GET', '/status')).body.groups
+    .map(g => g.models.find(m => m.model === 'm2'))
+    .filter(Boolean)
+  ok('㉘ 并发上限不在分组条目上：所有分组里 m2 看到的生效上限一致',
+    m2Status.length > 0 && m2Status.every(m => m.concurrency === 2), JSON.stringify(m2Status))
+  await api('POST', '/model-concurrency', { provider: 'p', model: 'm2', concurrency: null })
+  ok('㉘ 并发清空后回落到默认（不再出现在 modelConcurrency 里）',
+    (await api('GET', '/status')).body.modelConcurrency['p/m2'] === undefined)
+  await api('DELETE', '/groups/g3')
+  await api('DELETE', '/groups/gc')
+  await api('POST', '/failed/reset', {})
+}
+
+// ── ㉙ 看板状态列：错误码一直看得见，完整报错走悬停 ───────────────────────
+//     状态列副行放错误码（截断显示），title 里是完整报错文案。错误码与文案
+//     必须成对出现：只有码看不出「上游到底说了什么」，只有文案又没法归类。
+{
+  // 一次失败调用：finish 带上 failure 的 code 与 message
+  const failStream = async function* () {
+    yield { type: 'text-delta', index: 0, text: 'partial' }
+    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'UPSTREAM_500', message: '上游 500：provider overloaded, retry later' } } }
+  }
+  await api('POST', '/groups', { id: 'ge', name: 'GE', models: [
+    { provider: 'pe', model: 'em1', priority: 1 },
+  ] })
+  {
+    const iter = await streamHandler({ provider: 'pe', model: 'em1', messages: [] }, () => failStream())
+    for await (const _c of iter) { /* 消费到 finish，触发采样 */ }
+  }
+  const errRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pe' && r.model === 'em1')
+  ok('㉙ 失败行带上错误码', errRow?.lastErrorCode === 'UPSTREAM_500',
+    JSON.stringify(errRow && { c: errRow.lastErrorCode }))
+  ok('㉙ 失败行带上完整报错文案（悬停要看的就是它）',
+    errRow?.lastErrorMessage === '上游 500：provider overloaded, retry later',
+    JSON.stringify(errRow && { m: errRow.lastErrorMessage }))
+  // 成功之后，错误码与文案都要让位给最新的成功（否则会一直挂着旧错误）
+  const okStream = async function* () {
+    yield { type: 'text-delta', index: 0, text: 'ok' }
+    yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  {
+    const iter = await streamHandler({ provider: 'pe', model: 'em1', messages: [] }, () => okStream())
+    for await (const _c of iter) { /* 消费 */ }
+  }
+  const errRow2 = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pe' && r.model === 'em1')
+  ok('㉙ 成功之后仍报区间内最后一次失败（错误码/文案跟着「最后一次失败」走，不被后来的成功顶掉）',
+    errRow2?.lastErrorCode === 'UPSTREAM_500'
+    && errRow2?.lastErrorMessage === '上游 500：provider overloaded, retry later',
+    JSON.stringify(errRow2 && { c: errRow2.lastErrorCode, m: errRow2.lastErrorMessage }))
+  // 当日失败记录带原因：看板悬停优先用它（「所有重试耗尽后」的最终结论）
+  const peAgent = makeAgent('pe-agent', {}, 'em2')
+  peAgent.status = 'running'
+  await errHandler({ agent: peAgent, turn: 1, provider: 'pe', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足' } },
+    () => Promise.resolve(undefined))
+  const failedEntry = (await api('GET', '/status')).body.failed.find(f => f.provider === 'pe' && f.model === 'em2')
+  ok('㉙ 当日失败记录带错误码与原因（看板悬停的文案来源）',
+    failedEntry?.code === 'QUOTA_EXCEEDED' && failedEntry?.reason === '余额不足',
+    JSON.stringify(failedEntry))
+  await api('DELETE', '/groups/ge')
+  await api('POST', '/failed/reset', {})
+}
+
+// ── ㉚ 「配置了路由却报错不自动路由」的两道回归 ────────────────────────────
+//     真实故障（session-45110bcc turn 94，2026-10-26 21:00）有两条独立的成因，
+//     都在这里钉住：
+//     ① 内层监听器不调 next() 就返回 ⇒ 短路整条 waterfall，本插件压根没被调用；
+//     ② 续跑消息投递失败就丢弃 ⇒ 模型换了、会话却停在原地。
+//
+//     ① 的现场是「llm-error-retry 的重试预算耗尽后直接 return undefined」：
+//     它 prepend 在最外层，不放行 → 我们这条监听器根本不在链上。
+//     这里用「内层监听器短路」复现同一形状：调用 next() 的那一层不往下传。
+{
+  const sid = 'short-circuit'
+  const sa = makeAgent(sid, {}, 'm1')
+  agents.push(sa)
+  await api('POST', '/session-group', { sessionId: sid, groupId: 'g2', mode: 'route' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+  useModel(sid, 'm1')
+  sa.status = 'running'
+  // 内层短路：返回 undefined 却不把失败交给下游（真实插件的 exhausted 分支）。
+  // 我们的监听器在这条链上，所以它**拿不到**这次失败 —— 只能靠 agent/error 入口兜。
+  const shortCircuit = await errHandler(
+    { agent: sa, turn: 11, provider: 'p', failure: { code: 'INVALID_REQUEST', message: '内容太长了，请精简输入或开启新对话', status: 400 } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㉚ 内层不表态时本插件不返回 retry（retry 也换不了已冻结的 selection）',
+    shortCircuit === undefined, JSON.stringify(shortCircuit))
+  // 宿主在 waterfall 之后照样抛 LlmError，turn 收尾时以 agent/error 广播。
+  await agentErrorHandler({
+    agent: sa, turn: 11, step: 1,
+    error: llmErr('INVALID_REQUEST', '内容太长了，请精简输入或开启新对话'),
+  })
+  ok('㉚ 内层短路后，agent/error 入口照样把失败路由出去（不靠「自己最外层」的前提）',
+    switchOf(sid) === 'm2', `→ ${switchOf(sid)}`)
+  ok('㉚ 被拒的模型不算「当日失败」（上下文超长不是模型坏了，换个模型照样能用）',
+    !(await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'm1'))
+  sa.status = 'idle'
+  for (const fn of handlers.getAll('agent/status')) fn({ agent: sa, status: 'idle' })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  ok('㉚ 切换后照常排队续跑（模型换了，话也得接着说）',
+    followups.some(f => f.id === sid))
+}
+
+// ② 续跑投递失败不许丢：followup 抛错时条目留在原地，等下一个窗口再试。
+{
+  const sid = 'cont-retry'
+  const ca = makeAgent(sid, {}, 'm1')
+  agents.push(ca)
+  await api('POST', '/session-group', { sessionId: sid, groupId: 'g2', mode: 'route' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+  await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+  useModel(sid, 'm1')
+  ca.status = 'running'
+  await errHandler(
+    { agent: sa2(sid), turn: 12, provider: 'p', failure: { code: 'QUOTA_EXCEEDED', message: '余额不足' } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㉚ 失败后切到组内下一个', switchOf(sid) === 'm2', `→ ${switchOf(sid)}`)
+  // 让 followup 抛错：agent 还��� running 时宿主会拒绝排队
+  ca.status = 'running'
+  ca.followup = () => { throw new Error('agent is busy') }
+  for (const fn of handlers.getAll('agent/status')) fn({ agent: ca, status: 'idle' })
+  await Promise.resolve()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  const log = (await api('GET', '/debug/status-log')).body
+  ok('㉚ 投递失败时留下「continuation/failed」痕迹（不是静默消失）',
+    log.entries.some(e => e.kind === 'continuation/failed' && e.sessionId === sid),
+    JSON.stringify(log.entries.filter(e => e.kind.startsWith('continuation/')).map(e => e.kind)))
+  ok('㉚ 投递失败时待续跑仍在队列里（等下一个窗口再试，不是丢掉）',
+    log.pendingContinuations.includes(sid), JSON.stringify(log.pendingContinuations))
+}
+// 上面那段需要一个「取回假 Agent」的辅助（续跑链路用的是 session id，不是 agent 对象）
+function sa2(id) { return agents.find(a => a.id === id) }
+
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

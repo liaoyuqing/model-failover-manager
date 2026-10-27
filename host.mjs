@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v71'
+const HOST_VERSION = 'v74'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -763,7 +763,7 @@ export function apply(ctx, config = {}) {
    * 「最近 N 条」。内存占用按调用次数线性增长，单条几十字节，正常量级可忽略。
    *
    * @param {string} key - `provider/model`。
-   * @param {{ttftMs: number|null, inTokens: number|null, outTokens: number|null, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, at: number}} sample - 一次调用的观测值。
+   * @param {{ttftMs: number|null, inTokens: number|null, outTokens: number|null, cacheReadTokens: number|null, cacheWriteTokens: number|null, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, errorMessage: string|null, at: number}} sample - 一次调用的观测值。
    * @returns {void}
    */
   function recordSpeedSample(key, sample) {
@@ -779,7 +779,7 @@ export function apply(ctx, config = {}) {
    * @param {{since?: number, until?: number}} [window] - 采样时间窗（毫秒时间戳，两端包含）；
    *   省略则统计全部样本。日期筛选由这里做，而不是交给界面：分位数与合计都要按
    *   「所选区间」算。缓冲区不设条数上限，所以这里的统计就是全量历史。
-   * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, inTokens: number, outTokens: number, tokenSamples: number, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
+   * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, inTokens: number, outTokens: number, cacheReadTokens: number, cacheWriteTokens: number, tokenSamples: number, lifetimeInTokens: number, lifetimeOutTokens: number, lifetimeCacheReadTokens: number, lifetimeCacheWriteTokens: number, lifetimeTokenSamples: number, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
    */
   function speedStatsOf(key, window) {
     const all = speedSamples.get(key) ?? []
@@ -795,13 +795,22 @@ export function apply(ctx, config = {}) {
     // 所以另外给出「有多少条样本带 token 数」，界面据此说明覆盖范围。
     const inTok = numbers(s => s.inTokens)
     const outTok = numbers(s => s.outTokens)
-    const tokenSamples = list.filter(s => typeof s.inTokens === 'number' || typeof s.outTokens === 'number').length
+    const cacheRead = numbers(s => s.cacheReadTokens)
+    const cacheWrite = numbers(s => s.cacheWriteTokens)
+    // tokenSamples 计入任一 token 字段，避免「只报了缓存命中」的调用被算作没用量
+    const tokenSamples = list.filter(s =>
+      typeof s.inTokens === 'number' || typeof s.outTokens === 'number'
+        || typeof s.cacheReadTokens === 'number' || typeof s.cacheWriteTokens === 'number').length
     // 历史（全量）token 用量：不随日期筛选变化。看板上它是大字主值——用户要的是
     // 「这个模型一共用掉多少 token」，区间内用量只作副行参考。分母用全部样本，
     // 所以这里单独再算一遍，不能复用区间内的聚合。
     const lifetimeIn = all.map(s => s.inTokens).filter(v => typeof v === 'number').reduce((a, b) => a + b, 0)
     const lifetimeOut = all.map(s => s.outTokens).filter(v => typeof v === 'number').reduce((a, b) => a + b, 0)
-    const lifetimeTokenSamples = all.filter(s => typeof s.inTokens === 'number' || typeof s.outTokens === 'number').length
+    const lifetimeCacheRead = all.map(s => s.cacheReadTokens).filter(v => typeof v === 'number').reduce((a, b) => a + b, 0)
+    const lifetimeCacheWrite = all.map(s => s.cacheWriteTokens).filter(v => typeof v === 'number').reduce((a, b) => a + b, 0)
+    const lifetimeTokenSamples = all.filter(s =>
+      typeof s.inTokens === 'number' || typeof s.outTokens === 'number'
+        || typeof s.cacheReadTokens === 'number' || typeof s.cacheWriteTokens === 'number').length
     const pick = (arr, q) => {
       if (arr.length === 0) return null
       const sorted = [...arr].sort((a, b) => a - b)
@@ -809,8 +818,17 @@ export function apply(ctx, config = {}) {
       return Math.round(sorted[idx] * 10) / 10
     }
     let lastErrorCode = null
+    let lastErrorMessage = null
     for (let i = list.length - 1; i >= 0; i--) {
-      if (list[i].ok !== true && list[i].errorCode) { lastErrorCode = list[i].errorCode; break }
+      if (list[i].ok !== true && list[i].errorCode) {
+        lastErrorCode = list[i].errorCode
+        // 文案也跟着最近一次失败走：只有码没有文案时，鼠标放上去也看不到
+        // 「上游到底说了什么」。
+        lastErrorMessage = typeof list[i].errorMessage === 'string' && list[i].errorMessage !== ''
+          ? list[i].errorMessage
+          : null
+        break
+      }
     }
     return {
       samples: list.length,
@@ -822,12 +840,19 @@ export function apply(ctx, config = {}) {
       waitP50: pick(waits, 0.5),
       inTokens: inTok.reduce((a, b) => a + b, 0),
       outTokens: outTok.reduce((a, b) => a + b, 0),
+      // 缓存命中的输入量（billed input 的组成部分），与区间内的 inTokens 并排给出，
+      // 界面才能把「实际烧掉的输入」算全，而不是只显示未命中缓存的那部分。
+      cacheReadTokens: cacheRead.reduce((a, b) => a + b, 0),
+      cacheWriteTokens: cacheWrite.reduce((a, b) => a + b, 0),
       tokenSamples,
       lifetimeInTokens: lifetimeIn,
       lifetimeOutTokens: lifetimeOut,
+      lifetimeCacheReadTokens: lifetimeCacheRead,
+      lifetimeCacheWriteTokens: lifetimeCacheWrite,
       lifetimeTokenSamples,
       lastAt: list.length === 0 ? null : list[list.length - 1].at,
       lastErrorCode,
+      lastErrorMessage,
     }
   }
 
@@ -858,7 +883,8 @@ export function apply(ctx, config = {}) {
       if (err?.code !== CAPACITY_TIMEOUT_CODE) throw err
       recordSpeedSample(key, {
         ttftMs: null, inTokens: null, outTokens: null, speedTps: null,
-        waitMs: Date.now() - startedAt, ok: false, errorCode: CAPACITY_TIMEOUT_CODE, at: Date.now(),
+        cacheReadTokens: null, cacheWriteTokens: null,
+        waitMs: Date.now() - startedAt, ok: false, errorCode: CAPACITY_TIMEOUT_CODE, errorMessage: null, at: Date.now(),
       })
       yield { type: 'finish', reason: { kind: 'error', failure: { message: err.message, code: CAPACITY_TIMEOUT_CODE } } }
       return
@@ -868,7 +894,10 @@ export function apply(ctx, config = {}) {
     let firstTokenAt = null
     let usageOut = null
     let usageIn = null
+    let usageCacheRead = null
+    let usageCacheWrite = null
     let failureCode = null
+    let failureMessage = null
     let settledOk = false
     try {
       for await (const chunk of next()) {
@@ -879,10 +908,19 @@ export function apply(ctx, config = {}) {
         // 一次调用可能吐多条 usage（增量或最后一次汇总），取最后一条为准
         if (chunk?.type === 'usage' && typeof chunk.usage?.outputTokens === 'number') usageOut = chunk.usage.outputTokens
         if (chunk?.type === 'usage' && typeof chunk.usage?.inputTokens === 'number') usageIn = chunk.usage.inputTokens
+        // 缓存命中的 token 是**输入**的一部分：DSH 的 usage 把它们拆成
+        // cacheReadTokens / cacheWriteTokens 单独报（billed input = 三者之和，
+        // 见 packages/llm/llm/src/types.ts 的 TokenUsage 注释）。只看 inputTokens
+        // 会把命中缓存的那部分整段丢掉，看板的大字因此低估输入量。
+        if (chunk?.type === 'usage' && typeof chunk.usage?.cacheReadTokens === 'number') usageCacheRead = chunk.usage.cacheReadTokens
+        if (chunk?.type === 'usage' && typeof chunk.usage?.cacheWriteTokens === 'number') usageCacheWrite = chunk.usage.cacheWriteTokens
         if (chunk?.type === 'finish') {
           const kind = chunk.reason?.kind
           settledOk = kind !== 'error' && kind !== 'aborted'
           if (!settledOk && chunk.reason?.failure?.code) failureCode = String(chunk.reason.failure.code)
+          // 完整报错文案：错误码只说「哪一类错」，排查要靠文案（上游说了什么、
+          // 请求被哪一环拒了）。截断到 400 字，与当日失败记录同口径。
+          if (!settledOk && chunk.reason?.failure?.message) failureMessage = String(chunk.reason.failure.message).slice(0, 400)
         }
         yield chunk
       }
@@ -900,10 +938,13 @@ export function apply(ctx, config = {}) {
         ttftMs,
         inTokens: usageIn,
         outTokens: usageOut,
+        cacheReadTokens: usageCacheRead,
+        cacheWriteTokens: usageCacheWrite,
         speedTps,
         waitMs,
         ok: settledOk,
         errorCode: settledOk ? null : (failureCode ?? 'STREAM_ABORTED'),
+        errorMessage: settledOk ? null : failureMessage,
         at: endedAt,
       })
     }
@@ -2166,6 +2207,14 @@ export function apply(ctx, config = {}) {
   // next-turn 消息正是这个作用，且它是 durable 的（agent/inbox/spliced）。
   const disposeError = ctx.on('agent/request-error', async ({ agent, turn, provider: eventProvider, failure }, next) => {
     // 内层先决定：任何重试策略表态重试，就尊重它（这才是“重试都完成之后”）
+    //
+    // 内层不表态时 next() 返回 undefined，这有两种含义，处置必须区分：
+    //  · 内层确实处理完了、只是没有「重试」这个动作 → 轮到我们接手；
+    //  · 内层**短路**了整条链（不调 next() 就返回）→ 我们根本不会被调用到。
+    // 第二种是「配置了路由却报错不自动路由」最常见的成因：任何 prepend 在更外层、
+    // 又不肯放行的监听器（典型是重试插件「预算耗尽就抛出去」）都会把本插件整条跳过。
+    // 所以这里不靠「自己最外层」这个前提：本插件同时守着 agent/error 那条入口，
+    // 那边对「同一个 turn 尚未处置过」的失败一定会补一次路由（见 disposeAgentError）。
     const action = await next()
     if (action?.kind === 'retry') { noteFailure(agent, eventProvider, failure, 'inner-retry'); return action }
     if (disposed || !agent || !agent.session) return action
@@ -2368,6 +2417,11 @@ export function apply(ctx, config = {}) {
 
   /**
    * 给一次待续跑装上兜底闹钟（同一个会话只装一个）。
+   *
+   * 闹钟只负责「到点还没投递就再试一次」，不是一次性判定：投递失败（agent 还在跑、
+   * followup 抛错）时消息必须**留在** pendingContinuations 里再挂一次闹钟，否则
+   * 用户看到的就是「模型换了，然后就没有然后了」——那次续跑就此丢失。
+   *
    * @param {string} sessionId - 待续跑的会话。
    * @returns {void}
    */
@@ -2378,7 +2432,11 @@ export function apply(ctx, config = {}) {
       if (disposed) return
       const pending = pendingContinuations.get(sessionId)
       if (!pending) return
-      if (pending.agent?.status !== 'idle') return
+      if (pending.agent?.status !== 'idle') {
+        // 还在跑：那条 idle 边沿迟早会来，重新挂上闹钟，别让这次续跑就此消失。
+        armContinuationFailsafe(sessionId)
+        return
+      }
       ctx.logger.warn(`[model-failover] ${sessionId} 的续跑等了 ${CONTINUATION_FAILSAFE_MS / 1000}s 还没等到 idle 边沿，补投一次`)
       deliverContinuation(sessionId)
     }, CONTINUATION_FAILSAFE_MS)
@@ -2439,30 +2497,42 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * 投递一条待续跑消息；只在 agent 空闲时执行，失败即放弃并留日志。
+   * 投递一条待续跑消息；只在 agent 空闲时执行。
+   *
+   * 投递失败（followup 抛错）时**保留**待续跑条目并重新挂上兜底闹钟：续跑消息是
+   * 「模型换了之后让会话接着干」的唯一载体，丢掉它等于这次切换只剩半截（模型换了，
+   * 会话却停在原地）。原来的实现是先 delete 再投递，followup 一抛错这条续跑就永久
+   * 消失了——状态日志里只会看到 scheduled 而没有 delivered。
+   *
    * @param {string} sessionId - 待续跑的会话。
+   * @returns {void}
    */
   function deliverContinuation(sessionId) {
     const pending = pendingContinuations.get(sessionId)
     if (!pending) return
-    pendingContinuations.delete(sessionId)
-    clearContinuationFailsafe(sessionId)
     if (disposed) {
+      pendingContinuations.delete(sessionId)
+      clearContinuationFailsafe(sessionId)
       // 卸载时丢掉也必须留痕：状态日志里只有 scheduled 没有 delivered，
       // 排查「模型换了却没续跑」时才看得出是断在这里。
       logStatus('continuation/dropped', sessionId, null)
       return
     }
-    logStatus('continuation/delivered', sessionId, null)
     // 先恢复 goal 再投递：goal-round-driver 在 agent 回到 idle 时，如果发现本轮的
     // 预留消息还在队列里且 goal 仍 armed，会主动 pause 它。所以必须在 followup 之前
     // 把 activation 恢复回来，否则用户会看到目标被这次切换「暂停」。
     reviveGoalAfterSwitch(pending.agent, pending.goalRevival)
     try {
       pending.agent.followup(createContinuationMessage(pending.fromProvider, pending.fromModel, pending.target))
+      pendingContinuations.delete(sessionId)
+      clearContinuationFailsafe(sessionId)
+      logStatus('continuation/delivered', sessionId, null)
       ctx.logger.info(`[model-failover] ${sessionId} 已排队续跑（${pending.target.provider}/${pending.target.model}）`)
     } catch (e) {
-      ctx.logger.warn(`[model-failover] ${sessionId} 排队续跑失败：${e?.message || e}`)
+      // 投递失败：条目留在原地，兜底闹钟重新挂上，等下一个窗口再试。
+      armContinuationFailsafe(sessionId)
+      logStatus('continuation/failed', sessionId, null, { error: String(e?.message || e) })
+      ctx.logger.warn(`[model-failover] ${sessionId} 排队续跑失败：${e?.message || e}；已保留待续跑，稍后重试`)
     }
   }
 
@@ -2580,7 +2650,7 @@ export function apply(ctx, config = {}) {
     let llm
     try { llm = ctx.get('llm') } catch { /* 下面统一报错 */ }
     if (!llm || typeof llm.stream !== 'function') {
-      return { ...base, ok: false, ttftMs: null, tps: null, inTokens: null, outTokens: null, errorCode: 'NO_LLM_SERVICE', error: 'llm 服务不可用' }
+      return { ...base, ok: false, ttftMs: null, tps: null, inTokens: null, outTokens: null, cacheReadTokens: null, cacheWriteTokens: null, errorCode: 'NO_LLM_SERVICE', error: 'llm 服务不可用' }
     }
     const controller = new AbortController()
     const onOuterAbort = () => controller.abort()
@@ -2590,6 +2660,8 @@ export function apply(ctx, config = {}) {
     let firstAt = null
     let usageIn = null
     let usageOut = null
+    let usageCacheRead = null
+    let usageCacheWrite = null
     let finish = null
     let thrown = null
     try {
@@ -2610,6 +2682,8 @@ export function apply(ctx, config = {}) {
         if (chunk?.type === 'usage') {
           if (typeof chunk.usage?.inputTokens === 'number') usageIn = chunk.usage.inputTokens
           if (typeof chunk.usage?.outputTokens === 'number') usageOut = chunk.usage.outputTokens
+          if (typeof chunk.usage?.cacheReadTokens === 'number') usageCacheRead = chunk.usage.cacheReadTokens
+          if (typeof chunk.usage?.cacheWriteTokens === 'number') usageCacheWrite = chunk.usage.cacheWriteTokens
         }
         if (chunk?.type === 'finish') finish = chunk.reason
       }
@@ -2638,6 +2712,8 @@ export function apply(ctx, config = {}) {
       tps,
       inTokens: usageIn,
       outTokens: usageOut,
+      cacheReadTokens: usageCacheRead,
+      cacheWriteTokens: usageCacheWrite,
       elapsedMs,
       errorCode: ok ? null : (errorCode ?? 'ERROR'),
       error: ok ? null : String(failure?.message ?? thrown?.message ?? (controller.signal.aborted ? '测速超时' : '测速失败')).slice(0, 200),
