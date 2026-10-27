@@ -3,3 +3,5 @@ node_modules/
 *.tgz
 .DS_Store
 Thumbs.db
+# 热重载用的一次性宿主副本：内容与 host.mjs 相同，只是换个文件名让 ESM 重新求值
+host.v*.mjs

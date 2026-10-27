@@ -78,7 +78,7 @@ import { pathToFileURL } from 'node:url'
 // 而监听端口与 prototype 补丁由 shim 的 globalThis 槽跨重载保持。
 const QODER_SHIM_MODULE = './qoder-compress-shim.mjs'
 /** shim 构建号：每次改动 qoder-compress-shim.mjs 就把它 +1，否则 ESM 仍用缓存的旧模块。 */
-const QODER_SHIM_BUILD = '58'
+const QODER_SHIM_BUILD = '62'
 /** shim 只换得掉这两家的加密端点（QoderEncryptedInfer#prepareInfer 的使用者）。 */
 const QODER_SHIM_PROVIDERS = new Set(['qoder', 'qodercn'])
 
@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v75'
+const HOST_VERSION = 'v79'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -1975,6 +1975,12 @@ export function apply(ctx, config = {}) {
    * 压缩 shim 此刻是否接管了该 provider（见 qoder-compress-shim.mjs：它换掉
    * QoderEncryptedInfer#prepareInfer，把加密请求改成明文 OpenAI 先过 bili）。
    *
+   * 判据是 shim 的 `effective`（真的接管了运行时在用的加密器），不是 `installed`
+   * （只是把补丁挂上了）。磁盘上 dsh-codearts-auth 那份 qoder-wasm.js 在本部署里不被
+   * 加载，给它打补丁不改变任何请求；只有 pack.js 暴露的那份才算数。按 installed 判
+   * 会让守卫在「补丁挂上了但一个请求都没经过它」时宣布正常，2026-10-26 就是这样静默
+   * 失效的。
+   *
    * @param {string} provider - provider id。
    * @returns {boolean} 已接管则为 true。
    */
@@ -1983,7 +1989,7 @@ export function apply(ctx, config = {}) {
     if (qoderShimHandle === null) return false
     try {
       const st = qoderShimHandle.status()
-      return st !== null && st.installed === true
+      return st !== null && st.effective === true
     } catch {
       return false
     }
@@ -2050,6 +2056,8 @@ export function apply(ctx, config = {}) {
       uncompressedProviders: [...uncompressedProviders],
       // 已被压缩 shim 改道、因此不算旁路的 provider（此时路由不会再降级它们）
       shimCovered: [...QODER_SHIM_PROVIDERS].filter((id) => uncompressedProviders.has(id) && qoderShimCovers(id)),
+      // shim 挂上了补丁但还没接管运行时（多半是注入口写进文件后宿主没重启）
+      shimPending: [...QODER_SHIM_PROVIDERS].filter((id) => uncompressedProviders.has(id) && !qoderShimCovers(id)),
       downgradedModels: downgradedModels.slice(0, 50),
       degradedSessions,
       lastDiagnosis: lastCompressionDiagnosis,

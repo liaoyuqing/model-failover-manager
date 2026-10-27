@@ -23,6 +23,19 @@ const PENDING_TTL_MS = 120_000
 const PENDING_MAX = 256
 
 /**
+ * 认领注入口时的固定 label。
+ *
+ * 注入口（pack.js 里的 `globalThis.__mfQoderEncryptor = QoderEncryptedInfer`）要等
+ * dsh-our-free-model 的 pack 真正 apply 之后才存在，而本插件的 apply 可能更早 ——
+ * 宿主冷启动就是这个顺序。一次性读取会把「还没到」误判成「没有」，于是 shim 一直
+ * 不接管、qoder 全量上下文直发。所以认领要可重试。
+ */
+const ADOPT_LABEL = 'pack:__mfQoderEncryptor'
+/** 认领重试：1.5s 一拍，最多 400 拍（约 10 分钟），够 cover 宿主冷启动与手动重载。 */
+const ADOPT_INTERVAL_MS = 1500
+const ADOPT_MAX_TICKS = 400
+
+/**
  * 把 adapter 的 ask 折成 OpenAI chat body（交给 bili 压缩的形状）。
  *
  * ask.history 本身就是 OpenAI 形状的 messages（role/content/tool_calls/tool_call_id），
@@ -266,16 +279,40 @@ function ensurePackHook(packPath) {
 }
 
 /**
- * 找出 dsh-our-free-model 的 pack.js。与 resolveQoderWasmPath 同样从本文件向上找。
+ * 找出所有 dsh-our-free-model 的 pack.js 拷贝。
  *
- * @returns pack.js 绝对路径，或 null
+ * ⚠️ 只找 <home>/plugins/dsh-our-free-model 是不够的：profile 把该插件作为
+ * `github:` 依赖装进 `<home>/profiles/<name>/node_modules`，宿主真正 import 的是
+ * 那一份。2026-10-27 实测：plugins/ 那份带着注入口、profiles/web 那份没有，
+ * 于是本函数报告「注入口已在」而运行中的加密器根本没被暴露，压缩静默失效。
+ *
+ * 两份都可能是「正在加载的那份」，所以全部返回、全部核对。
+ *
+ * @returns {{path: string, scope: string}[]} pack.js 绝对路径列表（可能为空）
  */
-function resolvePackPath() {
-  for (let dir = HERE, i = 0; i < 5 && dir.length > 3; i += 1, dir = dirname(dir)) {
-    const candidate = join(dir, 'plugins', 'dsh-our-free-model', 'vendor', 'channel-pack', 'pack.js')
-    if (existsSync(candidate)) return candidate
+function resolvePackPaths() {
+  const found = []
+  const seen = new Set()
+  const push = (path, scope) => {
+    if (!existsSync(path)) return
+    let real = path
+    try { real = realpathSync(path) } catch { /* 用原路径 */ }
+    if (seen.has(real)) return
+    seen.add(real)
+    found.push({ path: real, scope })
   }
-  return null
+  for (let dir = HERE, i = 0; i < 5 && dir.length > 3; i += 1, dir = dirname(dir)) {
+    push(join(dir, 'plugins', 'dsh-our-free-model', 'vendor', 'channel-pack', 'pack.js'), 'plugins')
+    const profiles = join(dir, 'profiles')
+    if (!existsSync(profiles)) continue
+    let entries = []
+    try { entries = readdirSync(profiles, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      push(join(profiles, entry.name, 'node_modules', 'dsh-our-free-model', 'vendor', 'channel-pack', 'pack.js'), 'profile:' + entry.name)
+    }
+  }
+  return found
 }
 const STOP_GRACE_MS = 2000
 
@@ -320,7 +357,9 @@ async function collectTargets(ctx, wasmPath) {
       try {
         const mod = await import(url)
         const Cls = mod.QoderEncryptedInfer
-        if (typeof Cls === 'function') push('wasm:' + url.slice(-40), Cls.prototype)
+        // label 必须唯一：盘符大小写会分裂成两个 ESM 实例（实测 Node 22/Windows），
+        // 两者尾部 40 字符完全相同，用尾部当 label 会让第二个被当成第一个而漏打补丁。
+        if (typeof Cls === 'function') push('wasm:' + url, Cls.prototype)
       } catch (err) {
         notes.push('载入失败 ' + url.slice(-40) + ' :: ' + (err && err.code ? err.code : String(err)))
       }
@@ -365,7 +404,9 @@ async function collectTargets(ctx, wasmPath) {
 function createImpl(context) {
   const origin = 'http://127.0.0.1:' + context.port
   const stats = context.stats
-  const pending = new Map()
+  // 热替换时沿用上一轮的 pending 表：在途请求的 rid 是上一轮 prepare 注册的，
+  // 换一张空表会让它们全部命中 410。
+  const pending = context.pending instanceof Map ? context.pending : new Map()
 
   const sweep = () => {
     const now = Date.now()
@@ -497,6 +538,20 @@ function createImpl(context) {
         // 但条数与正文长度不变 —— 那不是压缩，看 diff 就能分辨。
         diff: messages === null ? [] : diffMessages(entry.sentList, messages).slice(0, 8),
       }
+      // 诊断环：只留最近几次交换的规模与结果。lastExchange 只保留最后一条，
+      // 而一次探针会打出多次重试，单看最后一条无法判断「大请求到底进没进来」。
+      if (!Array.isArray(stats.recentExchanges)) stats.recentExchanges = []
+      stats.recentExchanges.push({
+        at: Date.now(),
+        rid,
+        beforeCount: entry.sentMessages,
+        afterCount: gotCount,
+        beforeContent: entry.sentContent,
+        afterContent: gotContent,
+        shrank,
+        msgs: entry.sentMessages,
+      })
+      if (stats.recentExchanges.length > 6) stats.recentExchanges.splice(0, stats.recentExchanges.length - 6)
       const nextAsk = body === null ? null : applyCompressedBody(entry.ask, body)
       let real = null
       try {
@@ -514,7 +569,7 @@ function createImpl(context) {
     })
   }
 
-  return { origin, prepare, handle }
+  return { origin, prepare, handle, pending }
 }
 
 
@@ -571,7 +626,7 @@ export async function startQoderShim(options) {
   const logger = opts.logger
   const port = Number.isInteger(opts.port) && opts.port > 0 && opts.port < 65536 ? opts.port : 47001
   const wasmPath = resolveQoderWasmPath(opts.wasmPath)
-  const info = (text) => { if (logger !== undefined && typeof logger.info === 'function') logger.info(text) }
+  const info = (text) => { if (logger !== undefined && logger !== null && typeof logger.info === 'function') logger.info(text) }
 
   const inert = (reason) => {
     const stats = {
@@ -586,19 +641,62 @@ export async function startQoderShim(options) {
 
   // 内联打包那份加密器只能靠 pack.js 里的注入口拿到。那个包会被它自己的自更新
   // 整份替换，钩子随之消失，所以每次装载都核对一次并在缺失时补回去。
-  let hookRepair = { state: 'n/a', detail: '无需注入口' }
-  const needsHook = (() => {
-    try { return typeof globalThis.__mfQoderEncryptor !== 'function' } catch { return true }
-  })()
-  if (needsHook) {
-    const packPath = resolvePackPath()
-    hookRepair = packPath === null
-      ? { state: 'skipped', detail: '没找到 dsh-our-free-model/vendor/channel-pack/pack.js' }
-      : ensurePackHook(packPath)
+  //
+  // 磁盘上可能同时存在多份 pack.js（plugins/ 的开发副本 + profiles/<name>/node_modules
+  // 的实际安装副本），宿主只 import 其中一份，所以全部核对：任何一份缺注入口，
+  // 都可能在下次宿主重启后才轮到它生效。
+  const hookChecks = []
+  {
+    const packs = resolvePackPaths()
+    if (packs.length === 0) {
+      hookChecks.push({ scope: '-', state: 'skipped', detail: '没找到 dsh-our-free-model/vendor/channel-pack/pack.js' })
+    } else {
+      for (const p of packs) {
+        const result = ensurePackHook(p.path)
+        hookChecks.push({ scope: p.scope, path: p.path, ...result })
+      }
+    }
   }
+  /** 取最严重的状态作为对外结论：repaired/failed 优先于 ok，ok 优先于 skipped。 */
+  const worst = (() => {
+    const rank = { failed: 5, 'pending-restart': 4, repaired: 3, stale: 2, skipped: 1, ok: 0 }
+    let pick = hookChecks[0]
+    for (const c of hookChecks) {
+      if ((rank[c.state] ?? 0) > (rank[pick.state] ?? 0)) pick = c
+    }
+    return pick
+  })()
+  const hookRepair = {
+    state: hookChecks.length === 1 ? hookChecks[0].state : worst.state,
+    detail: hookChecks.map((c) => c.scope + ': ' + c.detail).join('；'),
+    copies: hookChecks.map((c) => ({ scope: c.scope, state: c.state })),
+  }
+  /**
+   * 注入口写进文件，不等于当前进程已经执行过它：宿主启动时 import 过 pack.js，
+   * 内存里那份模块是**改动前**求值的，globalThis 上仍是 undefined。2026-10-26 的
+   * 事故就是这样：文件里的钩子被 profile 重装整份换掉，而 /status 只核对文件、
+   * 报「ok」，于是静默失效。所以这里必须再问一次进程自己拿没拿到那个类。
+   */
+  /**
+   * 读一次进程里的注入口对象。
+   *
+   * 注入口由 dsh-our-free-model 的 pack 在 **它自己 apply 的时候**写入，而本插件可能
+   * 更早 apply（宿主冷启动就是这个顺序）。所以「读不到」有两种完全不同的含义：
+   * 还没到，或者永远不会有。这里只回答「现在有没有」，由调用方决定要不要等。
+   *
+   * @returns 暴露出来的类，或 null
+   */
+  const readLiveEncryptor = () => {
+    try {
+      const value = globalThis.__mfQoderEncryptor
+      return typeof value === 'function' && value.prototype !== undefined ? value : null
+    } catch { return null }
+  }
+  /** 注入口还有可能在未来出现（文件里有、只是 pack 还没 apply）。 */
+  const hookPossible = hookChecks.some((c) => c.state === 'ok' || c.state === 'repaired' || c.state === 'stale')
 
   const collected = await collectTargets(ctx, wasmPath)
-  if (collected.targets.length === 0) {
+  if (collected.targets.length === 0 && !hookPossible) {
     return inert('找不到可打补丁的 QoderEncryptedInfer' + (collected.notes.length > 0 ? '：' + collected.notes.join('; ') : ''))
   }
 
@@ -611,6 +709,10 @@ export async function startQoderShim(options) {
         lastError: null, lastAt: null, targets: [], seenRequests: 0, portals: 0,
       }
   if (typeof stats.folded !== 'number') stats.folded = 0
+  // 上表中没有的计数字段（新增字段时旧 stats 对象会缺）补零，避免 /status 出现 undefined。
+  for (const key of ['intercepted', 'forwarded', 'compacted', 'seenRequests', 'portals']) {
+    if (typeof stats[key] !== 'number') stats[key] = 0
+  }
   stats.enabled = true
   stats.installed = true
   stats.port = port
@@ -618,8 +720,8 @@ export async function startQoderShim(options) {
   stats.targets = collected.targets.map((t) => t.label)
   stats.notes = collected.notes
   stats.hookRepair = hookRepair
-
-  const impl = createImpl({ port, stats })
+  // 沿用上一轮的 pending：在途请求的 rid 属于上一轮的 prepare。
+  const impl = createImpl({ port, stats, pending: previous !== undefined && previous.impl !== undefined ? previous.impl.pending : null })
 
   /**
    * 装 dispatcher（幂等）。dispatcher 不随重载更换：它只读全局状态槽，重载时换掉
@@ -637,27 +739,101 @@ export async function startQoderShim(options) {
   }
 
   const patched = previous !== undefined && Array.isArray(previous.patched) ? previous.patched : []
-  for (const t of collected.targets) {
-    const existing = patched.find((p) => p.label === t.label)
+
+  /**
+   * 把一个目标挂上 dispatcher。重复调用安全：同一个 label 只保留一条记录。
+   *
+   * @param label 唯一标识这个 holder（见 collectTargets 的 label 约定）
+   * @param holder 承载 prepareInfer 的原型对象
+   * @param original 别人实现的 prepareInfer
+   */
+  const patchTarget = (label, holder, original) => {
+    const existing = patched.find((p) => p.label === label)
     if (existing === undefined) {
-      const entry = { label: t.label, holder: t.holder, box: { original: t.original }, fn: undefined }
+      const entry = { label, holder, box: { original }, fn: undefined }
       ensureDispatcher(entry)
       patched.push(entry)
-    } else {
-      existing.holder = t.holder
-      existing.box.original = t.original
-      ensureDispatcher(existing)
+      return
     }
+    existing.holder = holder
+    // ⚠️ 重载时 holder.prepareInfer 已经是本模块装的 dispatcher，把它当「原始实现」
+    // 会让 handle 里的重新加密再次走进 dispatcher —— 请求自己转发给自己，计数暴涨
+    // 且最终 502。只有拿到的确实是别人实现的函数时才更新 box.original。
+    if (original !== existing.fn) existing.box.original = original
+    ensureDispatcher(existing)
+  }
+  for (const t of collected.targets) patchTarget(t.label, t.holder, t.original)
+
+  /**
+   * 认领运行时真正在用的加密器（pack.js 内联那份），成功即打上补丁。
+   *
+   * pack 的 apply 与「本插件 apply」没有顺序保证：宿主冷启动时本插件先 apply，
+   * 那时注入口还不存在。所以这里既做首次尝试，也作为重试定时器的回调 —— 只在
+   * 还没认领到的时候继续试，认领成功后不再消耗任何资源。
+   *
+   * @returns 本次是否认领成功（此前已认领也算成功）
+   */
+  const adoptRuntimeEncryptor = () => {
+    if (stats.effective === true) return true
+    const Cls = readLiveEncryptor()
+    if (Cls === null) return false
+    patchTarget(ADOPT_LABEL, Cls.prototype, Cls.prototype.prepareInfer)
+    const labels = new Set(patched.map((p) => p.label))
+    stats.targets = [...labels]
+    stats.effective = true
+    stats.adoptedAt = new Date().toISOString()
+    stats.notes = collected.notes
+    info('[model-failover] qoder 压缩 shim 已认领运行时加密器（pack:__mfQoderEncryptor），此后 qoder 请求走「明文进 bili → 压缩 → 再加密发上游」')
+    return true
+  }
+  adoptRuntimeEncryptor()
+  if (stats.effective !== true) {
+    stats.effective = false
+    stats.notes = [
+      ...collected.notes,
+      '还没认领到运行时加密器（globalThis.__mfQoderEncryptor 为空）：dsh-our-free-model 的 pack 尚未 apply，本 shim 会继续重试认领',
+    ]
   }
 
   // 无论有没有打到类，都给真实 adapter 装传送门（诊断 + 覆盖率证明）。
   const portals = installPortals(collected.adapters, stats)
 
+  /**
+   * 认领定时器跨重载共用一份：热替换只换回调，不叠加定时器。
+   *
+   * 只在「注入口有可能出现、但此刻还没有」时启动；认领成功或插件卸载即自我注销。
+   * unref 让它不拖住进程退出。
+   */
+  const retry = previous !== undefined && previous.retry !== undefined
+    ? previous.retry
+    : { fn: null, timer: null, ticks: 0 }
+  retry.fn = adoptRuntimeEncryptor
+  stats.adoptTicks = retry.ticks
+  if (stats.effective !== true && hookPossible && retry.timer === null && typeof setInterval === 'function') {
+    retry.timer = setInterval(() => {
+      retry.ticks += 1
+      stats.adoptTicks = retry.ticks
+      const slot = globalThis[STATE_KEY]
+      if (slot === undefined || retry.fn === null || retry.ticks > ADOPT_MAX_TICKS) {
+        clearInterval(retry.timer)
+        retry.timer = null
+        return
+      }
+      // 只换 impl 的话，这里可能仍是旧模块的回调；旧的也能用（认领逻辑与模块版本无关）
+      if (retry.fn()) {
+        clearInterval(retry.timer)
+        retry.timer = null
+      }
+    }, ADOPT_INTERVAL_MS)
+    if (typeof retry.timer.unref === 'function') retry.timer.unref()
+  }
+
   if (previous !== undefined && previous.port === port && previous.server !== undefined) {
     previous.impl = impl
     previous.patched = patched
+    previous.retry = retry
     info('[model-failover] qoder 压缩 shim 已热替换实现（继续复用 127.0.0.1:' + port + '，覆盖 ' + patched.length + ' 个目标）')
-    return { status: () => ({ ...stats }), stop: previous.stop }
+    return { status: () => ({ ...stats, liveSeen: readLiveEncryptor() !== null }), stop: previous.stop }
   }
   if (previous !== undefined) await previous.stop()
 
@@ -672,6 +848,10 @@ export async function startQoderShim(options) {
   const stop = async () => {
     if (stopped) return
     stopped = true
+    if (retry.timer !== null) {
+      try { clearInterval(retry.timer) } catch { /* 已停 */ }
+      retry.timer = null
+    }
     for (const p of patched) {
       try { if (p.holder !== undefined && p.holder.prepareInfer === p.fn) p.holder.prepareInfer = p.box.original } catch { /* 还原失败不影响进程退出 */ }
     }
@@ -695,8 +875,13 @@ export async function startQoderShim(options) {
   }
 
   await new Promise((done) => { server.listen(port, '127.0.0.1', done) })
-  globalThis[STATE_KEY] = { port, wasmPath, stats, impl, patched, portals, server, stop }
+  globalThis[STATE_KEY] = { port, wasmPath, stats, impl, patched, portals, retry, server, stop }
   info('[model-failover] qoder 压缩 shim 已监听 127.0.0.1:' + port + '（明文经 bili 压缩后再加密发往上游；覆盖 ' + patched.length + ' 个目标：' + stats.targets.join(', ') + '）')
 
-  return { status: () => ({ ...stats }), stop }
+  /**
+   * 句柄。status() 里的 liveSeen 是**实时**读的：stats.effective 只在认领那一刻写一次，
+   * 而注入口可能在本插件 apply 之后才由 pack 写好，两者不一致时 liveSeen 能说明到底是
+   * 「进程里没有」还是「有但没认领」。
+   */
+  return { status: () => ({ ...stats, liveSeen: readLiveEncryptor() !== null }), stop }
 }

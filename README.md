@@ -67,6 +67,13 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
    - 这类失败重试没有意义、换模型才有意义；换到哪个由分组路由决定，诊断不改变切换路径。
 3. **判定 bili 是否在压缩**：只读全局量 `__BILI_DSH_COMPACTION_VERDICT__`，值为 `'active'` 才算在压缩。它由 bili 在 dsh-native 的 `apply(ctx)` 里、`plan.mode !== 'off'` 时无条件置位——只要 bili 原生通道启用就是 `active`，不需要压缩代理真的连上，也不依赖端口、鉴权与网络；`bili-compaction-gate` 读的是同一个量，两边判定不会分叉。bili 没启用时宿主自带压缩还在跑，这些 provider 照常有压缩。
 
+「压缩旁路」要四个条件同时成立：`compactionGuard` 开着、provider 在 `uncompressedProviders` 名单里、bili 此刻在压缩，**并且** shim 没有接管它。前三条缺一条都不算；shim 装上之后 qoder/qodercn 的请求已经以明文进 bili，压缩照常发生，因此它们自动退出这份名单、路由也不再被降级。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `compactionGuard` | `true` | 总开关。关掉后名单内的 provider 恢复原优先级参与路由，失败也不再打压缩旁路诊断 |
+| `uncompressedProviders` | `["qoder", "qodercn"]` | 声明哪些 provider 的端点注定绕过 bili 压缩。写成 `[]` 表示一个都不声明，效果等同于关掉守卫 |
+
 ### qoder 压缩 shim
 
 上面的「路由降级」只是避让；真正的解法是把 qoder 的请求改成 bili 认识的协议跑一趟：**明文进 bili，压缩完再还原成 qoder 的加密 wire**。落地成两段：
@@ -101,22 +108,51 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 装不上（模块缺失、导出对不上、端口占用）只告警并自动退回直发，不会阻断插件启动；原因写在 `/status.qoderShim.lastError` 里。
 
+#### 「装上了」和「真的接管了」是两件事
+
+`installed` 只说补丁挂到了某个原型上；真正决定 qoder 有没有压缩的是 `effective`——**补丁挂到了运行时此刻在用的那份加密器**。这两个值分开，是因为踩过一次很难查的坑：
+
+`dsh-our-free-model` 挂 `pack.js` 用的是 `ctx.inject(['credentials','commands','llm'])` 的 scoped fiber，**比本插件 apply 更晚**。shim 早期只在启动时读一次 `globalThis.__mfQoderEncryptor`，读到空就永久放弃，于是 `installed:true`、`hookRepair.state:'ok'`、守卫也认为 qoder 已被覆盖，而实际一个请求都没改道——状态全绿、压缩为零。现在改成**持续认领**：读不到就每 1.5 秒再读（最多约 10 分钟，`unref` 定时器，不挡进程退出），认领到就现场打补丁、把 `effective` 置 `true` 并记 `adoptedAt`。`/status.qoderShim.adoptTicks` 是已经重试过多少拍。
+
+因此：
+
+| 字段 | 含义 |
+| --- | --- |
+| `effective` | shim 是否已经接管运行时在用的加密器。**守卫与路由只看这个** |
+| `liveSeen` | 此刻实时读 `globalThis.__mfQoderEncryptor` 有没有值（`effective` 是认领那一刻的快照） |
+| `hookRepair.state` | `ok` 已在 / `repaired` 刚补回（下次宿主启动生效）/ `stale` 钩子在但不指向这个类 / `skipped` 定位不到不敢动 / `failed` 写不进去 / `pending-restart` 文件里有、当前进程还没执行到 |
+
+`pending-restart` 就是上面那个坑的显式化：文件侧完好、进程侧还没拿到类。它不是"正常"，只是"再等一会儿或重启就会好"。
+
 两处细节值得知道：
 
 - **shim 自己也能热更新**：监听端口与 prototype 补丁放在进程级 `globalThis` 槽里，宿主用带构建号的动态 `import` 装载模块。改完 shim 代码后重载插件，同端口再装一次只更换「请求处理实现」，服务器与既有 keep-alive 连接都不重建，因此不会打断进行中的请求。
 - **`rid` 不会用完即删**：adapter 遇到 409 `duplicate_request`、或排队（`model_queued`）之后会原样重发同一个请求，那时 `rid` 必须还能命中，否则重发会变成 410。条目只按 TTL（120 秒）与容量（256 条）淘汰。
 
-「压缩旁路」要四个条件同时成立：`compactionGuard` 开着、provider 在 `uncompressedProviders` 名单里、bili 此刻在压缩，**并且** shim 没有接管它。前三条缺一条都不算；shim 装上之后 qoder/qodercn 的请求已经以明文进 bili，压缩照常发生，因此它们自动退出这份名单、路由也不再被降级。
+#### 怎么确认它真的在压缩
 
-两个配置项：
+压缩不是每轮都发生，bili 有两个前提，实测确认过：
 
-| 键 | 默认 | 说明 |
-| --- | --- | --- |
-| `compactionGuard` | `true` | 总开关。关掉后名单内的 provider 恢复原优先级参与路由，失败也不再打压缩旁路诊断 |
-| `uncompressedProviders` | `["qoder", "qodercn"]` | 声明哪些 provider 的端点注定绕过 bili 压缩。写成 `[]` 表示一个都不声明，效果等同于关掉守卫 |
-| `qoderShim` | `false` | 打开 qoder 压缩 shim：明文进 bili、压缩后重新加密出上游。见「qoder 压缩 shim」 |
-| `qoderShimPort` | `47001` | shim 监听端口，只绑 `127.0.0.1` |
-| `qoderShimWasmPath` | 自动探测 | 显式指定 `qoder-wasm.js` 绝对路径 |
+1. **这条请求得进 bili 的 main 车道**。bili 把 `max_tokens` 在 `(0, 200]` 且没有 request agent 的请求判为 side request（`SIDE_REQUEST_MAX_TOKENS=200`），side 车道 **bypass 压缩**、超过窗口直接 413。正常对话的 `max_tokens` 远大于 200，所以真实会话不受影响；写探针时要把 `maxTokens` 设到 201 以上，否则会看到"body 逐字节不变"的假象。
+2. **得跨过触发线**。默认 `nudge.maxContextLimitPct = 0.75`：正文用量越过模型窗口的 75% 才开始压。实测同一会话内 60 轮 × 6000 字符，前 40 轮 `folded` 不动，第 50 轮起开始压（正文 360266 → 250945，净减 109321 字符）。
+
+取证只看两个字段，不要看 `compacted`：
+
+- `/status.qoderShim.folded`：正文真的变短的次数。
+- `/status.qoderShim.lastExchange.contentShrank` 与 `beforeContent` / `afterContent`：最近一次往返的正文净长度对照。
+
+`compacted` 会把 bili 往 system 里注入前言也算作"变了"，所以它涨了不等于压了。这也是 `folded` 单独存在的理由。
+
+**别只看 `lastExchange` 下结论。** adapter 的重试循环会让一次调用打出好几次往返，`lastExchange` 只留最后一条，被后面那次覆盖掉的往往才是大请求。诊断时看 `recentExchanges`（最近 6 次往返的规模与结果）：`folded` 为 0 而 `recentExchanges` 里全是 `shrank: true`，说明压缩在发生、只是最后一次是小请求。
+
+一次实测（`qodercn/dfmodel`，60 轮 × 20000 字符的合成请求）：
+
+```
+recentExchanges[].{beforeCount:66, afterCount:67, beforeContent:390286, afterContent:271485, shrank:true}
+lastExchange.diff[1] = {kind:"shrunk", role:"user", beforeLen:6003, afterLen:4108, delta:-1895}
+```
+
+条数没变、正文少了 30%，逐条看是每条消息被换成了带 `<acp tokens="1.5K">m0000N</acp>` 表头的摘要块——这就是 bili 的压缩。
 
 ### 在 `/status` 里看
 
@@ -145,12 +181,18 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ```json
 "qoderShim": {
-  "enabled": true, "installed": true, "port": 47001,
-  "wasmPath": "…/dsh-codearts-auth/lib/qoder-wasm.js",
+  "enabled": true, "installed": true, "effective": true, "liveSeen": true,
+  "port": 47001, "wasmPath": "…/dsh-codearts-auth/lib/qoder-wasm.js",
   "targets": ["wasm:…qoder-wasm.js", "wasm:…qoder-wasm.js", "pack:__mfQoderEncryptor"],
   "intercepted": 12, "forwarded": 12, "compacted": 12, "folded": 4, "fallback": 0,
-  "hookRepair": { "state": "ok", "detail": "注入口已在" },
+  "adoptTicks": 0, "adoptedAt": "2026-10-27T11:05:12.000Z",
+  "hookRepair": { "state": "ok", "detail": "注入口已在",
+                  "copies": [{ "scope": "plugins", "state": "ok" },
+                             { "scope": "profile:web", "state": "ok" }] },
   "portals": 2, "seenRequests": 12,
+  "recentExchanges": [
+    { "beforeCount": 66, "afterCount": 67, "beforeContent": 390286, "afterContent": 271485, "shrank": true }
+  ],
   "lastExchange": {
     "beforeCount": 1045, "afterCount": 302,
     "beforeContent": 1209786, "afterContent": 337396,
@@ -164,10 +206,12 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - `compacted`：回来的 `messages` 与发出去的不一样（含 bili 注入系统提示）的次数。
 - `folded`：**其中正文真的变短**的次数。这是「上下文被压下来了」的证据；只看 `compacted` 会被 bili 注入的提示词误导，它也会让 `messages` 变。
 - `lastExchange`：最近一次往返的对照，`beforeContent` / `afterContent` 是正文净长度（只算 `content`，不算 JSON 字段名与工具定义），`diff` 逐条列出哪几条消息被改、长了还是短了。
+- `recentExchanges`：最近 6 次往返的规模与结果。`lastExchange` 只留最后一条，而 adapter 的一次调用会因重试打出多次往返，最后那条常常不是大请求——判断「到底压没压」要看这里有没有 `shrank: true` 的大样本。
 - `fallback`：退回直发的次数（`ask` 形状不合法、重新加密失败、`rid` 过期等），配 `lastError` 看原因。
-- `installed`：补丁装成功了没有；`false` 时 `lastError` 说明为什么。
+- `installed` / `effective` / `liveSeen`：补丁挂上没有 / 有没有接管到运行时那份 / 此刻实时读有没有值。判压缩只看 `effective`。
+- `adoptTicks` / `adoptedAt`：等待认领重试了多少拍、什么时候认领到的。`ticks` 长时间在涨而 `effective` 仍为 `false`，说明 `pack.js` 里的注入口没被这个进程执行到。
 - `targets`：实际打了补丁的目标。出现 `pack:__mfQoderEncryptor` 才说明接管了运行时真正在跑的那份加密器。
-- `hookRepair`：`pack.js` 注入口的检查结果。`repaired` 表示刚补回（下一次宿主启动生效）。
+- `hookRepair`：`pack.js` 注入口的检查结果，`copies` 逐份列出（`plugins` 与 `profile:<name>` 是两份不同文件，宿主读的是后者）。`repaired` 表示刚补回（下一次宿主启动生效），`pending-restart` 表示文件里有、进程还没执行到。
 - `portals` / `seenRequests`：在 adapter 的 `fetchImpl` 上装的观测点数量与经过它的请求数。它只用来确认「请求到底走向 shim 还是直连加密端点」，不参与压缩。
 
 ## 安装
@@ -329,7 +373,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | 文件 | 说明 |
 | --- | --- |
 | `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
-| `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回 |
+| `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
 | `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」页签 |
 | `cordis.patch.yml` | 安装用的 bundle patch |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
@@ -342,6 +386,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。并发类失败不进这套状态，走的是几十秒的临时冷却。
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
+- 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
+- `pack.js` 有两份副本（`$DSH_HOME/plugins/` 下的开发副本与 `$DSH_HOME/profiles/<name>/node_modules/` 下宿主真正 import 的那份），尺寸与 mtime 会不同。插件对每一份都做检查，`hookRepair.copies` 逐份列出；只补 `plugins` 那份是不够的。
 
 ## English
 
