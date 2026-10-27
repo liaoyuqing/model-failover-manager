@@ -1407,6 +1407,28 @@ if (typeof agentErrorHandler !== 'function') throw new Error('agent/error 没有
   await api('POST', '/failed/reset', {})
 }
 
+// ── ㉛ 失败文案不是字符串时，宁可没有文案 ──────────────────────────────
+//     宿主把非 Error 的抛出值归一化成 HarnessError(String(value), 'UNKNOWN')，
+//     message 就成了字符串 "[object Object]"。把它显示在看板上等于什么都没说，
+//     错误码还在（那才是可归类的部分），文案必须留空。
+{
+  const objStream = async function* () {
+    yield { type: 'finish', reason: { kind: 'error', failure: { code: 'UNKNOWN', message: '[object Object]' } } }
+  }
+  await api('POST', '/groups', { id: 'go', name: 'GO', models: [
+    { provider: 'po', model: 'om1', priority: 1 },
+  ] })
+  {
+    const iter = await streamHandler({ provider: 'po', model: 'om1', messages: [] }, () => objStream())
+    for await (const _c of iter) { /* 消费到 finish */ }
+  }
+  const objRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'po' && r.model === 'om1')
+  ok('㉛ 「[object Object]」不算文案（错误码保留）',
+    objRow?.lastErrorCode === 'UNKNOWN' && !objRow?.lastErrorMessage,
+    JSON.stringify(objRow && { c: objRow.lastErrorCode, m: objRow.lastErrorMessage }))
+  await api('DELETE', '/groups/go')
+}
+
 // ── ㉚ 「配置了路由却报错不自动路由」的两道回归 ────────────────────────────
 //     真实故障（session-45110bcc turn 94，2026-10-26 21:00）有两条独立的成因，
 //     都在这里钉住：

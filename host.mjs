@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v74'
+const HOST_VERSION = 'v75'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -757,6 +757,25 @@ export function apply(ctx, config = {}) {
   } catch { /* 损坏的采样文件当作没有历史，不让插件起不来 */ }
 
   /**
+   * 从失败事实里取出能给人看的文案。
+   *
+   * 上游的 `failure.message` 未必是字符串：宿主把非 Error 的抛出值归一化成
+   * `HarnessError(String(value), 'UNKNOWN')`，于是 message 可能就是字符串
+   * `"[object Object]"`。把它原样显示在看板上等于什么都没说，所以只接受
+   * 真正的文本；非字符串的 message 一律当成没有文案，只留错误码。
+   *
+   * @param {{message?: unknown}|undefined} failure - 宿主给出的失败事实。
+   * @returns {string|null} 可读文案（截断到 400 字），没有则 null。
+   */
+  function failureTextOf(failure) {
+    const message = failure?.message
+    if (typeof message !== 'string') return null
+    const text = message.trim()
+    if (text === '' || text === '[object Object]') return null
+    return text.slice(0, 400)
+  }
+
+  /**
    * 记一条速度样本。
    *
    * 只追加、不裁剪：样本是看板统计的原始数据，条数上限会把「所选区间」偷换成
@@ -920,7 +939,7 @@ export function apply(ctx, config = {}) {
           if (!settledOk && chunk.reason?.failure?.code) failureCode = String(chunk.reason.failure.code)
           // 完整报错文案：错误码只说「哪一类错」，排查要靠文案（上游说了什么、
           // 请求被哪一环拒了）。截断到 400 字，与当日失败记录同口径。
-          if (!settledOk && chunk.reason?.failure?.message) failureMessage = String(chunk.reason.failure.message).slice(0, 400)
+          if (!settledOk) failureMessage = failureTextOf(chunk.reason?.failure)
         }
         yield chunk
       }
@@ -1008,7 +1027,7 @@ export function apply(ctx, config = {}) {
     const idx = failedList.findIndex(f => f.key === k && f.day === d)
     const now = Date.now()
     const code = failure?.code ? String(failure.code).slice(0, 32) : null
-    const reason = failure?.message ? String(failure.message).slice(0, 400) : null
+    const reason = failureTextOf(failure)
     if (idx >= 0) {
       const cur = failedList[idx]
       cur.count = (cur.count || 1) + 1
@@ -2059,7 +2078,7 @@ export function apply(ctx, config = {}) {
         model: extra?.model ?? null,
         code: failure?.code ?? null,
         outcome,
-        detail: extra?.detail ?? (failure?.message ? String(failure.message).slice(0, 160) : null),
+        detail: extra?.detail ?? failureTextOf(failure)?.slice(0, 160) ?? null,
         // 该 provider 的请求不经过压缩代理（无上下文压缩），排障时一眼可见
         ...(extra?.uncompressed === true ? { uncompressed: true } : {}),
       })
@@ -2716,7 +2735,7 @@ export function apply(ctx, config = {}) {
       cacheWriteTokens: usageCacheWrite,
       elapsedMs,
       errorCode: ok ? null : (errorCode ?? 'ERROR'),
-      error: ok ? null : String(failure?.message ?? thrown?.message ?? (controller.signal.aborted ? '测速超时' : '测速失败')).slice(0, 200),
+      error: ok ? null : (failureTextOf(failure) ?? String(thrown?.message ?? (controller.signal.aborted ? '测速超时' : '测速失败')).slice(0, 200)),
     }
   }
 

@@ -219,7 +219,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 codearts 的那句 429 单独处理：如果账号池里的账号全是 `capped`（并发占满、账号本身没坏），重启账号池只会打断正在跑的请求，所以按并发类失败临时换模型，不动账号池。只有池里确实全被禁用或冷却时才重启。
 
-「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、token 用量、成功率、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。状态列的副行常驻显示**错误码**（过长时截断），**鼠标放上去看完整报错文案**：当日失败的行取失败记录里的原因（那是「所有重试耗尽后」的最终结论），没有失败记录时取最近一次采样失败的信息。错误码与文案必须成对——只有码看不出上游到底说了什么，只有文案又没法归类；两者都没有就不显示，不拿空壳糊弄。「恢复」按钮紧跟在状态标签后面（与「当日失败」同一行），错误码独占副行——两者挤在一行会把错误码压成省略号。模型名下方的副行除了所属分组，还挂着这一行自己的动作（单个模型测速、从路由移除）。「并发」列的主值位置是输入框，改上限不用再切到「模型」页签。
+「数据看板」页签（模型弹窗里，打开时每 3 秒刷新）显示每个模型的首字延迟、输出速度、token 用量、成功率、并发现场与状态，列头可点击排序（升序 → 降序 → 默认序，无数据的行恒排末位）。状态列只画最严重的那一个状态（当日失败 > 已禁用 > 并发冷却 > 正常），列宽固定——否则带错误码的行会把自己的列撑宽、把模型名挤窄，整张表看着就像错位了。状态列的副行常驻显示**错误码**（过长时截断），**鼠标放上去看完整报错文案**：当日失败的行取失败记录里的原因（那是「所有重试耗尽后」的最终结论），没有失败记录时取最近一次采样失败的信息。错误码与文案必须成对——只有码看不出上游到底说了什么，只有文案又没法归类；两者都没有就不显示，不拿空壳糊弄。文案只收真正的文本：上游把非 Error 的抛出值归一化后，message 可能就是字符串 `"[object Object]"`，那不是给人看的话，这时只留错误码。「恢复」按钮紧跟在状态标签后面（与「当日失败」同一行），错误码独占副行——两者挤在一行会把错误码压成省略号。模型名下方的副行除了所属分组，还挂着这一行自己的动作（单个模型测速、从路由移除）。「并发」列的主值位置是输入框，改上限不用再切到「模型」页签。
 
 成功率列：主行是区间内成功调用 / 区间内全部采样，副行写「成功数/采样数」。样本少于 5 条时只显示数值、不标黄，避免 2 条错 1 条就把整行染红；失败多到 90% 以下才转成警示色。
 
@@ -373,7 +373,9 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   record (the verdict after every retry was exhausted), a row that only saw failed calls uses its
   most recent sample failure. Code and message travel together — the code alone does not say what
   the upstream said, and the message alone cannot be categorised; when neither exists nothing is
-  drawn rather than an empty shell. The *restore* button sits right behind the state label on the
+  drawn rather than an empty shell. Only real text counts as a message: the host normalises a
+  non-Error throw into the string `"[object Object]"`, and that is not something to show, so such a
+  row keeps its error code and drops the message. The *restore* button sits right behind the state label on the
   same line, so the error code keeps the second line to itself.
 - A success-rate column shows successful calls over all samples in the selected range, with the raw
   counts underneath. Ratings stay neutral below five samples — one failure out of two should not
