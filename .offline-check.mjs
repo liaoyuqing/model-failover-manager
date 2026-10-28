@@ -752,6 +752,48 @@ ok('⑬ 两个流都完整透传（闸门不改写 chunk）',
   && outB.join(',') === 'text-delta,text-delta,usage,finish',
   `outA=${outA.join(',')} outB=${outB.join(',')}`)
 
+// ⑬b 未配置并发上限的模型：不排队，但「当前并发」照样计数（数据看板要显示它）
+//     上限与计数是两件事：limit=0 只意味着「不排队」，不是「不统计」。
+//     这一条盯的正是那个曾经把计数整段跳过的早退分支。
+await api('POST', '/groups', { id: 'gu', name: 'GU', models: [
+  { provider: 'pu', model: 'mu', priority: 1 },
+] })
+const guRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pu' && r.model === 'mu')
+ok('⑬b 未配置上限：看板行 concurrency 为 null（不限）但 inflight 仍是数字',
+  guRow?.concurrency === null && typeof guRow?.inflight === 'number' && guRow.inflight === 0,
+  JSON.stringify(guRow && { concurrency: guRow.concurrency, inflight: guRow.inflight, queued: guRow.queued }))
+const looseA = Promise.withResolvers()
+const looseB = Promise.withResolvers()
+const iterU1 = await streamHandler({ provider: 'pu', model: 'mu', messages: [] }, () => fakeStream(looseA.promise))
+const iterU2 = await streamHandler({ provider: 'pu', model: 'mu', messages: [] }, () => fakeStream(looseB.promise))
+const outU1 = []
+const outU2 = []
+const doneU1 = (async () => { for await (const c of iterU1) outU1.push(c.type) })()
+const doneU2 = (async () => { for await (const c of iterU2) outU2.push(c.type) })()
+await new Promise(r => setTimeout(r, 40))
+ok('⑬b 不限上限时两个流同时拿到首字（没有排队）', outU1.length > 0 && outU2.length > 0,
+  `outU1=${JSON.stringify(outU1)} outU2=${JSON.stringify(outU2)}`)
+const liveRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pu' && r.model === 'mu')
+ok('⑬b 不限上限的模型进行中计数跟着流走（此刻 2）',
+  liveRow?.inflight === 2 && liveRow?.queued === 0,
+  JSON.stringify({ inflight: liveRow?.inflight, queued: liveRow?.queued }))
+const liveStatus = (await api('GET', '/status')).body.groups.find(g => g.id === 'gu')?.models?.[0]
+ok('⑬b /status 也报出进行中计数（不只有上限的模型才有）',
+  liveStatus?.concurrency === null && liveStatus?.inflight === 2,
+  JSON.stringify({ concurrency: liveStatus?.concurrency, inflight: liveStatus?.inflight }))
+looseA.resolve()
+looseB.resolve()
+await Promise.all([doneU1, doneU2])
+const afterRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pu' && r.model === 'mu')
+ok('⑬b 流结束后计数归零（不会只涨不落）',
+  afterRow?.inflight === 0 && afterRow?.queued === 0,
+  JSON.stringify({ inflight: afterRow?.inflight, queued: afterRow?.queued }))
+ok('⑬b 两个流都完整透传（无上限这条路也不改写 chunk）',
+  outU1.join(',') === 'text-delta,text-delta,usage,finish'
+  && outU2.join(',') === 'text-delta,text-delta,usage,finish',
+  `outU1=${outU1.join(',')} outU2=${outU2.join(',')}`)
+await api('DELETE', '/groups/gu')
+
 // ⑭ 数据看板：首字延迟与输出速度
 const metrics = (await api('GET', '/metrics')).body
 ok('⑭ /metrics 返回分组内模型的看板行', Array.isArray(metrics?.rows) && metrics.rows.length > 0,

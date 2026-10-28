@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v79'
+const HOST_VERSION = 'v80'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -493,34 +493,49 @@ export function apply(ctx, config = {}) {
    * 队列是每个 `provider/model` 一条 FIFO：释放时一次性唤醒队首，队首下一轮循环自己
    * 重新判断槽位，因此这里不需要把槽位直接转交给被唤醒者。
    *
+   * 无论 `limit` 是多少都会计数 `inflightByModel`：`limit` 只决定满了之后排不排队，
+   * 不决定要不要统计。看板要给「没配上限」的模型显示当前并发数，靠的就是这条计数。
+   *
    * @param {string} key - `provider/model`。
-   * @param {number} limit - 上限，0 = 不限（直接放行）。
+   * @param {number} limit - 上限，0 = 不限（不排队，但仍占槽计数）。
    * @param {AbortSignal|undefined} signal - 请求取消信号；取消时退出排队。
    * @returns {Promise<() => void>} 释放函数；重复调用安全。
    * @throws 排队超时抛 `{ code: CAPACITY_TIMEOUT_CODE }`；取消时抛取消原因。
    */
   async function acquireSlot(key, limit, signal) {
-    if (limit <= 0) return () => {}
+    /**
+     * 占一个槽位，返回释放函数。
+     *
+     * 占与释放是配对的，所以两条路径（有上限、无上限）共用这里：上限只决定
+     * 「满了怎么办」（排队还是直接放行），不决定「要不要计数」。
+     *
+     * @returns {() => void} 释放函数；重复调用安全。
+     */
+    const takeSlot = () => {
+      inflightByModel.set(key, (inflightByModel.get(key) ?? 0) + 1)
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        const now = (inflightByModel.get(key) ?? 1) - 1
+        if (now <= 0) inflightByModel.delete(key)
+        else inflightByModel.set(key, now)
+        const waiters = waitingByModel.get(key)
+        if (waiters !== undefined && waiters.length > 0) {
+          const next = waiters.shift()
+          if (waiters.length === 0) waitingByModel.delete(key)
+          next()
+        }
+      }
+    }
+    // 不限上限（limit=0）：照常计数，只是不排队。计数与上限是两件事——
+    // 看板的「当前并发」问的是「此刻几个请求正在跑」，没配上限的模型一样在跑，
+    // 提前返回空释放会让这些行永远显示 0（用户以为链路没在用）。
+    if (limit <= 0) return takeSlot()
     const deadline = concurrencyQueueTimeoutMs > 0 ? Date.now() + concurrencyQueueTimeoutMs : null
     for (;;) {
       const inflight = inflightByModel.get(key) ?? 0
-      if (inflight < limit) {
-        inflightByModel.set(key, inflight + 1)
-        let released = false
-        return () => {
-          if (released) return
-          released = true
-          const now = (inflightByModel.get(key) ?? 1) - 1
-          if (now <= 0) inflightByModel.delete(key)
-          else inflightByModel.set(key, now)
-          const waiters = waitingByModel.get(key)
-          if (waiters !== undefined && waiters.length > 0) {
-            const next = waiters.shift()
-            if (waiters.length === 0) waitingByModel.delete(key)
-            next()
-          }
-        }
-      }
+      if (inflight < limit) return takeSlot()
       const remaining = deadline === null ? null : deadline - Date.now()
       if (remaining !== null && remaining <= 0) {
         // 排队超时：不占用槽位，也不动队列——让上层把它当成一次失败，交给分组路由换模型。

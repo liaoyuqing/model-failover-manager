@@ -26,7 +26,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v12'
+    var VERSION = 'v13'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -487,7 +487,15 @@ window.__ModuleLoader__.load({
     function isNum(v) { return typeof v === 'number' && isFinite(v) }
     function fmtMs(v) { return isNum(v) ? Math.round(v) + 'ms' : '—' }
     function fmtTps(v) { return isNum(v) ? (Math.round(v * 10) / 10).toFixed(1) + ' tok/s' : '—' }
-    function fmtConcLimit(v) { return Number.isInteger(v) && v > 0 ? String(v) : '不限' }
+    /**
+     * 并发列的主值：进行中 / 生效上限；没配上限时上限位写「不限」。
+     *
+     * 进行中与上限是两个独立事实（limit 为 null 也照常统计进行中），所以不限的
+     * 模型不能只写「不限」——那会让人以为这个数没有意义。
+     */
+    function fmtInflight(inflight, limit) {
+      return String(inflight) + (limit === null ? '（不限）' : '/' + String(limit))
+    }
     /** 压缩计数写法：1234 → 1.2K，1234567 → 1.2M；保留一位小数，够看板比对用量 */
     function fmtTokens(v) {
       if (!isNum(v)) return '—'
@@ -1571,7 +1579,6 @@ window.__ModuleLoader__.load({
               var k = keyOf(r.provider, r.model)
               // 生效上限（已含默认值）：null = 不限
               var effConc = Number.isInteger(r.concurrency) && r.concurrency > 0 ? r.concurrency : null
-              var effText = fmtConcLimit(effConc)
               // 显式配置：只有在这里配过的模型才非空
               var explicit = Number.isInteger(configured[k]) && configured[k] > 0 ? configured[k] : null
               var inflight = isNum(r.inflight) ? r.inflight : 0
@@ -1715,7 +1722,9 @@ window.__ModuleLoader__.load({
                     }))
                 })(),
                 // 并发：上限直接在这一列改（与「模型」页签同一份提交逻辑，按模型
-                // 持久化、对所有分组统一生效）；输入框右边贴「进行中 / 生效上限」。
+                // 持久化、对所有分组统一生效）；输入框右边贴「进行中 / 生效上限」，
+                // 没配上限（跟随默认，默认也是不限）的行写成「N（不限）」——进行中
+                // 照常计数，不限的只是上限。
                 e('div', { style: S.metricsNumCell },
                   e('span', { style: S.metricsConcEdit },
                     e('input', {
@@ -1727,13 +1736,14 @@ window.__ModuleLoader__.load({
                       'aria-label': '并发上限',
                       title: '并发上限：正整数即写死（对所有分组统一生效）；留空或 0 = 跟随默认上限'
                         + (defaultHint ? '（' + defaultHint + '）' : '')
+                        + '\n当前进行中：' + inflight + (effConc === null ? '（不限上限，不排队）' : ' / 上限 ' + effConc)
                         + (queued > 0 ? '\n排队中：' + queued : '')
                         + '。达到上限时先尝试切到组内其它空闲模型，都满才排队',
                       onChange: function (ev) { commitConcurrency(r.provider, r.model, ev.target.value) },
                       onBlur: function () { concBlur(k) },
                     }),
                     e('span', { style: { fontSize: '11px', opacity: .65, whiteSpace: 'nowrap' } },
-                      String(inflight) + '/' + effText)),
+                      fmtInflight(inflight, effConc))),
                   concSubText && e('span', { style: S.metricsNumSub }, concSubText)),
                 // 状态：主行一个标签（失败 > 禁用 > 冷却 > 正常，只画最严重的那个，
                 // 避免一格里堆三枚胶囊把列撑爆），副行给错误码 + 「恢复」按钮。

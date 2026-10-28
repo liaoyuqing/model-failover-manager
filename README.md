@@ -255,7 +255,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 ## 并发与临时切换
 
-每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。
+每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。占槽位同时也是**计数**：没配上限（`0`）的模型不排队、不等槽，但从进入的那一刻就记进「进行中」——所以看板上它的并发数也是真实值，只是主值写成 `N（不限）` 而不是 `N/上限`。上限与计数是两件事，`0` 只意味着不限，不意味着不数。
 
 占不到槽位就排队，排队超过 `concurrencyQueueTimeoutMs` 判成 `CAPACITY_TIMEOUT`。**并发类失败不写「当日失败」**——它只说明此刻排队太长，模型本身没坏，停一整天不合理。取而代之的是一次短冷却（`capacityCooldownMs`，默认 30 秒）：冷却期间 `pickCandidate` 跳过它，到期自动回到候选队列。
 
@@ -332,7 +332,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
 - **单个模型单独测速**：每行模型名下方都有「测速」按钮，只测这一个模型，不牵连整组。它不受当前分组下拉的限制，**分组里已禁用的模型也能测**——单独点某一行的场景恰恰是排查「这个模型到底通不通」。要同时测整组还是用操作条上的「一键测速」。
 - **恢复失败模型**：当日失败的行在状态列直接给「恢复」按钮（只清这一个模型的失败记录）；操作条上的「恢复本组失败 (N)」只清当前分组里的失败模型——不带模型名的 `/failed/reset` 会清掉全天全部失败，跨了分组就是越权。
-- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。输入框右边仍贴着「进行中 / 生效上限」，副行给等槽与排队。
+- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。输入框右边贴着「进行中 / 生效上限」：有上限时是 `N/上限`，没配上限时是 `N（不限）`——两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；副行给等槽与排队。
 - **从路由移除**：模型名下方的「移除」按钮把这个模型从它所属分组里摘掉，分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。同一模型在两个分组里会出现两行，要彻底离开路由就两行都移除。
 
 ## 数据文件
@@ -406,7 +406,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
 - Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
-- Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. A request that cannot get a slot waits up to `concurrencyQueueTimeoutMs` and then fails as `CAPACITY_TIMEOUT`.
+- Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. Taking a slot is also the **count**: an uncapped model (`0`) never queues and never waits, but it is counted as in flight from the moment it enters — so the dashboard reports a real number for it too, written as `N (unlimited)` rather than `N/cap`. The cap and the count are two separate facts; unlimited means unlimited, not uncounted. A request that cannot get a slot waits up to `concurrencyQueueTimeoutMs` and then fails as `CAPACITY_TIMEOUT`.
 - Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.
 - The dashboard shows first-token latency, output speed, token usage, live concurrency, and state
   per model, with click-to-sort headers (ascending, descending, then the default order; rows without
@@ -468,7 +468,9 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - The concurrency cap is editable right on the dashboard: the 并发 / concurrency column's main value is
   an input box sharing the model row's submit logic (persisted per model, applying to every group): a
   positive integer sets it, empty or 0 follows `defaultConcurrency`. The input box keeps the live
-  `in-flight / effective cap` text beside it, with the wait and queue detail on the second line.
+  text beside it — `in-flight / effective cap` when a cap is set, `in-flight (unlimited)` when none
+  is, so the cell still shows the current count instead of going blank — with the wait and queue
+  detail on the second line.
 - Remove from routing: the *移除 / remove* button under the model name drops that model from the group
   the row belongs to, leaving the other models and their priorities alone. It differs from
   *禁用 / disable*: disabling keeps the entry and only bars it from routing, while removing deletes the
