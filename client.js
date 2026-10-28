@@ -295,12 +295,14 @@ window.__ModuleLoader__.load({
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
       // 七列：模型 / 成功率 / 首字 / 速度 / token / 并发 / 状态。状态列固定宽，否则「当日失败 +
       // 错误码」会把 auto 列撑宽、把模型列从 308px 压到 248px，整张表看着就乱了。
+      // 并发列 96px：上行输入框，下行「N/上限」加等槽、排队。再窄末尾就会被
+      // 省略号吃掉，而那一段正是要看的数。
       // token 列比速度列宽一点：它要放「1.2M」大字加「↑输入 12.3K」这种一行一个的小字。
       // 成功率列只放「98.5%」加副行「166/168」：主值够宽就够，副行靠 10px 字号塞进同一格。
       // 状态列 120px：副行要同时放下错误码与「恢复」按钮（错误码截断，完整报错走悬停）。
       metricsRow: {
         display: 'grid',
-        gridTemplateColumns: 'minmax(120px, 1fr) 56px 66px 82px 108px 76px 120px',
+        gridTemplateColumns: 'minmax(120px, 1fr) 56px 66px 82px 108px 96px 120px',
         alignItems: 'center', gap: '8px', padding: '6px 10px',
         borderTop: '0.5px solid var(--dsw-alias-border-l1)',
         fontSize: '12px', color: 'var(--dsw-alias-label-primary)',
@@ -376,12 +378,18 @@ window.__ModuleLoader__.load({
         borderRadius: 'var(--dsw-radius-sm)',
         background: 'transparent', color: 'var(--dsw-alias-label-secondary)',
       },
-      // 并发列的编辑态：上限输入框 + 「进行中 / 上限」占用文字并排。
-      // 看板这一列原来只读，改上限要切到「模型」页签；直接给输入框，提交逻辑
-      // 与模型页签共用同一份（按模型持久化，对所有分组生效）。
+      // 并发列的上行：上限输入框独占，进行中与上限的读数在下行。
+      // 改上限不必切到「模型」页签，提交逻辑与那边共用同一份（按模型持久化，
+      // 对所有分组生效）。
       metricsConcEdit: {
         display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
         gap: '4px', width: '100%',
+      },
+      // 并发副行：放的是实时数字，不能像 P90 那样淡到只剩暗示；但它仍是副行，
+      // 字号只到 11px、透明度只到 .7，不该盖过上面的输入框。
+      metricsConcSub: {
+        fontSize: '11px', opacity: .7, fontVariantNumeric: 'tabular-nums',
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%',
       },
       metricsConcInput: {
         width: '38px', textAlign: 'center', boxSizing: 'border-box', flexShrink: 0,
@@ -1721,10 +1729,11 @@ window.__ModuleLoader__.load({
                       }, part.label + ' ' + fmtTokens(part.value))
                     }))
                 })(),
-                // 并发：上限直接在这一列改（与「模型」页签同一份提交逻辑，按模型
-                // 持久化、对所有分组统一生效）；输入框右边贴「进行中 / 生效上限」，
-                // 没配上限（跟随默认，默认也是不限）的行写成「N（不限）」——进行中
-                // 照常计数，不限的只是上限。
+                // 并发：两行。上行是上限输入框（与「模型」页签同一份提交逻辑，按模型
+                // 持久化、对所有分组统一生效），下行是「进行中 / 生效上限」加等槽、
+                // 排队。这一格装两个独立事实——可编辑的上限、实时的进行中数——并排
+                // 会让后者被压成省略号，而它正是要看的那一个。没配上限（跟随默认，
+                // 默认也是不限）的行写成「N（不限）」：进行中照常计数，不限的只是上限。
                 e('div', { style: S.metricsNumCell },
                   e('span', { style: S.metricsConcEdit },
                     e('input', {
@@ -1741,10 +1750,13 @@ window.__ModuleLoader__.load({
                         + '。达到上限时先尝试切到组内其它空闲模型，都满才排队',
                       onChange: function (ev) { commitConcurrency(r.provider, r.model, ev.target.value) },
                       onBlur: function () { concBlur(k) },
-                    }),
-                    e('span', { style: { fontSize: '11px', opacity: .65, whiteSpace: 'nowrap' } },
-                      fmtInflight(inflight, effConc))),
-                  concSubText && e('span', { style: S.metricsNumSub }, concSubText)),
+                    })),
+                  e('span', {
+                    style: S.metricsConcSub,
+                    title: '当前进行中：' + fmtInflight(inflight, effConc)
+                      + (concSubText ? '（' + concSubText + '）' : ''),
+                  }, concSubText ? fmtInflight(inflight, effConc) + ' · ' + concSubText
+                    : fmtInflight(inflight, effConc))),
                 // 状态：主行一个标签（失败 > 禁用 > 冷却 > 正常，只画最严重的那个，
                 // 避免一格里堆三枚胶囊把列撑爆），副行给错误码 + 「恢复」按钮。
                 // 错误码一直要看得见（用户要判断「是不是同一个错」），完整报错

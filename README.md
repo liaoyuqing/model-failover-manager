@@ -332,7 +332,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
 - **单个模型单独测速**：每行模型名下方都有「测速」按钮，只测这一个模型，不牵连整组。它不受当前分组下拉的限制，**分组里已禁用的模型也能测**——单独点某一行的场景恰恰是排查「这个模型到底通不通」。要同时测整组还是用操作条上的「一键测速」。
 - **恢复失败模型**：当日失败的行在状态列直接给「恢复」按钮（只清这一个模型的失败记录）；操作条上的「恢复本组失败 (N)」只清当前分组里的失败模型——不带模型名的 `/failed/reset` 会清掉全天全部失败，跨了分组就是越权。
-- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。输入框右边贴着「进行中 / 生效上限」：有上限时是 `N/上限`，没配上限时是 `N（不限）`——两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；副行给等槽与排队。
+- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。这一格分两行：上行是输入框，下行是「进行中 / 生效上限」——有上限时是 `N/上限`，没配上限时是 `N（不限）`，两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；等槽与排队接在下行后面。并排一行放不下：76px 的列里输入框先占掉一半，剩下的读数只剩省略号。
 - **从路由移除**：模型名下方的「移除」按钮把这个模型从它所属分组里摘掉，分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。同一模型在两个分组里会出现两行，要彻底离开路由就两行都移除。
 
 ## 数据文件
@@ -467,10 +467,11 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   which would overreach into other groups.
 - The concurrency cap is editable right on the dashboard: the 并发 / concurrency column's main value is
   an input box sharing the model row's submit logic (persisted per model, applying to every group): a
-  positive integer sets it, empty or 0 follows `defaultConcurrency`. The input box keeps the live
-  text beside it — `in-flight / effective cap` when a cap is set, `in-flight (unlimited)` when none
-  is, so the cell still shows the current count instead of going blank — with the wait and queue
-  detail on the second line.
+  positive integer sets it, empty or 0 follows `defaultConcurrency`. The cell has two lines: the input
+  box on the first, the live `in-flight / effective cap` on the second — `in-flight (unlimited)` when
+  no cap is set, so the cell still shows the current count instead of going blank — with the wait and
+  queue detail trailing it. Side by side they did not fit: the input box took half of a 76px column and
+  the reading that matters collapsed to an ellipsis.
 - Remove from routing: the *移除 / remove* button under the model name drops that model from the group
   the row belongs to, leaving the other models and their priorities alone. It differs from
   *禁用 / disable*: disabling keeps the entry and only bars it from routing, while removing deletes the
