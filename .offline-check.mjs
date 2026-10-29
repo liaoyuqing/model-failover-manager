@@ -843,6 +843,53 @@ holdLateB.resolve()
 await Promise.all([doneLateA, doneLateB])
 await api('DELETE', '/groups/gu')
 
+// ⑭d 默认并发（面板级设置）：改一次对「所有没有单独设上限的模型」生效，并且落进 settings.json。
+//     出厂值来自 config；界面覆盖存 settings.json，重启后仍在。0 是合法上限（不限），
+//     所以「没设置」只能用 null 表示，不能用 0 冒充——否则清空界面输入框会变成「设成不限」。
+await api('POST', '/groups', { id: 'gdef', name: 'GDEF', models: [
+  { provider: 'pd', model: 'md', priority: 1 },
+  { provider: 'pd', model: 'md2', priority: 2 },
+] })
+const dflBefore = (await api('GET', '/status')).body
+ok('⑭d 默认并发未覆盖时跟随 config 出厂值',
+  dflBefore.settings?.defaultConcurrency === null
+  && dflBefore.defaultConcurrency === dflBefore.configDefaultConcurrency,
+  JSON.stringify({ settings: dflBefore.settings?.defaultConcurrency, eff: dflBefore.defaultConcurrency, cfg: dflBefore.configDefaultConcurrency }))
+const dflRowBefore = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pd' && r.model === 'md')
+ok('⑭d 没设默认并发时模型不限（concurrency 为 null）', dflRowBefore?.concurrency === null,
+  JSON.stringify({ concurrency: dflRowBefore?.concurrency }))
+const dflSet = await api('POST', '/settings', { defaultConcurrency: 1 })
+const dflAfter = (await api('GET', '/status')).body
+const dflRowAfter = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pd' && r.model === 'md')
+ok('⑭d 设了默认并发后，没单独配置的模型立刻按它算',
+  dflSet.status === 200 && dflAfter.defaultConcurrency === 1
+  && dflAfter.settings?.defaultConcurrency === 1 && dflRowAfter?.concurrency === 1,
+  JSON.stringify({ status: dflSet.status, eff: dflAfter.defaultConcurrency, row: dflRowAfter?.concurrency }))
+// 闸门认的是同一个生效值：默认 1 时第二个流也当场判满，交给人去换模型。
+const holdDefault = Promise.withResolvers()
+const iterDef = await streamHandler({ provider: 'pd', model: 'md', messages: [] }, () => fakeStream(holdDefault.promise))
+const doneDef = (async () => { for await (const _c of iterDef) { /* 占住唯一的槽 */ } })()
+await new Promise(r => setTimeout(r, 30))
+const outDef2 = []
+const iterDef2 = await streamHandler({ provider: 'pd', model: 'md', messages: [] }, () => fakeStream())
+for await (const c of iterDef2) outDef2.push(c)
+ok('⑭d 默认并发同样会被闸门判满（超了立刻交给路由，不排队）',
+  outDef2.length === 1 && outDef2[0]?.type === 'finish' && outDef2[0]?.reason?.failure?.code === 'CAPACITY_TIMEOUT',
+  JSON.stringify(outDef2))
+holdDefault.resolve()
+await doneDef
+ok('⑭d 非法默认并发被拒绝',
+  (await api('POST', '/settings', { defaultConcurrency: -1 })).status === 400)
+const dflCleared = await api('POST', '/settings', { defaultConcurrency: null })
+const dflClearedStatus = (await api('GET', '/status')).body
+const dflRowCleared = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pd' && r.model === 'md')
+ok('⑭d 清空后回落 config 出厂值（模型重新不限）',
+  dflCleared.status === 200 && dflClearedStatus.settings?.defaultConcurrency === null
+  && dflClearedStatus.defaultConcurrency === dflClearedStatus.configDefaultConcurrency
+  && dflRowCleared?.concurrency === null,
+  JSON.stringify({ settings: dflClearedStatus.settings?.defaultConcurrency, eff: dflClearedStatus.defaultConcurrency, row: dflRowCleared?.concurrency }))
+await api('DELETE', '/groups/gdef')
+
 // ⑬c 并发满了换模型，不排队（这条盯的是「不要排队」的终点，不只是闸门那一刻）
 //     闸门立刻判失败只是第一步：这次失败要真的变成「临时切到组内其它模型」；而整组都满
 //     时必须等槽位释放再切，不能就此判死——否则「不排队」就变成了「直接失败」。

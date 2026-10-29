@@ -27,10 +27,13 @@
 #   qoderShimPort: loopback port for that shim (default: 47001, 127.0.0.1 only)
 #   qoderShimWasmPath: explicit path to qoder-wasm.js when auto-detection under
 #            $DSH_HOME/profiles/<name>/node_modules fails
-#   defaultConcurrency: concurrency cap used by models that do not set one in
-#            model-concurrency.json (default: 0, unlimited). The cap is keyed by
-#            model rather than stored on a group entry, because one model
-#            reached through several groups shares the same upstream accounts.
+#   defaultConcurrency: factory value of the concurrency cap used by models
+#            that do not set one in model-concurrency.json (default: 0,
+#            unlimited). The effective value can be changed from the dashboard
+#            header and is stored in settings.json; clearing the override falls
+#            back here. The cap is keyed by model rather than stored on a group
+#            entry, because one model reached through several groups shares the
+#            same upstream accounts.
 #   concurrencyQueueTimeoutMs: how long routing waits for a slot when the whole
 #            group is full and there is nowhere to switch. The gate itself never
 #            queues: a request that cannot get a slot fails as CAPACITY_TIMEOUT

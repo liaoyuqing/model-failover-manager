@@ -26,7 +26,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v16'
+    var VERSION = 'v17'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -624,10 +624,22 @@ window.__ModuleLoader__.load({
       var range = rangePair[0]; var setRange = rangePair[1]
       /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
       var concPair = React.useState({}); var concDraft = concPair[0]; var setConcDraft = concPair[1]
+      /**
+       * 默认并发输入框的本地草稿：null = 没在改，显示 Host 的生效值。
+       * 不能直接绑生效值——看板每 3 秒轮询一次 /metrics，清空重打时会被顶回旧数字。
+       */
+      var defConcPair = React.useState(null); var defConcDraft = defConcPair[0]; var setDefConcDraft = defConcPair[1]
 
-      /** 默认并发上限：status.defaultConcurrency 是分组级默认，null = 未配置 */
+      /** 默认并发上限：status.defaultConcurrency 是面板级默认（对所有没单独设上限的模型生效） */
       var defaultConc = status && typeof status.defaultConcurrency === 'number' ? status.defaultConcurrency : null
-      var defaultConcHint = defaultConc === null ? '' : (defaultConc === 0 ? '当前默认不限' : '当前默认 ' + defaultConc)
+      /** 界面上有没有覆盖默认并发：settings.defaultConcurrency 非 null 即覆盖过（0 也是有效值） */
+      var defaultConcOverridden = !!(status && status.settings && typeof status.settings.defaultConcurrency === 'number')
+      /** config 里的出厂值：清掉界面上的覆盖后回落到它 */
+      var configDefaultConc = status && typeof status.configDefaultConcurrency === 'number' ? status.configDefaultConcurrency : null
+      var defaultConcHint = defaultConc === null
+        ? ''
+        : (defaultConc === 0 ? '当前默认不限（0）' : '当前默认 ' + defaultConc)
+          + (defaultConcOverridden ? '，在数据看板标题栏改' : '，来自 config，可在数据看板标题栏改')
       /** 输入框占位：显示“跟随”的默认值，让留空和写死都一眼可辨 */
       function defaultConcText() { return defaultConc === 0 ? '不限' : (defaultConc === null ? '' : String(defaultConc)) }
 
@@ -1075,6 +1087,44 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 默认并发上限（面板级）：POST /settings 的 defaultConcurrency。
+       *
+       * 与模型级并发不同，它作用于所有**没单独设上限**的模型；模型级那条永远优先。
+       * 留空 = 清掉界面上的覆盖、回落到 config.defaultConcurrency；0 = 不限。
+       *
+       * 提交放在失焦/回车而不是每次敲键：数字框清空重打时会先经过一个空值，
+       * 那个中间态若立刻提交，等于用户没说过的「清除覆盖」，还会触发一次全表刷新。
+       */
+      function commitDefaultConcurrency(raw) {
+        var text = String(raw).trim()
+        var payload = null
+        if (text !== '') {
+          var n = Number(text)
+          if (!Number.isInteger(n) || n < 0 || n > 999) {
+            setOrderNotice({ ok: false, text: '默认并发需为 0..999 的整数（0 = 不限），或留空跟随配置' })
+            setDefConcDraft(null)
+            return
+          }
+          payload = n
+        }
+        apiSend(API + '/settings', 'POST', { defaultConcurrency: payload })
+          .then(function (r) {
+            if (r && r.ok === false) {
+              setOrderNotice({ ok: false, text: '默认并发保存失败：' + String(r.error || '未知原因') })
+              setDefConcDraft(null)
+              return null
+            }
+            setOrderNotice(null)
+            setDefConcDraft(null)
+            return refreshMetrics()
+          })
+          .catch(function (e) {
+            setOrderNotice({ ok: false, text: '默认并发保存失败：' + String(e && e.message ? e.message : e) })
+            setDefConcDraft(null)
+          })
+      }
+
+      /**
        * 恢复一个模型的当日失败：/failed/reset 带 provider/model 时只清这一个模型，
        * 不会连带清掉其它分组里也在失败名单上的模型。看板与「失败模型」页签共用。
        */
@@ -1299,7 +1349,7 @@ window.__ModuleLoader__.load({
         var sorted = metricsSortedRows(rows, sort)
         var noneSampled = rows.length > 0 && rows.every(function (r) { return !(r.samples > 0) })
         var now = Date.now()
-        var defaultHint = defConc === null ? '' : (defConc === 0 ? '当前默认不限' : '当前默认 ' + defConc)
+        var defaultHint = defConc === null ? '' : (defConc === 0 ? '当前默认不限（0）' : '当前默认 ' + defConc)
 
         // ---- 「按当前排序重设优先级」与「一键测速」共用的一份目标清单 ----
         //
@@ -1447,8 +1497,27 @@ window.__ModuleLoader__.load({
         return e('div', { style: S.pane },
           e('div', { style: S.metricsHead },
             e('span', { style: { fontSize: '12px', fontWeight: 600 } }, '数据看板'),
-            e('span', { style: { fontSize: '11px', opacity: .6 } },
-              '默认并发上限：' + (defConc === null ? '—' : (defConc === 0 ? '不限（0）' : String(defConc)))),
+            // 默认并发：直接在这里改（存 Host 的 settings.json，所有没单独设上限的
+            // 模型立即跟着变）。留空 = 清掉覆盖、回落到 config 的出厂值。
+            e('span', { style: { fontSize: '11px', opacity: .6, display: 'flex', alignItems: 'center', gap: '4px' } },
+              e('span', { title: '默认并发上限：所有没有单独设置上限的模型都按它算' }, '默认并发'),
+              e('input', {
+                type: 'number', min: 0, max: 999, step: 1,
+                style: Object.assign({}, S.modelConcInput, { width: '52px' }),
+                value: defConcDraft !== null ? defConcDraft : (defConc === null ? '' : String(defConc)),
+                placeholder: '不限',
+                'aria-label': '默认并发上限',
+                title: '默认并发上限：所有没单独设上限的模型都按它算。0 = 不限；'
+                  + '留空 = 清除这里的设置、跟随 config 的出厂值'
+                  + (configDefaultConc === null ? '' : '（config 里是 ' + (configDefaultConc === 0 ? '不限' : configDefaultConc) + '）')
+                  + '。单独设过上限的模型不受影响。改完失焦或回车生效。',
+                onChange: function (ev) { setDefConcDraft(ev.target.value) },
+                onBlur: function (ev) { commitDefaultConcurrency(ev.target.value) },
+                onKeyDown: function (ev) { if (ev.key === 'Enter') ev.target.blur() },
+              }),
+              defaultConcOverridden
+                ? e('span', { style: { fontSize: '10px', opacity: .45 }, title: '界面上设过默认并发；清空输入框即回落 config 的出厂值' }, '已设置')
+                : e('span', { style: { fontSize: '10px', opacity: .45 }, title: '当前跟随 config.defaultConcurrency' }, '跟随配置')),
             metrics && isNum(metrics.sampledAt) && e('span', { style: { fontSize: '11px', opacity: .5 } },
               '采样于 ' + new Date(metrics.sampledAt).toLocaleTimeString()),
             e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' } },
@@ -1495,7 +1564,8 @@ window.__ModuleLoader__.load({
             + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时（大字是区间中位数 P50，'
             + '小字是该模型活跃并发区间内的合计速度——这批在跑请求从最早开始产出的那一刻算到现在，总输出字符 ÷ 4 ÷ 区间秒数）；'
             + 'token = 所选区间内该模型的输入/输出/缓存用量合计（只统计适配器报了 usage 的调用）；'
-            + '并发 = 正在进行的请求 / 生效上限（上限直接在「并发」列改，按模型持久化、对所有分组统一生效；达到上限时立刻换组内其它模型，不排队）。'),
+            + '并发 = 正在进行的请求 / 生效上限（模型自己的上限直接在「并发」列改，按模型持久化、对所有分组统一生效；'
+            + '没单独设上限的模型跟随标题栏的「默认并发」，那里改一次就全表生效；达到上限时立刻换组内其它模型，不排队）。'),
           e('div', { style: S.metricsNote },
             '副行灰字是该列的补充：成功率给成功数 / 采样数，首字给 P90，速度给活跃区间合计速度（没请求在产出时不显示），'
             + 'token 一行一个数给输入 / 缓存命中 / 缓存写入 / 输出（鼠标悬停大字看历史总量），'
@@ -1779,7 +1849,7 @@ window.__ModuleLoader__.load({
                       placeholder: defaultConcText(),
                       'aria-label': '并发上限',
                       title: '并发上限：正整数即写死（对所有分组统一生效）；留空或 0 = 跟随默认上限'
-                        + (defaultHint ? '（' + defaultHint + '）' : '')
+                        + (defaultHint ? '（' + defaultHint + '，在数据看板标题栏改）' : '')
                         + '\n当前进行中：' + inflight + (effConc === null ? '（不限上限）' : ' / 上限 ' + effConc)
                         + (queued > 0 ? '\n等槽位：' + queued : '')
                         + '。达到上限时立刻切到组内其它空闲模型，不在闸门里排队；整组都满才等槽位释放',

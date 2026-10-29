@@ -255,7 +255,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 ## 并发与临时切换
 
-每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。占槽位同时也是**计数**：没配上限（`0`）的模型不会被判满，但从进入的那一刻就记进「进行中」——所以看板上它的并发数也是真实值，只是主值写成 `N（不限）` 而不是 `N/上限`。上限与计数是两件事，`0` 只意味着不限，不意味着不数。
+每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。`defaultConcurrency` 是**出厂值**（写在 `cordis.patch.yml`），实际生效值可以在**数据看板标题栏**改：改一次就对所有没单独设上限的模型生效，覆盖值存进 `settings.json`（`defaultConcurrency: null` 表示没覆盖、跟随 config），重启后仍在。界面上「跟随配置 / 已设置」就是这两种状态。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。占槽位同时也是**计数**：没配上限（`0`）的模型不会被判满，但从进入的那一刻就记进「进行中」——所以看板上它的并发数也是真实值，只是主值写成 `N（不限）` 而不是 `N/上限`。上限与计数是两件事，`0` 只意味着不限，不意味着不数。
 
 占不到槽位的处理是**换模型，不是排队**：闸门当场不调用下游适配器，直接以 `CAPACITY_TIMEOUT` 收尾；宿主把这个失败交给本插件，本插件按分组路由切到组内空闲的模型（`pickCandidate` 本来就跳过已满的模型，所以满员的那个不会被选中，也就没有「等它空出来」这一步）。只有**整组都满、无处可换**时才真的等：那时等的是那个目标模型的槽位，上限由 `concurrencyQueueTimeoutMs` 控制（`0` = 无限等），等到就切过去，超时才记为 `all-capacity` 放弃。**并发类失败不写「当日失败」**——它只说明此刻太挤，模型本身没坏，停一整天不合理。取而代之的是一次短冷却（`capacityCooldownMs`，默认 30 秒）：冷却期间 `pickCandidate` 跳过它，到期自动回到候选队列。
 
@@ -308,7 +308,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`） |
-| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`） |
+| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`）。`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组。`PUT` 的 `models` 是**整体替换**：看板的「移除」用它把某个模型从所属分组的清单里摘掉，其余模型与优先级保持不变 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
@@ -334,7 +334,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
 - **单个模型单独测速**：每行模型名下方都有「测速」按钮，只测这一个模型，不牵连整组。它不受当前分组下拉的限制，**分组里已禁用的模型也能测**——单独点某一行的场景恰恰是排查「这个模型到底通不通」。要同时测整组还是用操作条上的「一键测速」。
 - **恢复失败模型**：当日失败的行在状态列直接给「恢复」按钮（只清这一个模型的失败记录）；操作条上的「恢复本组失败 (N)」只清当前分组里的失败模型——不带模型名的 `/failed/reset` 会清掉全天全部失败，跨了分组就是越权。
-- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。这一格分两行：上行是输入框，下行是「进行中 / 生效上限」——有上限时是 `N/上限`，没配上限时是 `N（不限）`，两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；等槽时间与等槽位数（只有整组都满时才有人等）接在下行后面。并排一行放不下：76px 的列里输入框先占掉一半，剩下的读数只剩省略号。
+- **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。没有单独设上限的模型跟的是数据看板标题栏那个「默认并发」（输入框就在标题栏上，改一次全表生效，存 `settings.json`）。这一格分两行：上行是输入框，下行是「进行中 / 生效上限」——有上限时是 `N/上限`，没配上限时是 `N（不限）`，两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；等槽时间与等槽位数（只有整组都满时才有人等）接在下行后面。并排一行放不下：76px 的列里输入框先占掉一半，剩下的读数只剩省略号。
 - **从路由移除**：模型名下方的「移除」按钮把这个模型从它所属分组里摘掉，分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。同一模型在两个分组里会出现两行，要彻底离开路由就两行都移除。
 
 ## 数据文件
@@ -347,7 +347,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `session-bindings.json` | 会话 → 分组 + 模式的绑定 |
 | `default-binding.json` | 新会话沿用的默认绑定 |
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
-| `settings.json` | 界面设置 |
+| `settings.json` | 界面设置（含看板排序与默认并发覆盖值） |
 | `model-concurrency.json` | 按模型记录的并发上限（`provider/model` → 上限），对所有分组生效 |
 
 ## 配置
@@ -361,7 +361,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `ofmHandoffExcludeProviders` | `["codearts"]` | 不走 Our Free Model 换号的 provider；这些 provider 失败后直接进分组路由。写成 `[]` 表示不排除任何 provider |
 | `compactionGuard` | `true` | 压缩旁路守卫总开关：bili 生效时把 `uncompressedProviders` 里、且未被 shim 接管的 provider 降为分组兜底候选，并在失败时写压缩旁路诊断 |
 | `uncompressedProviders` | `["qoder", "qodercn"]` | 端点注定绕过 bili 压缩的 provider 名单（见「与 billion-context 的配合」）。写成 `[]` 等同于关掉守卫 |
-| `defaultConcurrency` | `0` | 模型没在 `model-concurrency.json` 里配置上限时沿用的并发上限；`0` = 不限。见「并发与临时切换」 |
+| `defaultConcurrency` | `0` | **出厂值**：模型没在 `model-concurrency.json` 里配置上限时沿用的并发上限（`0` = 不限）。界面上的实际生效值存在 `settings.json`，可在数据看板标题栏改；清空覆盖即回到这里的出厂值。见「并发与临时切换」 |
 | `concurrencyQueueTimeoutMs` | `180000` | 整组模型都满、路由无处可换时，等目标模型槽位释放的上限；超时记为 `all-capacity`、本轮不再切换。`0` = 无限等 |
 | `capacityCooldownMs` | `30000` | 并发类失败后的临时冷却时长：期间该模型不参与路由挑选，到期自动恢复 |
 | `capacitySwitchRevertMs` | `30000` | 因并发临时切走后，至少待这么久才允许切回原模型（防止两个模型来回抖） |
@@ -408,7 +408,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
 - Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
-- Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. Taking a slot is also the **count**: an uncapped model (`0`) is never judged full, but it is counted as in flight from the moment it enters — so the dashboard reports a real number for it too, written as `N (unlimited)` rather than `N/cap`. The cap and the count are two separate facts; unlimited means unlimited, not uncounted. A request that cannot get a slot does not queue: the gate skips the adapter entirely and fails it as `CAPACITY_TIMEOUT`, and routing switches the session to a free model in the group (candidate picking already skips full models). Only a group that is full end to end makes anything wait — for that model's slot, up to `concurrencyQueueTimeoutMs` (`0` waits forever); when a slot frees the session switches, and on timeout routing gives up for the turn (`all-capacity`).
+- Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. `defaultConcurrency` in `cordis.patch.yml` is the factory value: the effective one is editable from the dashboard header and stored in `settings.json` (`null` means not overridden), so one edit applies to every model without its own cap and survives a restart. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. Taking a slot is also the **count**: an uncapped model (`0`) is never judged full, but it is counted as in flight from the moment it enters — so the dashboard reports a real number for it too, written as `N (unlimited)` rather than `N/cap`. The cap and the count are two separate facts; unlimited means unlimited, not uncounted. A request that cannot get a slot does not queue: the gate skips the adapter entirely and fails it as `CAPACITY_TIMEOUT`, and routing switches the session to a free model in the group (candidate picking already skips full models). Only a group that is full end to end makes anything wait — for that model's slot, up to `concurrencyQueueTimeoutMs` (`0` waits forever); when a slot frees the session switches, and on timeout routing gives up for the turn (`all-capacity`).
 - Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.
 - The dashboard shows first-token latency, output speed, token usage, live concurrency, and state
   per model, with click-to-sort headers (ascending, descending, then the default order; rows without

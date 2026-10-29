@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v83'
+const HOST_VERSION = 'v84'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -267,11 +267,17 @@ export function apply(ctx, config = {}) {
   // 默认不限是刻意的——绝大多数 provider 自己会排队，凭据池也有自己的上限；
   // 强制给个数字反而会让用户在不知情的情况下被限速。
   // 单个模型的覆盖存在 $DSH_HOME/model-failover-manager/model-concurrency.json。
-  const defaultConcurrencyRaw = config.defaultConcurrency
-  const defaultConcurrency = Number.isInteger(defaultConcurrencyRaw) && defaultConcurrencyRaw >= 0 ? defaultConcurrencyRaw : 0
-  if (defaultConcurrencyRaw !== undefined && defaultConcurrency !== defaultConcurrencyRaw) {
-    ctx.logger.warn(`[model-failover] config.defaultConcurrency=${JSON.stringify(defaultConcurrencyRaw)} 非法（需 >=0 的整数，0 为不限），回退 0`)
+  //
+  // config 里的是**出厂值**：界面上的「默认并发」存在 settings.json 的
+  // defaultConcurrency 键，用户改过就以界面为准（见下面 settings 加载处）；
+  // 界面里留空 = 清掉那条覆盖，回落到这里的 config 值。
+  const configDefaultConcurrencyRaw = config.defaultConcurrency
+  const configDefaultConcurrency = Number.isInteger(configDefaultConcurrencyRaw) && configDefaultConcurrencyRaw >= 0 ? configDefaultConcurrencyRaw : 0
+  if (configDefaultConcurrencyRaw !== undefined && configDefaultConcurrency !== configDefaultConcurrencyRaw) {
+    ctx.logger.warn(`[model-failover] config.defaultConcurrency=${JSON.stringify(configDefaultConcurrencyRaw)} 非法（需 >=0 的整数，0 为不限），回退 0`)
   }
+  /** 生效的默认并发上限：随 settings.defaultConcurrency 变化，未覆盖时等于 config 的出厂值 */
+  let defaultConcurrency = configDefaultConcurrency
 
   // 「整组模型都满」时等槽位释放的上限。
   //
@@ -421,7 +427,7 @@ export function apply(ctx, config = {}) {
   // metricsSort：数据看板上次使用的排序（{ key, dir } 或 null = 默认序）。
   // 存在 settings.json 里而不是浏览器 localStorage：同一台宿主的多个浏览器
   // 与刷新后的页面都看到同一份排序，换机器也不会各记一套。
-  let settings = Object.assign({ dialogMode: false, metricsSort: null }, readJson(settingsFile, {}))
+  let settings = Object.assign({ dialogMode: false, metricsSort: null, defaultConcurrency: null }, readJson(settingsFile, {}))
 
   /**
    * 看板排序列的合法键。与 client.js 的 metricsSortValue 一一对应；
@@ -447,6 +453,20 @@ export function apply(ctx, config = {}) {
   }
 
   settings.metricsSort = normalizeMetricsSort(settings.metricsSort)
+
+  /**
+   * 界面上的「默认并发」：settings.defaultConcurrency 是**用户覆盖值**，
+   * null 表示没覆盖过、跟随 config 的出厂值。0 是合法值（不限），所以不能用
+   * truthy 判断区分「没设」和「设成不限」。
+   *
+   * 坏值不该让插件起不来：认不出就当成没覆盖，记一条告警并清掉。
+   */
+  if (Number.isInteger(settings.defaultConcurrency) && settings.defaultConcurrency >= 0) {
+    defaultConcurrency = settings.defaultConcurrency
+  } else if (settings.defaultConcurrency !== null) {
+    ctx.logger.warn(`[model-failover] settings.defaultConcurrency=${JSON.stringify(settings.defaultConcurrency)} 非法（需 >=0 的整数或 null），按未覆盖处理，跟随 config 的 ${configDefaultConcurrency}`)
+    settings.defaultConcurrency = null
+  }
   let disposed = false
   // 压缩 shim 的句柄：声明在这里，因为「压缩旁路守卫」的路由判断要读它（见 qoderShimCovers）
   let qoderShimHandle = null
@@ -3070,7 +3090,10 @@ export function apply(ctx, config = {}) {
         // 这两项缺一就先在这里暴露出来，而不是等真失败时才发现救不了。
         codeartsSelfHeal: await describeCodeartsSelfHeal(),
         failureLog: failureLog.slice(-10).reverse(),
+        // 生效的默认并发上限（0 = 不限）；设置入口见 settings.defaultConcurrency
         defaultConcurrency,
+        // config 里的出厂值：界面据此说明「当前是跟随 config 还是被改过」
+        configDefaultConcurrency,
         // 按模型显式配置的并发上限（没配的模型不出现在这里，跟随 defaultConcurrency）
         modelConcurrency: Object.fromEntries(modelConcurrency),
         concurrencyQueueTimeoutMs,
@@ -3207,6 +3230,25 @@ export function apply(ctx, config = {}) {
         // metricsSort：看板表头排序的持久化。显式传 null 表示「回到默认序」，
         // 也是合法的保存动作，所以用 `in` 判断而不是 truthy 判断。
         if ('metricsSort' in body) settings.metricsSort = normalizeMetricsSort(body.metricsSort)
+        // defaultConcurrency：界面上的「默认并发」。null / '' = 清掉覆盖，回落 config
+        // 的出厂值；0 是合法值（不限），所以必须用 `in` 判断、单独校验，不能靠 truthy。
+        if ('defaultConcurrency' in body) {
+          const raw = body.defaultConcurrency
+          if (raw === null || raw === '') {
+            settings.defaultConcurrency = null
+            defaultConcurrency = configDefaultConcurrency
+            ctx.logger.info(`[model-failover] 默认并发改为跟随 config（${configDefaultConcurrency === 0 ? '不限' : configDefaultConcurrency}）`)
+          } else {
+            const n = Number(raw)
+            if (!Number.isInteger(n) || n < 0 || n > 999) {
+              sendJson(res, 400, { ok: false, error: 'defaultConcurrency 需为 0..999 的整数（0 = 不限），或 null / 留空表示跟随 config' })
+              return
+            }
+            settings.defaultConcurrency = n
+            defaultConcurrency = n
+            ctx.logger.info(`[model-failover] 默认并发设为 ${n === 0 ? '不限' : n}`)
+          }
+        }
         saveSettings()
         sendJson(res, 200, { ok: true, settings })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
