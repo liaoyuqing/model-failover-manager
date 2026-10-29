@@ -6,7 +6,7 @@
  *    - 关闭时，紧凑下拉列表
  *    - 弹窗内含「路由分组」「数据看板」「失败模型」页签；分组可绑定到当前会话
  * 2. 设置页「模型故障转移」：dialogMode 开关 + 分组 CRUD（含优先级）+ 失败模型恢复
- * 3. 数据看板：读 /metrics 展示每个模型的首字延迟、输出速度、并发占用与排队，
+ * 3. 数据看板：读 /metrics 展示每个模型的首字延迟、输出速度、并发占用与等槽，
  *    表头可点击排序（结果被记住）；并发上限在并发列直接改；模型行可单独测速、
  *    从路由移除，当日失败的行可恢复；排序顺眼时可按当前排序重设路由优先级，
  *    也能对整组一键测速。
@@ -26,7 +26,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v14'
+    var VERSION = 'v15'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -295,7 +295,7 @@ window.__ModuleLoader__.load({
       // 模型列拿掉 nowrap：provider/model 太长时折行而不是被省略号吃掉
       // 七列：模型 / 成功率 / 首字 / 速度 / token / 并发 / 状态。状态列固定宽，否则「当日失败 +
       // 错误码」会把 auto 列撑宽、把模型列从 308px 压到 248px，整张表看着就乱了。
-      // 并发列 96px：上行输入框，下行「N/上限」加等槽、排队。再窄末尾就会被
+      // 并发列 96px：上行输入框，下行「N/上限」加等槽时间与等槽位数。再窄末尾就会被
       // 省略号吃掉，而那一段正是要看的数。
       // token 列比速度列宽一点：它要放「1.2M」大字加「↑输入 12.3K」这种一行一个的小字。
       // 成功率列只放「98.5%」加副行「166/168」：主值够宽就够，副行靠 10px 字号塞进同一格。
@@ -870,7 +870,7 @@ window.__ModuleLoader__.load({
                 style: S.modelConcWrap,
                 title: '该模型同时最多几个请求，对所有分组统一生效；留空 = 跟随默认上限'
                   + (defaultConcHint ? '（' + defaultConcHint + '）' : '')
-                  + '。达到上限时会先尝试切到组内其它空闲模型，都满才排队。',
+                  + '。达到上限时立刻切到组内其它空闲模型，不在闸门里排队；整组都满才等槽位释放。',
                 onClick: function (ev) { ev.stopPropagation() },
               },
                 e('span', { style: S.modelConcLabel }, '并发'),
@@ -1495,11 +1495,11 @@ window.__ModuleLoader__.load({
             + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时（大字是区间中位数 P50，'
             + '小字是这个模型此刻所有在跑请求的总速度，实时、按字符估 token）；'
             + 'token = 所选区间内该模型的输入/输出/缓存用量合计（只统计适配器报了 usage 的调用）；'
-            + '并发 = 正在进行的请求 / 生效上限（上限直接在「并发」列改，按模型持久化、对所有分组统一生效）。'),
+            + '并发 = 正在进行的请求 / 生效上限（上限直接在「并发」列改，按模型持久化、对所有分组统一生效；达到上限时立刻换组内其它模型，不排队）。'),
           e('div', { style: S.metricsNote },
             '副行灰字是该列的补充：成功率给成功数 / 采样数，首字给 P90，速度给实时总速度（没请求在跑时不显示），'
             + 'token 一行一个数给输入 / 缓存命中 / 缓存写入 / 输出（鼠标悬停大字看历史总量），'
-            + '并发给等槽时间与排队数，模型给所属分组。'
+            + '并发给等槽时间与等槽位数（闸门里不排队，只有整组都满时才有人等），模型给所属分组。'
             + '模型行的「移除」把这个模型从它所属分组里摘掉；当日失败的行点状态列的「恢复」立即重新参与路由。'
             + '采样与 token 用量会落盘，重启后仍在。'),
           noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
@@ -1635,9 +1635,9 @@ window.__ModuleLoader__.load({
                   }, fmtTps(r.tpsP50)),
                   sub)
               }
-              // 并发副行：等槽时间优先，其次排队数；都没有就不画
+              // 并发副行：等槽时间优先，其次等槽位数；都没有就不画
               var concSub = isNum(r.waitP50) && r.waitP50 > 0 ? '等槽 ' + fmtMs(r.waitP50) : null
-              var queueSub = queued > 0 ? '排队 ' + queued : null
+              var queueSub = queued > 0 ? '等槽位 ' + queued : null
               var concSubText = [concSub, queueSub].filter(Boolean).join(' · ')
               return e('div', { key: k, style: style },
                 // 模型列允许折行：provider/model 再长也看全，title 兜底完整值
@@ -1763,8 +1763,8 @@ window.__ModuleLoader__.load({
                     }))
                 })(),
                 // 并发：两行。上行是上限输入框（与「模型」页签同一份提交逻辑，按模型
-                // 持久化、对所有分组统一生效），下行是「进行中 / 生效上限」加等槽、
-                // 排队。这一格装两个独立事实——可编辑的上限、实时的进行中数——并排
+                // 持久化、对所有分组统一生效），下行是「进行中 / 生效上限」加等槽时间
+                // 与等槽位数。这一格装两个独立事实——可编辑的上限、实时的进行中数——并排
                 // 会让后者被压成省略号，而它正是要看的那一个。没配上限（跟随默认，
                 // 默认也是不限）的行写成「N（不限）」：进行中照常计数，不限的只是上限。
                 e('div', { style: S.metricsNumCell },
@@ -1778,9 +1778,9 @@ window.__ModuleLoader__.load({
                       'aria-label': '并发上限',
                       title: '并发上限：正整数即写死（对所有分组统一生效）；留空或 0 = 跟随默认上限'
                         + (defaultHint ? '（' + defaultHint + '）' : '')
-                        + '\n当前进行中：' + inflight + (effConc === null ? '（不限上限，不排队）' : ' / 上限 ' + effConc)
-                        + (queued > 0 ? '\n排队中：' + queued : '')
-                        + '。达到上限时先尝试切到组内其它空闲模型，都满才排队',
+                        + '\n当前进行中：' + inflight + (effConc === null ? '（不限上限）' : ' / 上限 ' + effConc)
+                        + (queued > 0 ? '\n等槽位：' + queued : '')
+                        + '。达到上限时立刻切到组内其它空闲模型，不在闸门里排队；整组都满才等槽位释放',
                       onChange: function (ev) { commitConcurrency(r.provider, r.model, ev.target.value) },
                       onBlur: function () { concBlur(k) },
                     })),

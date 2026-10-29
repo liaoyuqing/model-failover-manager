@@ -31,9 +31,11 @@
 #            model-concurrency.json (default: 0, unlimited). The cap is keyed by
 #            model rather than stored on a group entry, because one model
 #            reached through several groups shares the same upstream accounts.
-#   concurrencyQueueTimeoutMs: how long a request may wait for a concurrency
-#            slot before it fails as CAPACITY_TIMEOUT and reroutes to another
-#            model in the group (default: 180000; 0 waits forever)
+#   concurrencyQueueTimeoutMs: how long routing waits for a slot when the whole
+#            group is full and there is nowhere to switch. The gate itself never
+#            queues: a request that cannot get a slot fails as CAPACITY_TIMEOUT
+#            right away and routing moves the session to a free model in the
+#            group. (default: 180000; 0 waits forever)
 #   capacityCooldownMs: how long a model that hit a capacity failure is skipped
 #            while the router picks candidates (default: 30000). Capacity
 #            failures deliberately do not mark a model failed for the day.

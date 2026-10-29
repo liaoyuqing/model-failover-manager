@@ -685,7 +685,7 @@ ok('⑫b 手动解除并发冷却后回到候选',
   (await api('GET', '/status')).body.capacityCooldowns.every(c => c.key !== 'codearts/m1'))
 await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
 
-// ⑬ 模型并发上限：按模型（全局）配置生效，且 llm/stream 闸门按它排队。
+// ⑬ 模型并发上限：按模型（全局）配置生效，且 llm/stream 闸门按它判满并当场交给路由换模型。
 await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
 await api('POST', '/groups', { id: 'gc', name: 'GC', models: [
   { provider: 'pc', model: 'mc', priority: 1 },
@@ -717,7 +717,8 @@ ok('⑬ 非法并发值被拒绝',
   (await api('POST', '/model-concurrency', { provider: 'pc', model: 'mc', concurrency: -3 })).status === 400)
 // 恢复 1，供后面的闸门与看板断言使用
 await api('POST', '/model-concurrency', { provider: 'pc', model: 'mc', concurrency: 1 })
-// 直接驱动 llm/stream 闸门：连开两个流，第二个必须等第一个结束才拿到首字。
+// 直接驱动 llm/stream 闸门：并发已满时第二个流不再排队等槽，而是当场以 CAPACITY_TIMEOUT
+// 收尾——宿主把它当一次失败交给 agent/request-error，本插件据此换到组内空闲模型。
 const streamHandler = handlers.getAll('llm/stream').at(-1)
 ok('⑬ 插件注册了 llm/stream（并发闸门与速度采样挂在这里）', typeof streamHandler === 'function',
   `listeners=${handlers.getAll('llm/stream').length}`)
@@ -732,25 +733,40 @@ function fakeStream(gate) {
   })()
 }
 const gateA = Promise.withResolvers()
-const gateB = Promise.withResolvers()
 const outA = []
 const outB = []
+let bCalledUpstream = false
 const iterA = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream(gateA.promise))
-const iterB = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream(gateB.promise))
-// 两个流的 gate 都由测试外部放开；流自己绝不 resolve 自己的 gate（否则会自我死锁）。
-gateB.resolve()
+const iterB = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => {
+  bCalledUpstream = true
+  return fakeStream()
+})
+// gate 由测试外部放开；流自己绝不 resolve 自己的 gate（否则会自我死锁）。
 const finishedA = (async () => { for await (const c of iterA) outA.push(c.type) })()
-const finishedB = (async () => { for await (const c of iterB) outB.push(c.type) })()
+const finishedB = (async () => { for await (const c of iterB) outB.push(c) })()
 await new Promise(r => setTimeout(r, 40))
-ok('⑬ 并发=1 时第二个流必须排队（首字还没到）', outB.length === 0, `outB=${JSON.stringify(outB)}`)
-// 放开 A：它跑完 → 释放槽位 → B 才被唤醒
+// 第二个流在闸门里就被判失败：唯一一个 chunk 是 finish(error)，没有首字、没有 usage。
+ok('⑬ 并发=1 时第二个流不再排队，当场以 CAPACITY_TIMEOUT 失败（满了就换模型）',
+  outB.length === 1 && outB[0]?.type === 'finish' && outB[0]?.reason?.kind === 'error'
+  && outB[0]?.reason?.failure?.code === 'CAPACITY_TIMEOUT',
+  `outB=${JSON.stringify(outB)}`)
+ok('⑬ 满了就不再去上游（不占着连接空等首字）', bCalledUpstream === false)
+ok('⑬ 第一个流不受第二个流失败影响（还没跑完）', outA.includes('finish') === false, `outA=${JSON.stringify(outA)}`)
+const cappedRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
+// 记进采样是为了看板能说明「为什么切了」；只记成功会让满槽失败变成看不见的空白。
+ok('⑬ 满槽失败记进采样（看板看得见原因，不冒充成功）',
+  cappedRow?.lastErrorCode === 'CAPACITY_TIMEOUT',
+  JSON.stringify({ lastErrorCode: cappedRow?.lastErrorCode, okSamples: cappedRow?.okSamples }))
 gateA.resolve()
 await Promise.all([finishedA, finishedB])
-ok('⑬ 第一个流跑完后第二个才拿到首字', outB.length > 0, `outA=${JSON.stringify(outA)} outB=${JSON.stringify(outB)}`)
-ok('⑬ 两个流都完整透传（闸门不改写 chunk）',
-  outA.join(',') === 'text-delta,text-delta,usage,finish'
-  && outB.join(',') === 'text-delta,text-delta,usage,finish',
-  `outA=${outA.join(',')} outB=${outB.join(',')}`)
+ok('⑬ 第一个流完整透传（闸门不改写 chunk）',
+  outA.join(',') === 'text-delta,text-delta,usage,finish', `outA=${outA.join(',')}`)
+// 闸门放开后再跑一次成功调用：上面那条满槽失败不是成功样本，而 ⑰/⑱/⑲ 的 token 累计
+// 需要两个成功样本（这是这次改动与之前唯一的行为差别）。
+const openGate = Promise.withResolvers()
+const iterOpen = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream(openGate.promise))
+openGate.resolve()
+for await (const _c of iterOpen) { /* 只为补一个成功样本 */ }
 
 // ⑬b 未配置并发上限的模型：不排队，但「当前并发」照样计数（数据看板要显示它）
 //     上限与计数是两件事：limit=0 只意味着「不排队」，不是「不统计」。
@@ -801,6 +817,99 @@ ok('⑬b 两个流都完整透传（无上限这条路也不改写 chunk）',
   && outU2.join(',') === 'text-delta,text-delta,usage,finish',
   `outU1=${outU1.join(',')} outU2=${outU2.join(',')}`)
 await api('DELETE', '/groups/gu')
+
+// ⑬c 并发满了换模型，不排队（这条盯的是「不要排队」的终点，不只是闸门那一刻）
+//     闸门立刻判失败只是第一步：这次失败要真的变成「临时切到组内其它模型」；而整组都满
+//     时必须等槽位释放再切，不能就此判死——否则「不排队」就变成了「直接失败」。
+await api('POST', '/groups', { id: 'gcap', name: 'GCAP', models: [
+  { provider: 'pcx', model: 'mx', priority: 1 },
+  { provider: 'pcx', model: 'mx2', priority: 2 },
+] })
+await api('POST', '/model-concurrency', { provider: 'pcx', model: 'mx', concurrency: 1 })
+await api('POST', '/model-concurrency', { provider: 'pcx', model: 'mx2', concurrency: 1 })
+// 顺序很关键：会话先绑组（此刻 mx 空着，所以落在 priority 1 的 mx），再把 mx 占满。
+// 反过来做就成了「会话本来就在 mx2 上，却收到一条 mx 的满分失败」——那不是要验的场景。
+const a = makeAgent('cap-switch-1', {}, 'mx')
+agents.push(a)
+await api('POST', '/session-group', { sessionId: 'cap-switch-1', groupId: 'gcap', mode: 'route' })
+const routedTo = switchOf('cap-switch-1')
+const holdMx = Promise.withResolvers()
+const iterMx = await streamHandler({ provider: 'pcx', model: 'mx', messages: [] }, () => fakeStream(holdMx.promise))
+const drainMx = (async () => { for await (const _c of iterMx) { /* 只为占住槽位 */ } })()
+await new Promise(r => setTimeout(r, 30))
+{
+  const mxRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pcx' && r.model === 'mx')
+  ok('⑬c 会话先绑到组的首选模型（它是后面失败的模型）', routedTo === 'mx', JSON.stringify({ routedTo }))
+  ok('⑬c 先占满 mx（1/1），组内还剩 mx2 空着', mxRow?.inflight === 1, JSON.stringify({ inflight: mxRow?.inflight }))
+  a.status = 'running'
+  const startedAt = Date.now()
+  await errHandler({ agent: a, turn: 1, provider: 'pcx',
+    failure: { code: 'CAPACITY_TIMEOUT', message: 'pcx/mx 的并发已满（1/1），立刻换组内其它模型' } },
+    () => Promise.resolve(undefined))
+  const elapsedMs = Date.now() - startedAt
+  a.status = 'idle'
+  const log = await lastLogFor('cap-switch-1')
+  // 不是原地重试同一个满模型，而是换到空闲的兄弟——这才是「临时切到其他模型」。
+  ok('⑬c 并发满了临时切到组内空闲的兄弟模型',
+    log?.outcome === 'capacity-switched' && switchOf('cap-switch-1') === 'mx2',
+    JSON.stringify({ outcome: log?.outcome, model: switchOf('cap-switch-1') }))
+  ok('⑬c 有兄弟可用时立刻切，没在任何地方等槽', elapsedMs < 1000, `elapsedMs=${elapsedMs}`)
+  for (const fn of handlers.getAll('agent/status')) fn({ agent: a, status: 'idle' })
+  await Promise.resolve()
+  ok('⑬c 切换后照样排一条续跑（换了模型，话得接着说）',
+    followups.some(f => f.id === 'cap-switch-1'), JSON.stringify(followups.map(f => f.id)))
+}
+holdMx.resolve()
+await drainMx
+
+// ⑬c 续：整组都满 → 等槽位释放（concurrencyQueueTimeoutMs 只管这一段），而不是判死
+const holdMxAgain = Promise.withResolvers()
+const holdMx2 = Promise.withResolvers()
+const iterMxA = await streamHandler({ provider: 'pcx', model: 'mx', messages: [] }, () => fakeStream(holdMxAgain.promise))
+const iterMx2 = await streamHandler({ provider: 'pcx', model: 'mx2', messages: [] }, () => fakeStream(holdMx2.promise))
+const drainMxA = (async () => { for await (const _c of iterMxA) { /* 占住 */ } })()
+const drainMx2 = (async () => { for await (const _c of iterMx2) { /* 占住 */ } })()
+await new Promise(r => setTimeout(r, 30))
+{
+  const pcxRows = (await api('GET', '/metrics')).body.rows.filter(r => r.provider === 'pcx')
+  const rowOf = (name) => pcxRows.find(r => r.model === name)
+  ok('⑬c 组内两个模型都占满（各自 1/1）',
+    rowOf('mx')?.inflight === 1 && rowOf('mx2')?.inflight === 1,
+    JSON.stringify(pcxRows.map(r => ({ m: r.model, i: r.inflight, q: r.queued }))))
+  const a = makeAgent('cap-wait-1', {}, 'mx')
+  agents.push(a)
+  await api('POST', '/session-group', { sessionId: 'cap-wait-1', groupId: 'gcap', mode: 'route' })
+  a.status = 'running'
+  const waiting = errHandler({ agent: a, turn: 1, provider: 'pcx',
+    failure: { code: 'CAPACITY_TIMEOUT', message: 'pcx/mx 的并发已满（1/1），立刻换组内其它模型' } },
+    () => Promise.resolve(undefined))
+  await new Promise(r => setTimeout(r, 60))
+  // 唯一能换过去的 mx2 也满 → 只能等它释放；看板上的 queued 就是这件事的读数。
+  // 这一刻 errHandler 还没返回，所以这条断言证明的是「在等」，不是「等完失败了」。
+  const waitingRows = (await api('GET', '/metrics')).body.rows.filter(r => r.provider === 'pcx')
+  ok('⑬c 整组都满时不判死，转成等槽位（看板 queued≥1）',
+    waitingRows.reduce((sum, r) => sum + (r.queued ?? 0), 0) >= 1,
+    JSON.stringify(waitingRows.map(r => ({ m: r.model, i: r.inflight, q: r.queued }))))
+  // 两个槽位一起放开：等的是哪一个都不影响「等到了就切」这件事，也避免用例自己死锁。
+  holdMx2.resolve()
+  holdMxAgain.resolve()
+  await waiting
+  a.status = 'idle'
+  const log = await lastLogFor('cap-wait-1')
+  const picks = appended.filter(e => e.id === 'cap-wait-1').map(e => e.data?.model)
+  // 等到的那个模型必须真的换了人（不是原地不动），并且记成一次并发切换。
+  ok('⑬c 槽位一释放就切过去（等到就是切，不是放弃）',
+    log?.outcome === 'capacity-switched' && picks.at(-1) === 'mx2',
+    JSON.stringify({ outcome: log?.outcome, picks }))
+  const freedRows = (await api('GET', '/metrics')).body.rows.filter(r => r.provider === 'pcx')
+  ok('⑬c 等到槽位后 queued 归零（等人这件事有始有终）',
+    freedRows.every(r => (r.queued ?? 0) === 0), JSON.stringify(freedRows.map(r => ({ m: r.model, q: r.queued }))))
+}
+await Promise.all([drainMxA, drainMx2])
+await api('POST', '/model-concurrency', { provider: 'pcx', model: 'mx', concurrency: null })
+await api('POST', '/model-concurrency', { provider: 'pcx', model: 'mx2', concurrency: null })
+await api('POST', '/capacity/reset', {})
+await api('DELETE', '/groups/gcap')
 
 // ⑭ 数据看板：首字延迟与输出速度
 const metrics = (await api('GET', '/metrics')).body
@@ -930,7 +1039,7 @@ const tokRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider ===
 ok('⑰ 看板行带 token 汇总字段',
   tokRow !== undefined && 'inTokens' in tokRow && 'outTokens' in tokRow && 'tokenSamples' in tokRow,
   JSON.stringify(tokRow && { i: tokRow.inTokens, o: tokRow.outTokens, n: tokRow.tokenSamples }))
-// fakeStream 每次吐 input 10 / output 8，共跑了两次（⑬ 的 A、B）
+// fakeStream 每次吐 input 10 / output 8；成功的两跑 = ⑬ 的 A 与紧接着那次补跑（B 被闸门判满、没有 usage）
 ok('⑰ 输入 token 是区间内累加值（10×2）', tokRow?.inTokens === 20, `in=${tokRow?.inTokens}`)
 ok('⑰ 输出 token 是区间内累加值（8×2）', tokRow?.outTokens === 16, `out=${tokRow?.outTokens}`)
 ok('⑰ tokenSamples 只数带 usage 的样本', tokRow?.tokenSamples >= 2, `n=${tokRow?.tokenSamples}`)
@@ -946,10 +1055,10 @@ const metricsPath = join(dir, 'metrics.json')
 ok('⑱ 采样写进了 dataDir/metrics.json', existsSync(metricsPath), metricsPath)
 const onDisk = existsSync(metricsPath) ? JSON.parse(readFileSync(metricsPath, 'utf8')) : null
 ok('⑱ 落盘内容按 provider/model 分组，且带 token 字段',
-  onDisk?.['pc/mc']?.length >= 2
-  && typeof onDisk['pc/mc'][0].inTokens === 'number'
-  && typeof onDisk['pc/mc'][0].outTokens === 'number',
-  JSON.stringify(onDisk?.['pc/mc']?.slice(-1)))
+  (onDisk?.['pc/mc']?.length ?? 0) >= 2
+  && onDisk['pc/mc'].every(s => 'inTokens' in s && 'outTokens' in s)
+  && onDisk['pc/mc'].some(s => s.inTokens === 10 && s.outTokens === 8),
+  JSON.stringify(onDisk?.['pc/mc']?.slice(-2)))
 // 模拟重启：用同一个 dataDir 重新 apply 一次，历史样本应被读回
 const ctx2 = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
 let routeHandler2 = null
@@ -978,6 +1087,8 @@ ok('⑱ 重启后首字与速度分位数也在', typeof restarted?.tpsP50 === '
 const BULK = 220
 const beforeBulk = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pc' && r.model === 'mc')
 const beforeSamples = beforeBulk?.samples ?? 0
+// 带 usage 的样本数另算：闸门判满的那次失败样本没有 token，不能算进 10/8 的倍数里。
+const beforeTokenSamples = beforeBulk?.tokenSamples ?? 0
 for (let i = 0; i < BULK; i++) {
   // 逐条串行：并发上限是 1，并发跑会在闸门里排队
   const iter = await streamHandler({ provider: 'pc', model: 'mc', messages: [] }, () => fakeStream())
@@ -991,7 +1102,8 @@ ok('⑲ 超过 200 条也不裁剪，样本数等于实际调用次数',
 ok('⑲ /metrics 不再声明每模型条数上限（sampleLimit 为 null）',
   bulkMetrics.sampleLimit === null, `sampleLimit=${JSON.stringify(bulkMetrics.sampleLimit)}`)
 ok('⑲ token 合计按全部样本累加（不是最近 200 条）',
-  bulkRow?.inTokens === 10 * (beforeSamples + BULK) && bulkRow?.outTokens === 8 * (beforeSamples + BULK),
+  bulkRow?.inTokens === 10 * (beforeTokenSamples + BULK)
+  && bulkRow?.outTokens === 8 * (beforeTokenSamples + BULK),
   JSON.stringify({ i: bulkRow?.inTokens, o: bulkRow?.outTokens, n: bulkRow?.samples }))
 await new Promise(r => setTimeout(r, 1800))
 ok('⑲ 全量样本也照样落盘（重启后能读回同样条数）', (() => {

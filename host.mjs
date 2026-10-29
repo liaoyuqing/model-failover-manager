@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v81'
+const HOST_VERSION = 'v82'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -273,12 +273,16 @@ export function apply(ctx, config = {}) {
     ctx.logger.warn(`[model-failover] config.defaultConcurrency=${JSON.stringify(defaultConcurrencyRaw)} 非法（需 >=0 的整数，0 为不限），回退 0`)
   }
 
-  // 并发闸门的排队上限：占到槽位之前最多等多久，超时就把这次请求判为 CAPACITY_TIMEOUT，
-  // 让失败路径按「临时换组内其它模型」接手。0 = 无限等（只用于确认上游一定会放行的部署）。
+  // 「整组模型都满」时等槽位释放的上限。
+  //
+  // 模型自己的槽满了并不会等：闸门立刻把这次调用判成 CAPACITY_TIMEOUT，让失败路径按
+  // 「临时换组内其它模型」接手（见 acquireSlot）。只有路由把整组都挑了一遍、连兜底候选
+  // 都满时，才退化成等槽位——那一刻没有可换的目标，等待是唯一能推进的动作。
+  // 0 = 无限等（只用于确认上游一定会放行的部署）。
   //
   // 为什么必须有上限：闸门挂在 llm/stream，那里改不了 provider/model（selection 在
-  // pre-step 已冻结），所以闸门自己能做的只有「等」和「报错让路由接手」。无限等会让
-  // 用户看到界面卡住却没有任何切换，正是这个插件要消除的体验。
+  // pre-step 已冻结），所以它能做的只有「报错让路由接手」和「等」。无限等会让用户看到
+  // 界面卡住却没有任何切换，正是这个插件要消除的体验。
   const concurrencyQueueTimeoutRaw = config.concurrencyQueueTimeoutMs
   const concurrencyQueueTimeoutMs = Number.isInteger(concurrencyQueueTimeoutRaw) && concurrencyQueueTimeoutRaw >= 0
     ? concurrencyQueueTimeoutRaw
@@ -457,8 +461,9 @@ export function apply(ctx, config = {}) {
   // ② 数据看板要能看首字延迟和 token 输出速度。
   //
   // 并发闸门挂在 `llm/stream`（waterfall，宿主每次模型调用都会经过）：
-  // 进流前占一个槽，流出完/出错释放。占不到槽时**排队**而不是报错——路由挑选时
-  // 已经尽量避开满的模型（见 routable/pickCandidate），这里兜住「刚好都满」的瞬间。
+  // 进流前占一个槽，流出完/出错释放。占不到槽时**立刻**把这次调用判成 CAPACITY_TIMEOUT，
+  // 交给失败路径临时换到组内其它模型：闸门自己改不了 provider/model（selection 在
+  // pre-step 已冻结），报错是它唯一能推动切换的动作。
   //
   // 速度采样同样在 `llm/stream` 里做，但只用流上的时间戳与事件算：
   //  · 首字延迟（TTFT）= 第一个 text/reasoning/tool-call delta 到达的时刻 - 请求发出时刻
@@ -467,7 +472,7 @@ export function apply(ctx, config = {}) {
 
   /** provider/model -> 正在占用中的并发数 */
   const inflightByModel = new Map()
-  /** 排队等槽的 promise，按 provider/model 分组保证 FIFO */
+  /** 等槽位释放的订阅者（只有「整组都满」那条路会用到），按 provider/model 分组保证 FIFO */
   const waitingByModel = new Map()
 
   /**
@@ -498,26 +503,30 @@ export function apply(ctx, config = {}) {
   const CAPACITY_TIMEOUT_CODE = 'CAPACITY_TIMEOUT'
 
   /**
-   * 占用一个并发槽；已满则排队，超过 `concurrencyQueueTimeoutMs` 就放弃。
+   * 占用一个并发槽；满了**立刻**失败，不排队。
    *
-   * 队列是每个 `provider/model` 一条 FIFO：释放时一次性唤醒队首，队首下一轮循环自己
-   * 重新判断槽位，因此这里不需要把槽位直接转交给被唤醒者。
+   * 为什么不在闸门里等：闸门挂在 `llm/stream`，那里改不了 provider/model（selection 在
+   * pre-step 已冻结），闸门唯一能推动切换的动作就是把这次调用判成失败，让宿主走
+   * agent/request-error → 本插件的分组路由接手。旁边往往就有空闲模型，让用户盯着一个
+   * 不动的会话等槽位，正是这个插件要消除的体验。
    *
-   * 无论 `limit` 是多少都会计数 `inflightByModel`：`limit` 只决定满了之后排不排队，
+   * 「整组模型都满、路由无处可换」不在这里等，由 routeAfterModelFailure 用
+   * `awaitSlotFree` 接手——只有那里才知道「一个可换的目标都没有」。
+   *
+   * 无论 `limit` 是多少都会计数 `inflightByModel`：`limit` 只决定满了之后放行还是判失败，
    * 不决定要不要统计。看板要给「没配上限」的模型显示当前并发数，靠的就是这条计数。
    *
    * @param {string} key - `provider/model`。
-   * @param {number} limit - 上限，0 = 不限（不排队，但仍占槽计数）。
-   * @param {AbortSignal|undefined} signal - 请求取消信号；取消时退出排队。
-   * @returns {Promise<() => void>} 释放函数；重复调用安全。
-   * @throws 排队超时抛 `{ code: CAPACITY_TIMEOUT_CODE }`；取消时抛取消原因。
+   * @param {number} limit - 上限，0 = 不限（永远占得到，但仍占槽计数）。
+   * @returns {() => void} 释放函数；重复调用安全。
+   * @throws 槽位已满时抛 `{ code: CAPACITY_TIMEOUT_CODE }`。
    */
-  async function acquireSlot(key, limit, signal) {
+  function acquireSlot(key, limit) {
     /**
      * 占一个槽位，返回释放函数。
      *
      * 占与释放是配对的，所以两条路径（有上限、无上限）共用这里：上限只决定
-     * 「满了怎么办」（排队还是直接放行），不决定「要不要计数」。
+     * 「满了怎么办」（判失败还是直接放行），不决定「要不要计数」。
      *
      * @returns {() => void} 释放函数；重复调用安全。
      */
@@ -530,6 +539,8 @@ export function apply(ctx, config = {}) {
         const now = (inflightByModel.get(key) ?? 1) - 1
         if (now <= 0) inflightByModel.delete(key)
         else inflightByModel.set(key, now)
+        // 唤醒一个等槽位的人（只有「整组都满」那条路会挂在这里）。唤醒只告诉他
+        // 「有人释放了」，槽位可能立刻被别的请求抢走，所以他要自己再看一次。
         const waiters = waitingByModel.get(key)
         if (waiters !== undefined && waiters.length > 0) {
           const next = waiters.shift()
@@ -538,25 +549,56 @@ export function apply(ctx, config = {}) {
         }
       }
     }
-    // 不限上限（limit=0）：照常计数，只是不排队。计数与上限是两件事——
+    // 不限上限（limit=0）：照常计数，也不占槽就放行。计数与上限是两件事——
     // 看板的「当前并发」问的是「此刻几个请求正在跑」，没配上限的模型一样在跑，
     // 提前返回空释放会让这些行永远显示 0（用户以为链路没在用）。
     if (limit <= 0) return takeSlot()
-    const deadline = concurrencyQueueTimeoutMs > 0 ? Date.now() + concurrencyQueueTimeoutMs : null
+    const inflight = inflightByModel.get(key) ?? 0
+    if (inflight < limit) return takeSlot()
+    // 满了：不占槽、不入队，直接把这次调用判成失败，让分组路由换组内其它模型。
+    const err = new Error(`${key} 的并发已满（${inflight}/${limit}），立刻换组内其它模型`)
+    err.code = CAPACITY_TIMEOUT_CODE
+    throw err
+  }
+
+  /**
+   * 该模型此刻有没有空槽位（不排队就占得到）。
+   *
+   * 「并发冷却中」也算没有：冷却记录说的是「它刚刚满了」，路由不该把一个刚报满的模型
+   * 当空闲模型用。
+   *
+   * @param {string} provider - provider id。
+   * @param {string} model - model id。
+   * @returns {boolean} 现在就能占到槽位则为 true。
+   */
+  function hasFreeSlot(provider, model) {
+    if (capacityCooldownOf(provider, model) !== null) return false
+    const limit = concurrencyLimitOf(provider, model)
+    if (limit <= 0) return true
+    return (inflightByModel.get(failKey(provider, model)) ?? 0) < limit
+  }
+
+  /**
+   * 等某个模型的槽位释放——只用在「整组模型都满、无处可换」这一条路上。
+   *
+   * 模型自己的槽满了不会在这里等（闸门立刻失败，交给路由换模型）；只有路由把整组都挑
+   * 了一遍、连兜底候选都满时，等待才是唯一能推进的动作——不等就只剩把这一轮判失败。
+   *
+   * @param {string} key - `provider/model`。
+   * @param {number} limit - 该模型的上限；0 = 不限（永远有空位）。
+   * @param {number} timeoutMs - 最多等多久；0 = 无限等。
+   * @returns {Promise<boolean>} true = 现在就有空位或等到了；false = 超时。
+   */
+  async function awaitSlotFree(key, limit, timeoutMs) {
+    if (limit <= 0) return true
+    if ((inflightByModel.get(key) ?? 0) < limit) return true
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null
     for (;;) {
-      const inflight = inflightByModel.get(key) ?? 0
-      if (inflight < limit) return takeSlot()
       const remaining = deadline === null ? null : deadline - Date.now()
-      if (remaining !== null && remaining <= 0) {
-        // 排队超时：不占用槽位，也不动队列——让上层把它当成一次失败，交给分组路由换模型。
-        const err = new Error(`${key} 的并发已满，排队 ${Math.round(concurrencyQueueTimeoutMs / 1000)}s 仍未拿到槽位`)
-        err.code = CAPACITY_TIMEOUT_CODE
-        throw err
-      }
-      // 满了：排到队尾，等有人释放、自己被取消、或排队超时。
-      await new Promise((resolve, reject) => {
+      if (remaining !== null && remaining <= 0) return false
+      const woken = await new Promise((resolve) => {
         const waiters = waitingByModel.get(key) ?? []
-        // settle 保证「唤醒 / 取消 / 超时」三者只有第一个生效，且都把自己从队列摘掉。
+        // settle 保证「唤醒 / 超时」只有第一个生效，且都把自己从队列摘掉。
         let settled = false
         let timer = null
         const detach = () => {
@@ -564,30 +606,21 @@ export function apply(ctx, config = {}) {
           if (rest.length === 0) waitingByModel.delete(key)
           else waitingByModel.set(key, rest)
         }
-        const finish = (fn) => {
+        const finish = (value) => {
           if (settled) return
           settled = true
           detach()
-          signal?.removeEventListener('abort', onAbort)
           if (timer !== null) clearTimeout(timer)
-          fn()
+          resolve(value)
         }
-        const wake = () => finish(resolve)
-        const onAbort = () => finish(() => reject(signal?.reason ?? new Error('concurrency wait aborted')))
+        const wake = () => finish(true)
         waiters.push(wake)
         waitingByModel.set(key, waiters)
-        if (remaining !== null) {
-          timer = setTimeout(() => {
-            const err = new Error(`${key} 的并发已满，排队 ${Math.round(concurrencyQueueTimeoutMs / 1000)}s 仍未拿到槽位`)
-            err.code = CAPACITY_TIMEOUT_CODE
-            finish(() => reject(err))
-          }, remaining)
-        }
-        if (signal !== undefined) {
-          if (signal.aborted) { onAbort(); return }
-          signal.addEventListener('abort', onAbort, { once: true })
-        }
+        if (remaining !== null) timer = setTimeout(() => finish(false), remaining)
       })
+      if (!woken) return false
+      // 唤醒只说明有人释放了，槽位可能已被同组别的请求抢走，所以要重新看一次。
+      if ((inflightByModel.get(key) ?? 0) < limit) return true
     }
   }
 
@@ -926,7 +959,7 @@ export function apply(ctx, config = {}) {
    * 包一层 `llm/stream`：并发闸门 + 速度采样。
    *
    * 只在 `next()` 产出的流上做统计；自己**绝不**改写 chunk，也不缓存正文。
-   * 唯一的例外是排队超时：此时**不调用** next()，直接吐一个 `finish(error)`，把这次
+   * 唯一的例外是槽位已满：此时**不调用** next()，直接吐一个 `finish(error)`，把这次
    * 调用判成 CAPACITY_TIMEOUT 失败——宿主随后会走 agent/request-error，本插件在那里
    * 按「临时换到组内其它模型」接手。这是 llm/stream 里唯一能推动切换的方式：
    * selection 在 pre-step 已经冻结，闸门自己改不了 provider/model。
@@ -943,9 +976,10 @@ export function apply(ctx, config = {}) {
     const startedAt = Date.now()
     let release
     try {
-      release = await acquireSlot(key, limit, options?.signal)
+      release = acquireSlot(key, limit)
     } catch (err) {
-      // 取消不是失败：既不采样，也不换模型，原样抛给宿主按取消处理。
+      // 到这里只可能是「槽位已满」：不占槽、不生成，记一次失败样本，再把这次调用判成
+      // CAPACITY_TIMEOUT——宿主会走 agent/request-error，本插件在那里换模型。
       if (err?.code !== CAPACITY_TIMEOUT_CODE) throw err
       recordSpeedSample(key, {
         ttftMs: null, inTokens: null, outTokens: null, speedTps: null,
@@ -2263,13 +2297,27 @@ export function apply(ctx, config = {}) {
       noteFailure(agent, provider, failure, 'no-target', { model, detail: why, uncompressed: compressionGap !== null })
       return 'no-target'
     }
-    // 整组都并发打满时不换：换过去也是同一个满池，只会在两个模型之间来回抖。
-    // 让这次失败照常暴露，由下一轮的开始检查再判断（那时可能已经有槽位释放）。
-    if (capacityFailure && capacityCooldownOf(target.provider, target.model) !== null) {
-      const why = '组内模型全部并发已满，换过去也不会好，等槽位释放后再路由'
-      ctx.logger.warn(`[model-failover] ${provider}/${model} ${why}`)
-      noteFailure(agent, provider, failure, 'all-capacity', { model, detail: why })
-      return 'all-capacity'
+    // 连兜底候选都占不到槽位：换过去也是同一个满池，只会在两个模型之间来回抖。
+    // 此时没有可换的目标，唯一能推进的动作是**等槽位释放**——等到就照常切过去续跑，
+    // 等不到（超过 concurrencyQueueTimeoutMs）才把这一轮判失败。
+    //
+    // 这不等同于「排队」：模型自己满时闸门是立刻失败的（见 acquireSlot），只有
+    // 「整组都满」这一条路才会等，因为那一刻除了等没有别的选择。
+    if (capacityFailure && !hasFreeSlot(target.provider, target.model)) {
+      const key = failKey(target.provider, target.model)
+      const limit = concurrencyLimitOf(target.provider, target.model)
+      const budget = concurrencyQueueTimeoutMs > 0 ? `${Math.round(concurrencyQueueTimeoutMs / 1000)}s` : '不限'
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 并发已满，组内 ${target.provider}/${target.model} 也满，等槽位释放（最多 ${budget}）`)
+      const freed = await awaitSlotFree(key, limit, concurrencyQueueTimeoutMs)
+      if (disposed || !freed) {
+        const why = freed ? '插件已卸载，放弃这次切换' : `组内模型全部并发已满，等 ${budget} 仍没有槽位`
+        ctx.logger.warn(`[model-failover] ${provider}/${model} ${why}`)
+        noteFailure(agent, provider, failure, 'all-capacity', { model, detail: why })
+        return 'all-capacity'
+      }
+      // 刚等到空位说明这个模型已经不满了，它当时记下的冷却对现在已过时；留着会让
+      // 下一轮 rerouteForNewTurn 立刻又把它换走，等于白等。
+      capacityCooldowns.delete(key)
     }
     if (inherited?.inherited) {
       ctx.logger.info(`[model-failover] 子代理 ${id} 按继承的分组 ${binding.groupId}（来自 ${inherited.viaSessionId}）切换`)
@@ -3085,6 +3133,8 @@ export function apply(ctx, config = {}) {
             aggregateTps: liveSpeedOf(key, sampledAt),
             concurrency: limit > 0 ? limit : null,
             inflight: inflightByModel.get(key) ?? 0,
+            // 等槽位中的请求数：闸门自己不再排队，这个数只在「整组都满、正在等这个
+            // 模型的槽位释放」时才不为 0（见 routeAfterModelFailure 的那条等待）。
             queued: (waitingByModel.get(key) ?? []).length,
             failed: isFailed(m.provider, m.model),
             disabled: m.disabled === true,
