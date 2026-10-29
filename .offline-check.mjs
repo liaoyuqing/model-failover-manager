@@ -799,7 +799,7 @@ ok('⑬b /status 也报出进行中计数（不只有上限的模型才有）',
   JSON.stringify({ concurrency: liveStatus?.concurrency, inflight: liveStatus?.inflight }))
 // ⑭b 实时总速度：借 ⑬b 的两路并发窗口读它，因为这一格问的正是「此刻在跑的请求加起来多快」。
 //     它不是历史 P50（那两个数回答的不是同一个问题），所以必须在流还没结束时才有值。
-ok('⑭b 有流在跑时行上带实时总速度 aggregateTps > 0',
+ok('⑭b 有流在跑时行上带活跃区间合计速度 aggregateTps > 0',
   typeof liveRow?.aggregateTps === 'number' && liveRow.aggregateTps > 0,
   JSON.stringify({ aggregateTps: liveRow?.aggregateTps }))
 looseA.resolve()
@@ -810,12 +810,37 @@ ok('⑬b 流结束后计数归零（不会只涨不落）',
   afterRow?.inflight === 0 && afterRow?.queued === 0,
   JSON.stringify({ inflight: afterRow?.inflight, queued: afterRow?.queued }))
 // 实时值必须跟着流消失：留着会让看板一直显示一个不动的数，比空着更容易误读。
-ok('⑭b 流结束后实时总速度回到 null（不留一个不动的数）',
+ok('⑭b 流结束后合计速度回到 null（不留一个不动的数）',
   afterRow?.aggregateTps === null, JSON.stringify({ aggregateTps: afterRow?.aggregateTps }))
 ok('⑬b 两个流都完整透传（无上限这条路也不改写 chunk）',
   outU1.join(',') === 'text-delta,text-delta,usage,finish'
   && outU2.join(',') === 'text-delta,text-delta,usage,finish',
   `outU1=${outU1.join(',')} outU2=${outU2.join(',')}`)
+// ⑭c 活跃区间合计：分母必须是「这批请求共同的活跃区间」，不是每个请求各算各的时长。
+//     构造一个「很早就产出、之后一直没动静」的请求 A 和一个「刚开始、一口气吐很多」的
+//     请求 B：A 已静默 600ms，B 的字符是在最近几十毫秒里出的。若各请求各算各的时长
+//     （旧口径），B 会被算成上万 tok/s 的瞬时值；用共同区间作分母，读数就是
+//     (A+B 的总字符) ÷ 4 ÷ 区间秒数，量级在千级。
+const holdLateA = Promise.withResolvers()
+const holdLateB = Promise.withResolvers()
+async function* charStream(text, gate) {
+  yield { type: 'text-delta', text }
+  await gate
+  yield { type: 'finish', reason: 'stop' }
+}
+const iterLateA = await streamHandler({ provider: 'pu', model: 'mu', messages: [] }, () => charStream('aaaa', holdLateA.promise))
+const doneLateA = (async () => { for await (const _c of iterLateA) { /* 保持活跃 */ } })()
+await new Promise(r => setTimeout(r, 600))
+const iterLateB = await streamHandler({ provider: 'pu', model: 'mu', messages: [] }, () => charStream('b'.repeat(4000), holdLateB.promise))
+const doneLateB = (async () => { for await (const _c of iterLateB) { /* 保持活跃 */ } })()
+await new Promise(r => setTimeout(r, 60))
+const lateRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider === 'pu' && r.model === 'mu')
+ok('⑭c 合计速度的分母是共同活跃区间（刚起步的请求不会虚高）',
+  typeof lateRow?.aggregateTps === 'number' && lateRow.aggregateTps > 200 && lateRow.aggregateTps < 8000,
+  JSON.stringify({ aggregateTps: lateRow?.aggregateTps }))
+holdLateA.resolve()
+holdLateB.resolve()
+await Promise.all([doneLateA, doneLateB])
 await api('DELETE', '/groups/gu')
 
 // ⑬c 并发满了换模型，不排队（这条盯的是「不要排队」的终点，不只是闸门那一刻）

@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v82'
+const HOST_VERSION = 'v83'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -993,7 +993,7 @@ export function apply(ctx, config = {}) {
     const generatingStart = Date.now()
     // 实时读数：这条流每吐一个增量就原地更新，看板据此算「多并发总速度」。
     // 与下面结束时的 recordSpeedSample 是两件事——那份是历史样本，这份是此刻。
-    const live = { chars: 0, genStart: generatingStart, firstByteAt: null }
+    const live = { chars: 0, firstByteAt: null }
     liveOf(key).push(live)
     let firstTokenAt = null
     let usageOut = null
@@ -1197,15 +1197,20 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * 一个模型此刻所有在跑请求的总速度（token/s）。
+   * 一个模型当前活跃请求的合计速度（token/s）。
    *
-   * 口径是**实时**，不是区间聚合：只有还在跑的调用才计入，流一结束就归零——
-   * 进行中已经是 0 的行不该继续挂着一个速度。多并发时把各请求的速率相加，
-   * 所以这个数会随并发数上升；单并发时它就等于该请求此刻的速度。
+   * 口径是「活跃并发区间内的合计」：把此刻还在跑、并且已经吐出过增量的请求放进
+   * **同一段**时间里看——区间起点取它们中间最早吐首字的那一刻，终点是读取时刻。
+   * 区间内的总输出字符 ÷ 区间时长，就是这个模型这段时间的合计速度。
    *
-   * 速率的样本是两次「有增量」的 chunk 之间的字符数除以间隔，不是增量个数的
-   * 计数：适配器把长文本切多碎、要不要把 reasoning 与工具参数增量算进去，
-   * 都只影响切块方式，不影响这份速率。
+   * 为什么不是「各请求自己的速率相加」：同一次并发的几个请求起始时刻不同，各自
+   * 除以自己的时长会把刚起步的请求算得虚高、把跑了很久的请求算成它的历史平均，
+   * 加起来的数既不是此刻的吞吐，也不随并发口径可比。用同一个区间作分母，读数是
+   * 「这段时间这台模型一共产出多快」：几个请求一起跑时自然大于单个请求，也随
+   * 请求结束自然回落。
+   *
+   * 只算已经产出过增量的请求：还在等首字的请求既不贡献字符，也不该把区间起点
+   * 拉前——否则它的等待时长会把整段读数稀释掉。
    *
    * 字符到 token 的换算按 1 token ≈ CHARS_PER_TOKEN 个字符估——实时读数拿不到
    * 真实 token 数（usage 在流末尾才到），宁可用一个公开的粗估，也不把字符数
@@ -1218,21 +1223,17 @@ export function apply(ctx, config = {}) {
   function liveSpeedOf(key, now) {
     const list = liveRequests.get(key)
     if (list === undefined || list.length === 0) return null
-    let total = 0
-    let counted = 0
+    let chars = 0
+    let from = null
     for (const live of list) {
-      // 同一模型的并发请求不一定同时开始：先到的可能已经跑了几十秒，
-      // 后到的才刚吐出第一个字。速率只能各自算，不能拿总和除以一个时间差。
-      const from = live.firstByteAt ?? live.genStart
-      const spanMs = now - from
-      // 还没有任何增量（正在等首字）时不计入：此时速率是 0 而不是「未知」，
-      // 但它会把并发的总速度稀释下去，所以先不参与求和。
-      if (live.chars <= 0 || spanMs <= 0) continue
-      total += live.chars / CHARS_PER_TOKEN / (spanMs / 1000)
-      counted += 1
+      if (live.chars <= 0 || live.firstByteAt === null) continue
+      chars += live.chars
+      if (from === null || live.firstByteAt < from) from = live.firstByteAt
     }
-    if (counted === 0) return null
-    return Math.round(total * 10) / 10
+    if (chars <= 0 || from === null) return null
+    const spanMs = now - from
+    if (spanMs <= 0) return null
+    return Math.round((chars / CHARS_PER_TOKEN / (spanMs / 1000)) * 10) / 10
   }
 
   /**
@@ -3126,10 +3127,10 @@ export function apply(ctx, config = {}) {
             groupId: g.id,
             groupName: g.name,
             ...stats,
-            // 实时总速度：该模型此刻所有在跑请求的 token/s 之和，没有在跑的请求
-            // 时为 null（空着比写 0 诚实——0 会被读成「在跑但卡住了」）。
-            // 与上面的 tpsP50/tpsP90 是不同的量：那两条是历史样本的分位数，
-            // 这条跟着「进行中」实时涨落。
+            // 活跃区间合计速度：该模型这批在跑请求（各自已吐出过增量）在同一区间里的
+            // 总 token/s（见 liveSpeedOf）；没有请求在产出时为 null（空着比写 0 诚实——
+            // 0 会被读成「在跑但卡住了」）。与上面的 tpsP50/tpsP90 是不同的量：那两条是
+            // 已完成调用的历史分位数，这条跟着「进行中」涨落。
             aggregateTps: liveSpeedOf(key, sampledAt),
             concurrency: limit > 0 ? limit : null,
             inflight: inflightByModel.get(key) ?? 0,
