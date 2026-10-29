@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v80'
+const HOST_VERSION = 'v81'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -484,6 +484,16 @@ export function apply(ctx, config = {}) {
     return modelConcurrency.get(modelConcKey(provider, model)) ?? defaultConcurrency
   }
 
+  /**
+   * 实时速度的字符→token 换算：1 token ≈ 4 字符。
+   *
+   * 实时读数拿不到真实 token 数——适配器把 `usage` 放在流的末尾，看到它的时候
+   * 请求已经结束了。所以只有在跑的这段时间里按字符估；请求一结束，看板就改用
+   * 流末尾那份精确 usage 算出来的历史值。估到一位小数已经够用，这个数本来
+   * 就是给人看「这条链路现在跑得多快」，不参与任何计费。
+   */
+  const CHARS_PER_TOKEN = 4
+
   /** 排队等槽位超时后交给路由的失败码；不在宿主的默认可重试码表里，因此不会原地重试 */
   const CAPACITY_TIMEOUT_CODE = 'CAPACITY_TIMEOUT'
 
@@ -736,6 +746,28 @@ export function apply(ctx, config = {}) {
    */
   const metricsFile = join(dataDir, 'metrics.json')
 
+  /**
+   * 正在跑的请求：`provider/model` -> 这批请求的实时读数。
+   *
+   * 为什么不像 speedSamples 那样等流结束再记：多并发总速度问的是「此刻这个模型
+   * 一共在吐多少 token/s」，只有在跑的时候才有意义。等结束再算，看板上的数就变成
+   * 上一批请求的墓碑——进行中的个数已经是 0，速度却还挂在那儿。
+   *
+   * 每个值都是可变对象：流每吐一个 delta 就有人原地改它，读接口只做求和。
+   * 不进 metrics.json——重启后没有任何流在跑，这份表本来就该是空的。
+   */
+  const liveRequests = new Map()
+
+  /**
+   * 一次调用的实时读数。`text` 记这次调用吐出的字符数（含 reasoning 与工具参数
+   * 增量），两个时间戳决定它属于哪个采样区间。
+   */
+  const liveOf = (key) => {
+    let list = liveRequests.get(key)
+    if (list === undefined) { list = []; liveRequests.set(key, list) }
+    return list
+  }
+
   /** 落盘防抖：一次会话里连续几十次调用不必每次同步写盘 */
   let metricsFlushTimer = null
   const METRICS_FLUSH_DELAY_MS = 1500
@@ -925,6 +957,10 @@ export function apply(ctx, config = {}) {
     }
     const waitMs = Date.now() - startedAt
     const generatingStart = Date.now()
+    // 实时读数：这条流每吐一个增量就原地更新，看板据此算「多并发总速度」。
+    // 与下面结束时的 recordSpeedSample 是两件事——那份是历史样本，这份是此刻。
+    const live = { chars: 0, genStart: generatingStart, firstByteAt: null }
+    liveOf(key).push(live)
     let firstTokenAt = null
     let usageOut = null
     let usageIn = null
@@ -935,9 +971,13 @@ export function apply(ctx, config = {}) {
     let settledOk = false
     try {
       for await (const chunk of next()) {
-        if (firstTokenAt === null
-          && (chunk?.type === 'text-delta' || chunk?.type === 'reasoning-delta' || chunk?.type === 'tool-call-delta')) {
-          firstTokenAt = Date.now()
+        if (chunk?.type === 'text-delta' || chunk?.type === 'reasoning-delta' || chunk?.type === 'tool-call-delta') {
+          // 第一段增量是「开始出字」的时刻，之后的字符数都从这一刻起算速率
+          if (live.firstByteAt === null) live.firstByteAt = Date.now()
+          if (chunk.type === 'text-delta') live.chars += chunk.text.length
+          else if (chunk.type === 'reasoning-delta') live.chars += chunk.text.length
+          else live.chars += typeof chunk.argumentsDelta === 'string' ? chunk.argumentsDelta.length : 0
+          if (firstTokenAt === null) firstTokenAt = Date.now()
         }
         // 一次调用可能吐多条 usage（增量或最后一次汇总），取最后一条为准
         if (chunk?.type === 'usage' && typeof chunk.usage?.outputTokens === 'number') usageOut = chunk.usage.outputTokens
@@ -960,6 +1000,14 @@ export function apply(ctx, config = {}) {
       }
     } finally {
       release()
+      // 从在跑清单里摘掉：实时速度问的是「此刻」，这条流已经不在此刻了。
+      // 不管正常结束、失败还是取消都摘——否则调用方能一直看到一个不动的数。
+      const liveList = liveRequests.get(key)
+      if (liveList !== undefined) {
+        const idx = liveList.indexOf(live)
+        if (idx >= 0) liveList.splice(idx, 1)
+        if (liveList.length === 0) liveRequests.delete(key)
+      }
       const endedAt = Date.now()
       // 输出 token 只认适配器报的 usage：没有 usage 时宁可在看板上留空，
       // 也不拿字符数估算冒充精确值。
@@ -1112,6 +1160,45 @@ export function apply(ctx, config = {}) {
       if (!fallback) fallback = candidateOf(m)
     }
     return fallback ?? busyFallback
+  }
+
+  /**
+   * 一个模型此刻所有在跑请求的总速度（token/s）。
+   *
+   * 口径是**实时**，不是区间聚合：只有还在跑的调用才计入，流一结束就归零——
+   * 进行中已经是 0 的行不该继续挂着一个速度。多并发时把各请求的速率相加，
+   * 所以这个数会随并发数上升；单并发时它就等于该请求此刻的速度。
+   *
+   * 速率的样本是两次「有增量」的 chunk 之间的字符数除以间隔，不是增量个数的
+   * 计数：适配器把长文本切多碎、要不要把 reasoning 与工具参数增量算进去，
+   * 都只影响切块方式，不影响这份速率。
+   *
+   * 字符到 token 的换算按 1 token ≈ CHARS_PER_TOKEN 个字符估——实时读数拿不到
+   * 真实 token 数（usage 在流末尾才到），宁可用一个公开的粗估，也不把字符数
+   * 当成 token 数报出去。
+   *
+   * @param {string} key - `provider/model`。
+   * @param {number} now - 读取时刻（毫秒）。
+   * @returns {number|null} 总速度（tok/s，保留一位小数）；没有在跑的请求时为 null。
+   */
+  function liveSpeedOf(key, now) {
+    const list = liveRequests.get(key)
+    if (list === undefined || list.length === 0) return null
+    let total = 0
+    let counted = 0
+    for (const live of list) {
+      // 同一模型的并发请求不一定同时开始：先到的可能已经跑了几十秒，
+      // 后到的才刚吐出第一个字。速率只能各自算，不能拿总和除以一个时间差。
+      const from = live.firstByteAt ?? live.genStart
+      const spanMs = now - from
+      // 还没有任何增量（正在等首字）时不计入：此时速率是 0 而不是「未知」，
+      // 但它会把并发的总速度稀释下去，所以先不参与求和。
+      if (live.chars <= 0 || spanMs <= 0) continue
+      total += live.chars / CHARS_PER_TOKEN / (spanMs / 1000)
+      counted += 1
+    }
+    if (counted === 0) return null
+    return Math.round(total * 10) / 10
   }
 
   /**
@@ -2971,6 +3058,9 @@ export function apply(ctx, config = {}) {
       // modelConcurrency，与出现在哪个分组无关。
       const seen = new Set()
       const rows = []
+      // 同一时刻的读数喂给所有行：一屏里的「总速度」必须是同一瞬间快照，
+      // 否则逐行取 now 会让先算的行比后算的行早几毫秒，同一份响应自相矛盾。
+      const sampledAt = Date.now()
       for (const g of groups) {
         for (const m of g.models || []) {
           const key = `${m.provider}/${m.model}`
@@ -2988,6 +3078,11 @@ export function apply(ctx, config = {}) {
             groupId: g.id,
             groupName: g.name,
             ...stats,
+            // 实时总速度：该模型此刻所有在跑请求的 token/s 之和，没有在跑的请求
+            // 时为 null（空着比写 0 诚实——0 会被读成「在跑但卡住了」）。
+            // 与上面的 tpsP50/tpsP90 是不同的量：那两条是历史样本的分位数，
+            // 这条跟着「进行中」实时涨落。
+            aggregateTps: liveSpeedOf(key, sampledAt),
             concurrency: limit > 0 ? limit : null,
             inflight: inflightByModel.get(key) ?? 0,
             queued: (waitingByModel.get(key) ?? []).length,
@@ -3003,7 +3098,8 @@ export function apply(ctx, config = {}) {
       }
       sendJson(res, 200, {
         rows,
-        sampledAt: Date.now(),
+        // 与各行 aggregateTps 用的是同一个时刻，界面才能拿它做「几秒前」的基准
+        sampledAt,
         // 采样不设条数上限：界面据 sampleLimit === null 说明「保留全部历史」
         sampleLimit: null,
         // 筛选回显：界面据此知道结果对应哪个区间，而不是只信本地状态

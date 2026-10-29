@@ -26,7 +26,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v13'
+    var VERSION = 'v14'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -1492,11 +1492,12 @@ window.__ModuleLoader__.load({
               '已筛选，结果不含区间外的样本')),
           e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
             '成功率 = 区间内成功调用 / 区间内全部采样（历史全部保留，不按条数截断）；'
-            + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时；'
+            + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时（大字是区间中位数 P50，'
+            + '小字是这个模型此刻所有在跑请求的总速度，实时、按字符估 token）；'
             + 'token = 所选区间内该模型的输入/输出/缓存用量合计（只统计适配器报了 usage 的调用）；'
             + '并发 = 正在进行的请求 / 生效上限（上限直接在「并发」列改，按模型持久化、对所有分组统一生效）。'),
           e('div', { style: S.metricsNote },
-            '副行灰字是该列的补充：成功率给成功数 / 采样数，首字与速度给 P90，'
+            '副行灰字是该列的补充：成功率给成功数 / 采样数，首字给 P90，速度给实时总速度（没请求在跑时不显示），'
             + 'token 一行一个数给输入 / 缓存命中 / 缓存写入 / 输出（鼠标悬停大字看历史总量），'
             + '并发给等槽时间与排队数，模型给所属分组。'
             + '模型行的「移除」把这个模型从它所属分组里摘掉；当日失败的行点状态列的「恢复」立即重新参与路由。'
@@ -1602,6 +1603,38 @@ window.__ModuleLoader__.load({
                   e('span', { style: S.metricsNumMain }, fmt(p50)),
                   has90 && e('span', { style: S.metricsNumSub, title: 'P90 ' + fmt(p90) }, 'P90 ' + fmt(p90)))
               }
+              // 速度：主行是区间 P50（这个模型平时多快），副行是**此刻所有在跑请求
+              // 加起来**多快。两者回答的不是同一个问题——前者用来挑模型，后者用来看
+              // 这台机器现在被占了多少；并发上来时副行会明显大于主行，正是它的意义。
+              // 实时读数拿不到真实 token（usage 在流末尾才到），按字符估，故只在
+              // 请求进行中显示；流一结束副行就消失，改由下一次采样的 P50 反映。
+              function speedCell(r) {
+                var live = isNum(r.aggregateTps) ? r.aggregateTps : null
+                var running = isNum(r.inflight) ? r.inflight : 0
+                var sub = null
+                if (live !== null) {
+                  sub = e('span', {
+                    style: S.metricsNumSub,
+                    title: '实时总速度：这个模型此刻 ' + running + ' 个在跑请求加起来约 '
+                      + fmtTps(live) + '\n按输出（含思考与工具参数）字符数估 token，'
+                      + '1 token ≈ 4 字符；请求结束后以适配器报的 usage 计入区间样本',
+                  }, '实时 ' + fmtTps(live))
+                } else if (running > 0) {
+                  // 在跑但还没有任何输出增量：此时速率为 0，但那是「还在等第一个字」，
+                  // 不是「卡住了」，所以写清楚在等，而不是压一个 0.0。
+                  sub = e('span', {
+                    style: S.metricsNumSub,
+                    title: '这张表每 3 秒刷新一次，此刻这 ' + running + ' 个请求还没吐出第一个字',
+                  }, '实时 等首字')
+                }
+                return e('div', { style: S.metricsNumCell },
+                  e('span', {
+                    style: S.metricsNumMain,
+                    title: '区间内的输出速度中位数（P50）：输出 token / 生成耗时，只算已完成并报了 usage 的调用'
+                      + '\nP90 ' + fmtTps(r.tpsP90),
+                  }, fmtTps(r.tpsP50)),
+                  sub)
+              }
               // 并发副行：等槽时间优先，其次排队数；都没有就不画
               var concSub = isNum(r.waitP50) && r.waitP50 > 0 ? '等槽 ' + fmtMs(r.waitP50) : null
               var queueSub = queued > 0 ? '排队 ' + queued : null
@@ -1675,7 +1708,7 @@ window.__ModuleLoader__.load({
                     }, (isNum(r.okSamples) ? r.okSamples : 0) + '/' + (isNum(r.samples) ? r.samples : 0)))
                 })(),
                 p90Cell(r.ttftP50, r.ttftP90, fmtMs),
-                p90Cell(r.tpsP50, r.tpsP90, fmtTps),
+                speedCell(r),
                 // token：大字是**所选区间内**的总量（输入 + 输出，含缓存命中），
                 // 跟着日期筛选走——筛到某一天，这个数就只算那一天。副行把拆分
                 // 摊成一行一个数：命中缓存是省钱的关键信号，挤在一行里会被

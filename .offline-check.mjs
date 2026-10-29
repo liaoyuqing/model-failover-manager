@@ -781,6 +781,11 @@ const liveStatus = (await api('GET', '/status')).body.groups.find(g => g.id === 
 ok('⑬b /status 也报出进行中计数（不只有上限的模型才有）',
   liveStatus?.concurrency === null && liveStatus?.inflight === 2,
   JSON.stringify({ concurrency: liveStatus?.concurrency, inflight: liveStatus?.inflight }))
+// ⑭b 实时总速度：借 ⑬b 的两路并发窗口读它，因为这一格问的正是「此刻在跑的请求加起来多快」。
+//     它不是历史 P50（那两个数回答的不是同一个问题），所以必须在流还没结束时才有值。
+ok('⑭b 有流在跑时行上带实时总速度 aggregateTps > 0',
+  typeof liveRow?.aggregateTps === 'number' && liveRow.aggregateTps > 0,
+  JSON.stringify({ aggregateTps: liveRow?.aggregateTps }))
 looseA.resolve()
 looseB.resolve()
 await Promise.all([doneU1, doneU2])
@@ -788,6 +793,9 @@ const afterRow = (await api('GET', '/metrics')).body.rows.find(r => r.provider =
 ok('⑬b 流结束后计数归零（不会只涨不落）',
   afterRow?.inflight === 0 && afterRow?.queued === 0,
   JSON.stringify({ inflight: afterRow?.inflight, queued: afterRow?.queued }))
+// 实时值必须跟着流消失：留着会让看板一直显示一个不动的数，比空着更容易误读。
+ok('⑭b 流结束后实时总速度回到 null（不留一个不动的数）',
+  afterRow?.aggregateTps === null, JSON.stringify({ aggregateTps: afterRow?.aggregateTps }))
 ok('⑬b 两个流都完整透传（无上限这条路也不改写 chunk）',
   outU1.join(',') === 'text-delta,text-delta,usage,finish'
   && outU2.join(',') === 'text-delta,text-delta,usage,finish',
