@@ -4,15 +4,30 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 > 界面里叫「模型故障转移」。设置入口：**设置 → 模型故障转移**。
 
-弹窗有六个页签：**模型**、**路由分组**、**数据看板**、**失败模型**、**错误重试**、**免费渠道**。
+![模型页签：左侧供应商列表，右侧模型清单，顶部是路由分组、绑定模式与新会话默认](docs/preview-model-selection.png)
 
-![模型选择界面：左侧供应商列表，右侧六个页签，顶部是路由分组与默认分组](docs/preview-model-selection.png)
+弹窗六个页签，按排障时的动线排列：
 
-![路由分组界面：每个模型一行，带优先级、失败与禁用开关、时段入口](docs/preview-routing-groups.png)
+| 页签 | 做什么 |
+| --- | --- |
+| **模型** | 左栏供应商、右栏模型，点 ＋ 加进分组；顶部选路由分组、绑定模式与「新会话默认」 |
+| **路由分组** | 每组一份有序模型清单（数字越小越先试），可配生效时段与截止日，逐个开关失败/禁用 |
+| **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
+| **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
+| **错误重试** | 内嵌 `dsh-llm-error-retry` 自己的配置页，保存即生效 |
+| **免费渠道** | CodeArts / WorkBuddy / Our Free Model 三个能直接补免费模型的插件，带 GitHub 地址与一键安装 |
+
+## 界面
+
+![路由分组页签：每组一份有序模型清单，每个模型带失败与禁用开关](docs/preview-routing-groups.png)
+
+![数据看板页签：首字延迟、输出速度、token 用量、并发与状态，可按当前排序重设优先级](docs/preview-dashboard.png)
+
+![失败模型页签：当日彻底失败的模型与最近一次失败原因](docs/preview-failed-models.png)
 
 ![错误重试页签：内嵌 dsh-llm-error-retry 自己的配置页，顶部一条只读状态栏](docs/preview-error-retry.png)
 
-![免费渠道页签：CodeArts / WorkBuddy / Our Free Model 三张卡片，各带 GitHub 地址、复制链接与一键安装](docs/preview-free-channels.png)
+![免费渠道页签：三张卡片，各带 GitHub 地址、复制链接与一键安装](docs/preview-free-channels.png)
 
 ---
 
@@ -423,10 +438,10 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | --- | --- |
 | `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
-| `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」「错误重试」「免费渠道」页签 |
+| `client.js` | 浏览器半（DSH dynamic client bundle），六个页签、免费渠道卡片与 GitHub 复制都在这里 |
 | `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
 | `locale/en.json`、`locale/zh.json` | 界面文案。`meta.detail` 指向插件市场详情页要渲染的文档（`docs/market.zh.md` / `docs/market.en.md`），图片按文档所在目录解析 |
-| `docs/` | 界面截图与市场详情文档。`preview-*.png` 也被本 README 开头引用 |
+| `docs/` | 六个页签的界面截图（`preview-*.png`，本 README「界面」一节与市场详情文档都引用）与两份市场详情文档 |
 | `icon.svg` | 图标 |
 
 

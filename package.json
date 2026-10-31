@@ -1,6 +1,6 @@
 {
   "name": "model-failover-manager",
-  "version": "2.24.0",
+  "version": "2.24.1",
   "description": "DSH 插件：会话模型选择弹窗 + 路由分组 + 免费渠道推荐，模型彻底失败后自动切换到组内下一个可用模型",
   "license": "Apache-2.0",
   "type": "module",
@@ -30,6 +30,8 @@
     "icon.svg",
     "docs/preview-model-selection.png",
     "docs/preview-routing-groups.png",
+    "docs/preview-dashboard.png",
+    "docs/preview-failed-models.png",
     "docs/preview-error-retry.png",
     "docs/preview-free-channels.png",
     "docs/market.zh.md",
