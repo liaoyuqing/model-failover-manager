@@ -183,9 +183,16 @@ const applyTwice = (target, conf) => {
   mountState.stub = false
 }
 
+// ㉞ 免费渠道推荐要读这两个服务：默认不存在（与原先「取不到就按没有算」一致），
+// 只有那一段测试期间才装上，避免改变其它断言的现场。
+let managerStub
+let llmStub
+
 const ctx = {
   logger: { info() {}, warn() {}, error() {} },
   get(name) {
+    if (name === 'pluginManager') return managerStub
+    if (name === 'llm') return llmStub
     if (name === 'accountPool') return accountPool
     if (name === 'goals') return goalsService
     if (name === 'agents') return { list: () => agents, get: (id) => agents.find(a => a.id === id) }
@@ -1834,6 +1841,83 @@ ok('㉝ 弹窗新增「错误重试」页签，且只在停在该页签时探测
 ok('㉝ 页签内容内嵌重试插件自己的页面与配置接口（不在本插件里重写一份编辑器）',
   clientText.includes("fetch(RETRY_UI + '/api/config'")
   && clientText.includes("e('iframe', { src: RETRY_UI"))
+
+// ── ㉞ 免费渠道推荐页签：推荐表 / 安装状态 / 一键安装 ────────────────────────
+// 装没装读 pluginManager.listBundles()（profile 依赖），在线渠道读 llm 注册表；
+// 一键安装必须落在同一个 installBundle 上，且构建脚本待批准要原样抛回，不代批。
+managerStub = {
+  bundles: [{ name: 'dsh-connect-workbuddy', version: '5.16.0' }],
+  installCalls: [],
+  async listBundles() { return this.bundles },
+  async installBundle(spec) { this.installCalls.push(spec); return { applied: true } },
+}
+llmStub = { listProviders: () => [{ id: 'codearts' }, { id: 'qoder' }, { id: 'unrelated' }] }
+
+const fc = (await api('GET', '/free-channels')).body
+const chOf = (id) => fc.channels.find(c => c.id === id) || {}
+ok('㉞ GET /free-channels 回三个推荐渠道：装没装读 profile 依赖，在线渠道读 llm 注册表',
+  fc.managerAvailable === true
+  && fc.channels.length === 3
+  && fc.channels.every(c => typeof c.pkg === 'string' && typeof c.spec === 'string')
+  && chOf('workbuddy').installed === true && chOf('workbuddy').version === '5.16.0'
+  && chOf('codearts').installed === false && chOf('codearts').version === null
+  && JSON.stringify(chOf('codearts').providers) === '["codearts"]'
+  && JSON.stringify(chOf('our-free-model').providers) === '["qoder"]',
+  JSON.stringify(fc))
+
+const inst = await api('POST', '/free-channels/install', { id: 'codearts' })
+ok('㉞ 一键安装走 pluginManager.installBundle（与插件市场同一个引擎）',
+  inst.status === 200 && inst.body.ok === true
+  && managerStub.installCalls.length === 1 && managerStub.installCalls[0] === 'dsh-codearts',
+  JSON.stringify(inst.body))
+
+managerStub.installBundle = async () => ({ applied: false, pendingBuilds: ['esbuild'] })
+const pend = await api('POST', '/free-channels/install', { id: 'our-free-model' })
+ok('㉞ 需要执行构建脚本时按失败回执原样抛出待批准项，不替用户批准',
+  pend.status === 409 && pend.body.ok === false
+  && JSON.stringify(pend.body.pendingBuilds) === '["esbuild"]'
+  && /需要先批准/.test(pend.body.message),
+  JSON.stringify(pend.body))
+
+const unknownChannel = await api('POST', '/free-channels/install', { id: 'nope' })
+ok('㉞ 未知渠道 id 直接拒绝', unknownChannel.status === 409 && unknownChannel.body.ok === false, JSON.stringify(unknownChannel.body))
+
+managerStub = undefined
+llmStub = undefined
+const fcNoManager = (await api('GET', '/free-channels')).body
+ok('㉞ 取不到插件管理服务时 installed 回 null（界面显示「状态未检测」，不谎报未安装）',
+  fcNoManager.managerAvailable === false && fcNoManager.channels.every(c => c.installed === null),
+  JSON.stringify(fcNoManager))
+
+// 插件市场详情页渲染 locale meta.detail 指到的文档，图片按文档所在目录解析
+// （packages/util/plugin-detail/src/document.ts 的 detailImage）：所以详情文档写在
+// docs/ 里、图片用同级相对路径，文件也必须在 package.json 的 files 里才随包发布。
+for (const [localeFile, docFile] of [['locale/zh.json', 'docs/market.zh.md'], ['locale/en.json', 'docs/market.en.md']]) {
+  const meta = JSON.parse(readFileSync(new URL('./' + localeFile, import.meta.url), 'utf8')).meta
+  const base = docFile.slice('docs/'.length)
+  ok('㉞ ' + localeFile + ' 的 meta.detail 指向市场详情文档，且该文档引用的截图都在包里',
+    meta.detail === docFile
+    && existsSync(new URL('./' + docFile, import.meta.url))
+    && pkg.files.includes(docFile)
+    && [...readFileSync(new URL('./' + docFile, import.meta.url), 'utf8').matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)]
+      .every(m => m[1].startsWith('http') || (existsSync(new URL('./docs/' + m[1], import.meta.url)) && pkg.files.includes('docs/' + m[1]))),
+    String(meta.detail) + ' / ' + base)
+}
+
+ok('㉞ 每个渠道给出 GitHub 仓库地址，并提供一键复制',
+  clientText.includes("repo: 'https://github.com/elegant01/dsh-codearts'")
+  && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-workbuddy'")
+  && clientText.includes("repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model'")
+  && clientText.includes('function copyText(')
+  && clientText.includes("navigator.clipboard.writeText")
+  && clientText.includes("'复制链接'"))
+
+ok('㉞ 弹窗有「免费渠道」页签，只在停在该页签时读一次，安装按钮走本插件的 HTTP 接口',
+  clientText.includes("setTab('channels')")
+  && clientText.includes("tab !== 'channels'")
+  && clientText.includes("apiGet(API + '/free-channels')")
+  && clientText.includes("apiSend(API + '/free-channels/install', 'POST'")
+  && clientText.includes("'免费渠道'"))
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)

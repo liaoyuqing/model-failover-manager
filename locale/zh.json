@@ -1,1 +1,1 @@
-{"meta": {"title": "模型故障转移管理", "description": "模型选择弹窗（默认开启）+ 路由分组自动切换。依赖并在弹窗里内嵌 dsh-llm-error-retry 的错误重试页签；所有重试耗尽后自动切换组内下一个模型。"}}
+{"meta":{"title":"模型故障转移管理","description":"模型选择弹窗（默认开启）+ 路由分组自动切换 + 免费渠道推荐。依赖并在弹窗里内嵌 dsh-llm-error-retry 的错误重试页签；免费渠道页签一键安装 CodeArts / WorkBuddy / Our Free Model；所有重试耗尽后自动切换组内下一个模型。","detail":"docs/market.zh.md"}}

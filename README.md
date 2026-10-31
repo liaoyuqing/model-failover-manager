@@ -4,16 +4,22 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 > 界面里叫「模型故障转移」。设置入口：**设置 → 模型故障转移**。
 
-![模型选择界面：左侧供应商列表，右侧「模型 / 路由分组 / 数据看板 / 失败模型」页签与路由分组选择](docs/preview-model-selection.png)
+弹窗有六个页签：**模型**、**路由分组**、**数据看板**、**失败模型**、**错误重试**、**免费渠道**。
 
-![路由分组界面：已绑定「免费」分组、37 个模型按优先级排列，每个模型带失败与禁用开关](docs/preview-routing-groups.png)
+![模型选择界面：左侧供应商列表，右侧六个页签，顶部是路由分组与默认分组](docs/preview-model-selection.png)
+
+![路由分组界面：每个模型一行，带优先级、失败与禁用开关、时段入口](docs/preview-routing-groups.png)
+
+![错误重试页签：内嵌 dsh-llm-error-retry 自己的配置页，顶部一条只读状态栏](docs/preview-error-retry.png)
+
+![免费渠道页签：CodeArts / WorkBuddy / Our Free Model 三张卡片，各带 GitHub 地址、复制链接与一键安装](docs/preview-free-channels.png)
 
 ---
 
 ## 它做什么
 
 - **接管模型选择位**：以 `priority: -1` 注册 `conversation.input.model`，遮蔽内置选择器。
-  - 「弹窗模式」为左右分区弹窗（左：供应商，右：模型），右侧含「模型」「路由分组」「数据看板」「失败模型」「错误重试」五个页签；「错误重试」整块留给重试插件自己渲染的配置页（左栏让位）。**新装默认开启**。
+  - 「弹窗模式」为左右分区弹窗（左：供应商，右：模型），右侧含「模型」「路由分组」「数据看板」「失败模型」「错误重试」「免费渠道」六个页签；「错误重试」整块留给重试插件自己渲染的配置页，「免费渠道」整块放推荐卡片（两者都让出左栏）。**新装默认开启**。
   - 关掉后是紧凑下拉，一屏只列十几个模型，没有分栏与页签。
   - 触发按钮显示 **供应商 · 模型名 · 思考强度**；已绑定分组时另有一个分组徽标。
 - **路由分组**：可建多个分组，每组是一份有序模型列表（`priority` 决定尝试顺序）。
@@ -64,6 +70,26 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - **它在路由前面**：重试先跑完才轮到本插件换模型（见「失败切换的判定过程」），所以给 `400` 这类「换个模型才有意义」的错误配规则会拖慢切换——在「错误重试」页签里放宽或删掉那条规则即可。
 - **数据各管各的**：本插件写 `$DSH_HOME/model-failover-manager/`，重试规则与等待状态在 `$DSH_HOME/llm-error-retry/`。
 
+## 免费渠道推荐
+
+弹窗的「免费渠道」页签列三个「装上一登录就多几条免费模型」的插件，每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
+
+| 渠道 | 包 | 提供什么 |
+| --- | --- | --- |
+| CodeArts | `dsh-codearts` | 华为云 CodeArts 账号自带的模型额度，内置 OAuth2 登录（PKCE + DPoP） |
+| WorkBuddy | `dsh-connect-workbuddy` | 本机已登录的 WorkBuddy 账号（国内版 / 国际版），按上游目录读每个模型的积分倍率，支持多账号换号与每日签到 |
+| Our Free Model | `dsh-our-free-model` | 不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道 |
+
+装完之后它们提供的模型就和别的模型一样出现在「模型」页签里，可以排进路由分组——本插件的失败切换与「与 Our Free Model 的配合」里的换号逻辑对它们同样生效。
+
+**一键安装走插件市场的同一个引擎。** 按钮调的是宿主的 `pluginManager.installBundle(spec)`，也就是插件市场（`dshmarket`）和执行 `dsh plugin add` 时用的那条路径，本插件不自己跑 `pnpm`、不自己改 profile 清单。三条边界：
+
+- **不代批构建脚本。** 装包需要执行安装/构建脚本时，宿主返回待批准项；页签只把这件事原样显示出来（`pendingBuilds`），批准与否由你在插件管理里决定。
+- **状态是现场的。** 「已安装 / 未安装」读 `pluginManager.listBundles()` 里该 profile 的依赖，**在线渠道**读 `llm` 注册表现场算——装了但没登录时，卡片会显示「已安装」而「在线渠道」为空，这两个本来就该分开看。
+- **推荐表是固定的三条。** 候选写死在宿主半的 `FREE_CHANNELS`（包名、安装 spec、provider 匹配），介绍文案与 GitHub 地址写在 `client.js` 的 `FREE_CHANNEL_COPY`。加一条要两边同时改；宿主不认识的新 id 不会出现在页签里。
+
+已知不足：这一页只负责「装上」，登录、扫码、账号池这些各自的引导在它们自己的界面上；`Our Free Model` 的安装 spec 指向 GitHub 主干，拉不下来时按钮会给出错误原文，可以照卡片里的地址手动 `dsh plugin add`。
+
 ## 与 billion-context 的配合
 
 `billion-context`（bili）在 DSH 里是**唯一的上下文压缩器**：它一生效，`bili-compaction-gate` 就把宿主自带的 `compaction-basic` 置为 `disabled`。而 bili 的原生通道只改写它认得的模型端点——`/chat/completions`、`/v1/messages`、`/completions`、`/responses`、`/conversations` 与 Gemini 的 `/models/<name>:<method>`，其它 POST 原样直发、不压缩。
@@ -89,9 +115,9 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 上面的「路由降级」只是避让；真正的解法是把 qoder 的请求改成 bili 认识的协议跑一趟：**明文进 bili，压缩完再还原成 qoder 的加密 wire**。落地成两段：
 
 1. **换掉请求**：`QoderEncryptedInfer#prepareInfer` 被替换，不再返回 WASM 加密请求，而是返回一个明文 OpenAI 请求指向本机 shim（`http://127.0.0.1:47001/qoder/<rid>/chat/completions`）。路径以 `/chat/completions` 结尾，正是 bili 原生通道认得的那几种之一；`rid` 放在路径段而不是查询串，因为中继层可能改写或剥离查询串。
-2. **压缩后还原**：这次 `fetch` 发生在会话回合内，bili 会带上会话归属、把 `messages` 压缩，再转发回 shim。shim 用压缩后的 `messages` 重建 qoder 的 `ask`（`history` 本来就是 OpenAI 形状，映射几乎是恒等变换，系统消息、工具定义、采样参数原样带回），调用**原始** `prepareInfer` 重新加密，用 `node:https` 直连 qoder。上游 SSE 原样穿回 adapter，响应方向不需要翻译；凭据也不需要复制——shim 复用的正是被截获的那个 WASM 上下文（`this`）。
+2. **压缩后还原**：这次 `fetch` 发生在会话回合内，bili 会带上会话归属、把 `messages` 压缩，再转发回 shim。shim 用压缩后的 `messages` 重建 qoder 的 `ask`（`history` 本来就是 OpenAI 形状，映射几乎是恒等变换，系统消息、工具定义、采样参数原样带回），调用**原始** `prepareInfer` 重新加密，用 `node:https` 直连 qoder，再把上游的包装 SSE 拆成裸 OpenAI 帧穿回 adapter。凭据不需要复制——shim 复用的正是被截获的那个 WASM 上下文（`this`）。
 
-为什么不做响应方向的协议翻译：qoder 的响应本来就是 OpenAI 形状的 SSE 包了一层信封，adapter 自己会拆；这边只动请求方向。
+**响应方向为什么要拆包**：qoder 的响应是 OpenAI 形状的 SSE 外面包了一层信封（`data:{"headers":…,"body":"<真正的 JSON>"}`），adapter 自己有 `unwrapQoderEnvelopeStream` 会拆，但 bili 读的是**同一份字节**、只认裸 OpenAI 帧。包装帧里既没有 `choices` 也没有 `finish_reason`，bili 到 EOF 都等不到终止事件，判「流被截断」，于是丢掉本地的 reply 记录并塞一条 in-band error 给客户端。所以 shim 逐帧拆信封、丢掉 `firstTokenDuration`/`serverDuration` 这类计时心跳、把信封内的错误摊平成 `{code,message,type:'model_error'}`，并按 `\n\n` 分帧（**只给 `\n` 会让 bili 把多帧并成一段解不出来**，这正是「stream truncated」的真因）。拆完之后两种解析器都满意：bili 看到标准帧（含 `data: [DONE]`），adapter 的 unwrap 对裸帧原样放行。非 `text/event-stream` 的响应（错误回包）原样穿回，不拆。
 
 #### 补丁打在哪个加密器上
 
@@ -335,6 +361,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | POST | `/groups/reorder-priority` | 按看板当前排序重设某个分组的优先级：`{groupId, start, order: [{provider, model}]}`，按 `order` 的顺序从 `start` 起连续写回（`start` 缺省 1，需 1..999）。不在该分组里的名字被忽略，重复条目只认第一次 |
 | GET | `/speedtest` | 测速的进度快照：`{running, startedAt, finishedAt, total, done, targets, results}`；`targets` 是本次覆盖的模型清单（界面用它标出「哪几行正在测」），`results` 每项含 `provider/model/ok/ttftMs/tps/inTokens/outTokens/errorCode` |
 | POST | `/speedtest` | 启动一次测速：`{models: [{provider, model}]}`（整组或**单个模型**都走这里）或 `{groupId}`（整组，跳过已禁用的模型；显式点名的清单不排除禁用模型，方便排查一个被禁用的模型到底通不通），可选 `timeoutMs`（5s..120s，默认 45s）与 `parallel`（1..6，默认 2）。立即返回任务快照，任务在后台跑；已有任务在跑时返回 409 |
+| GET | `/free-channels` | 免费渠道推荐现场：`{managerAvailable, channels:[{id, pkg, spec, installed, version, providers}]}`。`installed` 读 `pluginManager.listBundles()`（`null` = 取不到插件管理服务，界面显示「状态未检测」），`providers` 是此刻 `llm` 注册表里匹配该渠道的 provider id |
+| POST | `/free-channels/install` | 一键安装某个推荐渠道：`{id}`，转调 `pluginManager.installBundle(spec)`。成功回 200 `{ok:true, message}`；需要批准构建脚本、未知 id、没有插件管理服务都回 409 `{ok:false, message, pendingBuilds?}`——待批准项原样抛回，不代批 |
 | GET | `/session-info?sessionId=` | 单个会话解析后的有效分组、是否继承、当前模型覆盖 |
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
@@ -395,9 +423,10 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | --- | --- |
 | `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
-| `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」与「错误重试」页签 |
+| `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」「错误重试」「免费渠道」页签 |
 | `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
-| `locale/en.json`、`locale/zh.json` | 界面文案 |
+| `locale/en.json`、`locale/zh.json` | 界面文案。`meta.detail` 指向插件市场详情页要渲染的文档（`docs/market.zh.md` / `docs/market.en.md`），图片按文档所在目录解析 |
+| `docs/` | 界面截图与市场详情文档。`preview-*.png` 也被本 README 开头引用 |
 | `icon.svg` | 图标 |
 
 
@@ -408,6 +437,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 - 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
+- 「免费渠道」页签只负责安装，不负责登录与账号配置：三个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定三条，也只在这三个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
 - 对 `dsh-llm-error-retry` 的依赖固定到具体 commit（`5543c34`，0.20.0），不是版本范围：「错误重试」页签内嵌的是它的页面与 `/llm-error-retry/api/config`，字段或路径一变页签就空，所以升级它要连这个页签一起验。
 - `pack.js` 有两份副本（`$DSH_HOME/plugins/` 下的开发副本与 `$DSH_HOME/profiles/<name>/node_modules/` 下宿主真正 import 的那份），尺寸与 mtime 会不同。插件对每一份都做检查，`hookRepair.copies` 逐份列出；只补 `plugins` 那份是不够的。
 
@@ -415,7 +445,9 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 A DSH plugin that replaces the composer's model seat with a grouped model picker, and automatically fails over to the next usable model in the bound group once a model has exhausted every retry policy.
 
-- Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector: a split-pane dialog by default (providers on the left, models and tabs on the right), or a compact dropdown once the dialog toggle is turned off. A fresh install runs in dialog mode.
+- Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector: a split-pane dialog by default (providers on the left, models on the right, six tabs above them: models, routing groups, dashboard, failed models, error retry, free channels), or a compact dropdown once the dialog toggle is turned off. A fresh install runs in dialog mode.
+- The *error retry* tab embeds `dsh-llm-error-retry`'s own configuration page in an iframe (same origin, `/llm-error-retry`) instead of re-implementing the editor: one rule table, one place to save it. The tab probes the plugin, and when it is not mounted it says so and offers a re-probe.
+- The *free channel* tab recommends three plugins that add free models — CodeArts (`dsh-codearts`), WorkBuddy (`dsh-connect-workbuddy`), and Our Free Model (`dsh-our-free-model`) — each with a one-line pitch, its facts, a copyable GitHub address, and an install button. Installing goes through `pluginManager.installBundle`, the same engine as the plugin market and `dsh plugin add`; a package that needs its install scripts approved comes back as a pending-build report rather than being approved for you. "Installed" is read from the profile dependencies and "providers online" from the live `llm` registry, so a channel that is installed but not logged in shows both facts separately.
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.
@@ -426,7 +458,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   outcome a user cannot fix by hand.
 - For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
-- Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are relayed untouched. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
+- Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are unwrapped on the way back: qoder's `data:{"headers":…,"body":"…"}` envelope frames become bare OpenAI frames with the `\n\n` framing bili needs, timing-only heartbeats are dropped, envelope errors are flattened to `{code,message,type:'model_error'}`, and non-event-stream replies pass through untouched. Leaving the envelope intact is what made bili report "stream truncated" and discard its reply record. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
 - Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. `defaultConcurrency` in `cordis.patch.yml` is the factory value: the effective one is editable from the dashboard header and stored in `settings.json` (`null` means not overridden), so one edit applies to every model without its own cap and survives a restart. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. Taking a slot is also the **count**: an uncapped model (`0`) is never judged full, but it is counted as in flight from the moment it enters — so the dashboard reports a real number for it too, written as `N (unlimited)` rather than `N/cap`. The cap and the count are two separate facts; unlimited means unlimited, not uncounted. A request that cannot get a slot does not queue: the gate skips the adapter entirely and fails it as `CAPACITY_TIMEOUT`, and routing switches the session to a free model in the group (candidate picking already skips full models). Only a group that is full end to end makes anything wait — for that model's slot, up to `concurrencyQueueTimeoutMs` (`0` waits forever); when a slot frees the session switches, and on timeout routing gives up for the turn (`all-capacity`).
 - Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.

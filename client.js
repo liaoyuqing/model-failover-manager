@@ -4,7 +4,7 @@
  * 1. 接管 composer 的模型选择位（conversation.input.model，priority -1 遮蔽原实现）：
  *    - 设置项 dialogMode 开启时，点击弹左右分区弹窗（左：提供商，右：模型）
  *    - 关闭时，紧凑下拉列表
- *    - 弹窗内含「路由分组」「数据看板」「失败模型」页签；分组可绑定到当前会话
+ *    - 弹窗内含「路由分组」「数据看板」「失败模型」「错误重试」「免费渠道」页签；分组可绑定到当前会话
  * 2. 设置页「模型故障转移」：dialogMode 开关 + 分组 CRUD（含优先级）+ 失败模型恢复
  * 3. 数据看板：读 /metrics 展示每个模型的首字延迟、输出速度、并发占用与等槽，
  *    表头可点击排序（结果被记住）；并发上限在并发列直接改；模型行可单独测速、
@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v19'
+    var VERSION = 'v20'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -135,6 +135,19 @@ window.__ModuleLoader__.load({
         borderBottom: '1px solid var(--dsw-alias-border-l2)',
       },
       retryFrame: { flex: 1, width: '100%', border: 'none', minHeight: 0, background: 'var(--dsw-alias-bg-layer-2)' },
+      // 免费渠道页签：卡片列表 + 安装按钮
+      channelPane: { display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px 2px', overflowY: 'auto', flex: 1, minHeight: 0 },
+      channelCard: {
+        display: 'flex', flexDirection: 'column', gap: '6px', padding: '10px 12px',
+        border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 'var(--dsw-radius-md)',
+      },
+      channelHead: { display: 'flex', alignItems: 'center', gap: '8px' },
+      channelTitle: { fontSize: '13px', fontWeight: 600 },
+      channelFact: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.5 },
+      channelActions: { display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' },
+      channelOk: { fontSize: '11px', color: 'var(--dsw-alias-state-business-primary)' },
+      channelWarn: { fontSize: '11px', color: 'var(--dsw-alias-state-warn-label)' },
+      channelError: { fontSize: '11px', color: 'var(--dsw-alias-state-error-primary)' },
       btn: {
         padding: '3px 10px', fontSize: '11px', cursor: 'pointer',
         border: '0.5px solid var(--dsw-alias-border-l3)',
@@ -634,6 +647,14 @@ window.__ModuleLoader__.load({
       var range = rangePair[0]; var setRange = rangePair[1]
       /** 错误重试页签的探测结果：null = 尚未探测，{ absent: true } = 没挂载那个插件，否则是它 /api/config 的返回 */
       var retryPair = React.useState(null); var retryProbe = retryPair[0]; var setRetryProbe = retryPair[1]
+      /** 免费渠道页签的现场：null = 尚未读取；{ managerAvailable, channels, error? } 由宿主算好 */
+      var channelPair = React.useState(null); var freeChannels = channelPair[0]; var setFreeChannels = channelPair[1]
+      /** 正在安装的渠道 id（按钮转圈用）；null = 空闲 */
+      var channelBusyPair = React.useState(null); var channelBusy = channelBusyPair[0]; var setChannelBusy = channelBusyPair[1]
+      /** 安装回执：{ id, ok, text }，只保留最近一条 */
+      var channelMsgPair = React.useState(null); var channelMsg = channelMsgPair[0]; var setChannelMsg = channelMsgPair[1]
+      /** 最近一次复制回执：{ id, ok }，1.5 秒后自动清掉，按钮文字回到默认 */
+      var copiedPair = React.useState(null); var copied = copiedPair[0]; var setCopied = copiedPair[1]
       /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
       var concPair = React.useState({}); var concDraft = concPair[0]; var setConcDraft = concPair[1]
       /**
@@ -758,6 +779,73 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         if (!open || tab !== 'retry') return
         probeRetry()
+      }, [open, tab])
+
+      /**
+       * 免费渠道现场：GET /free-channels。装没装由宿主读 profile 依赖判断，在线渠道由
+       * llm 注册表现场算，所以界面只负责取回来展示，不缓存、不自行推断。
+       */
+      function probeFreeChannels() {
+        apiGet(API + '/free-channels')
+          .then(function (data) { setFreeChannels(data) })
+          .catch(function (err) {
+            setFreeChannels({ managerAvailable: false, channels: [], error: String((err && err.message) || err) })
+          })
+      }
+
+      /**
+       * 一键安装：POST /free-channels/install。宿主用 pluginManager.installBundle 装，
+       * 与插件市场同一个引擎；需要执行构建脚本时宿主会回 ok:false 与待批准项。
+       */
+      function installChannel(id) {
+        setChannelBusy(id)
+        setChannelMsg(null)
+        apiSend(API + '/free-channels/install', 'POST', { id: id })
+          .then(function (res) {
+            setChannelBusy(null)
+            setChannelMsg({ id: id, ok: !!(res && res.ok), text: String((res && res.message) || (res && res.ok ? '已提交安装' : '安装失败')) })
+            probeFreeChannels()
+          })
+          .catch(function (err) {
+            setChannelBusy(null)
+            setChannelMsg({ id: id, ok: false, text: '安装请求失败：' + String((err && err.message) || err) })
+          })
+      }
+
+      /**
+       * 复制 GitHub 地址。优先用 navigator.clipboard（需要安全上下文/权限），
+       * 权限被拒或页面不是安全上下文时退回 execCommand，最后把成败写进按钮文字。
+       */
+      function copyText(text, id) {
+        var done = function (ok) { setCopied({ id: id, ok: ok }) }
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () { done(true) }, function () { done(false) })
+            return
+          }
+        } catch (err) { /* 回落到 execCommand */ }
+        var area = document.createElement('textarea')
+        area.value = text
+        area.style.position = 'fixed'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        var ok = false
+        try { ok = document.execCommand('copy') } catch (err) { ok = false }
+        document.body.removeChild(area)
+        done(ok)
+      }
+
+      React.useEffect(function () {
+        if (!copied) return
+        var t = setTimeout(function () { setCopied(null) }, 1500)
+        return function () { clearTimeout(t) }
+      }, [copied])
+
+      // 免费渠道只在停留时读一次；安装按钮与「刷新状态」自己会再读，没有轮询的必要
+      React.useEffect(function () {
+        if (!open || tab !== 'channels') return
+        probeFreeChannels()
       }, [open, tab])
 
       if (!props.available) return null
@@ -1006,6 +1094,92 @@ window.__ModuleLoader__.load({
             e('button', { style: S.btn, onClick: function () { probeRetry() } }, '刷新状态'),
             e('button', { style: S.btn, onClick: function () { window.open(RETRY_UI, '_blank', 'noopener') } }, '新窗口打开')),
           e('iframe', { src: RETRY_UI, title: 'LLM 错误重试配置', style: S.retryFrame }))
+      }
+
+      /* ---- 免费渠道推荐页签 ---- */
+      /**
+       * 推荐表只有事实（包名、安装 spec、在线渠道），介绍文案写在这里。
+       * 加渠道要同时改宿主 FREE_CHANNELS 与本表：宿主不认识新 id 就拿不到安装状态。
+       */
+      var FREE_CHANNEL_COPY = {
+        codearts: {
+          repo: 'https://github.com/elegant01/dsh-codearts',
+          title: 'CodeArts',
+          tagline: '华为云 CodeArts 账号自带的模型额度',
+          facts: [
+            '内置 OAuth2 登录（PKCE + DPoP），装好登录一次就能在模型列表里选到 CodeArts 的模型',
+            '额度用尽或换号失败会落进本插件的失败转移，不会打断当前会话',
+          ],
+        },
+        workbuddy: {
+          repo: 'https://github.com/dingminhua/dsh-connect-workbuddy',
+          title: 'WorkBuddy',
+          tagline: '本机已登录的 WorkBuddy 账号（国内版 / 国际版）',
+          facts: [
+            '按上游目录自动读取每个模型的积分倍率，可逐模型开关图片输入',
+            '多账号切换与账号池自动换号，附带每日签到与积分读数',
+          ],
+        },
+        'our-free-model': {
+          repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model',
+          title: 'Our Free Model',
+          tagline: '不登录、不填 API Key 也能用的免费通道',
+          facts: [
+            '含 DeepSeek V4.1 Flash、Kimi K3 等前沿模型，匿名免费通道保留',
+            '2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道',
+          ],
+        },
+      }
+
+      function channelTab() {
+        if (freeChannels === null) return e('div', { style: S.pane }, e('div', { style: S.hint }, '正在读取免费渠道状态…'))
+        var list = Array.isArray(freeChannels.channels) ? freeChannels.channels : []
+        // 前端热重载比宿主早一步时（宿主还没重启、没有 /free-channels），按本地文案把卡片
+        // 列出来，状态与安装按钮留空——不假装知道装没装，也不给一个注定 404 的安装入口。
+        var stale = list.length === 0
+        if (stale) {
+          list = Object.keys(FREE_CHANNEL_COPY).map(function (id) {
+            return { id: id, pkg: '', spec: '', installed: null, version: null, providers: [], stale: true }
+          })
+        }
+        return e('div', { style: S.channelPane },
+          e('div', { style: S.hint }, '下面三个插件都能直接补几条免费模型进模型列表。装完刷新本页确认，再回「模型」页签把它们排进路由分组。'),
+          stale && e('div', { style: S.hint }, '当前宿主还没有推荐表接口（改完宿主需要重启 DSH 才生效），所以这里只列介绍、不显示安装状态。'),
+          list.map(function (ch) {
+            var copy = FREE_CHANNEL_COPY[ch.id] || { title: ch.pkg, tagline: '', facts: [] }
+            var msg = channelMsg && channelMsg.id === ch.id ? channelMsg : null
+            var busy = channelBusy === ch.id
+            var stateText = ch.installed === true
+              ? ('已安装' + (ch.version ? ' ' + ch.version : ''))
+              : (ch.installed === null ? '状态未检测' : '未安装')
+            var stateStyle = ch.installed === true ? S.channelOk : S.channelWarn
+            return e('div', { key: ch.id, style: S.channelCard },
+              e('div', { style: S.channelHead },
+                e('span', { style: S.channelTitle }, copy.title),
+                // 宿主没有推荐表接口时不显示状态：那行 hint 已经说明「只列介绍、不显示安装状态」，
+                // 再挂一个「状态未知」只是噪声
+                ch.stale !== true && e('span', { style: stateStyle }, stateText),
+                e('span', { style: { flex: 1 } }),
+                ch.stale !== true && ch.installed !== true && e('button', {
+                  style: busy ? Object.assign({}, S.btnPrimary, { opacity: .6, cursor: 'default' }) : S.btnPrimary,
+                  disabled: busy || freeChannels.managerAvailable === false,
+                  title: freeChannels.managerAvailable === false ? '当前宿主没有插件管理服务' : '走 pluginManager.installBundle 安装',
+                  onClick: function () { installChannel(ch.id) },
+                }, busy ? '安装中…' : '安装')),
+              e('div', { style: S.channelFact }, copy.tagline),
+              copy.facts.map(function (line, i) { return e('div', { key: i, style: S.channelFact }, '· ' + line) }),
+              e('div', { style: S.channelActions },
+                e('span', { style: S.channelFact }, 'GitHub ' + copy.repo.replace(/^https?:\/\//, '')),
+                e('button', { style: S.btn, onClick: function () { copyText(copy.repo, ch.id) } },
+                  copied && copied.id === ch.id ? (copied.ok ? '已复制' : '复制失败') : '复制链接')),
+              e('div', { style: S.channelActions },
+                !ch.stale && e('span', { style: S.channelFact }, '包 ' + ch.pkg),
+                !ch.stale && e('span', { style: S.channelFact }, '在线渠道 ' + (ch.providers.length ? ch.providers.join(' / ') : '无')),
+                e('span', { style: { flex: 1 } }),
+                e('button', { style: S.btn, onClick: function () { probeFreeChannels() } }, '刷新状态')),
+              msg && e('div', { style: msg.ok ? S.channelOk : S.channelError }, msg.text))
+          }),
+          e('div', { style: S.hint }, '安装走插件管理服务，与插件市场同一个引擎；需要执行构建脚本时宿主只会提示「需要批准」，不会替你批准。GitHub 源装不上时，可以手动 dsh plugin add 对应 spec。'))
       }
 
       function groupTab() {
@@ -2092,6 +2266,9 @@ window.__ModuleLoader__.load({
         } else if (tab === 'retry') {
           // 重试配置页自己排版，整个右边栏给它（提供商列在下面隐藏）
           right = retryTab()
+        } else if (tab === 'channels') {
+          // 免费渠道是卡片列表，同样不需要提供商列
+          right = channelTab()
         } else {
           right = failedTab()
         }
@@ -2106,7 +2283,7 @@ window.__ModuleLoader__.load({
               e('button', { style: S.btn, onClick: function () { setOpen(false); setQuery('') } }, '关闭')),
             e('div', { style: S.body },
               // 错误重试页由重试插件自己的页面渲染，规则表格更吃宽度，左栏让位
-              tab === 'retry' ? null : e('div', { style: S.left },
+              (tab === 'retry' || tab === 'channels') ? null : e('div', { style: S.left },
                 e('div', { style: S.leftTitle }, '提供商'),
                 e('div', { style: S.leftList }, visible.map(function (g) {
                   var isActive = g.id === activeId
@@ -2126,7 +2303,8 @@ window.__ModuleLoader__.load({
                   e('button', { style: Object.assign({}, S.tab, tab === 'groups' ? S.tabActive : {}), onClick: function () { setTab('groups') } }, '路由分组'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'dashboard' ? S.tabActive : {}), onClick: function () { setTab('dashboard') } }, '数据看板'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'failed' ? S.tabActive : {}), onClick: function () { setTab('failed') } }, '失败模型' + (failedList.length ? ' (' + failedList.length + ')' : '')),
-                  e('button', { style: Object.assign({}, S.tab, tab === 'retry' ? S.tabActive : {}), onClick: function () { setTab('retry') } }, '错误重试')),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'retry' ? S.tabActive : {}), onClick: function () { setTab('retry') } }, '错误重试'),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'channels' ? S.tabActive : {}), onClick: function () { setTab('channels') } }, '免费渠道')),
                 right))),
           // 编辑器提到弹窗根层级：从任意页签（含模型页签的 ＋ 快捷入组）触发都能显示
           editing && groupEditor(poolOf(catalog, status))),

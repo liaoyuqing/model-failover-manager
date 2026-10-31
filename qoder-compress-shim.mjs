@@ -36,6 +36,16 @@ const ADOPT_INTERVAL_MS = 1500
 const ADOPT_MAX_TICKS = 400
 
 /**
+ * 对账间隔：把「注册表里的活 adapter 是否还挂着我打的补丁」重新核一次。
+ *
+ * 补丁挂在类原型上，只对**同一份模块拷贝**的实例生效。pack 自更新或 fiber 重启会
+ * 重新 import 一个全新的类，旧补丁留在旧原型上，新实例照常加密直发，而 /status 仍
+ * 报已接管。10s 是「宿主换拷贝」与「多扫几次注册表」之间的折中：代价是每拍两次
+ * Map 查找，不值得更快。
+ */
+const RECONCILE_INTERVAL_MS = 10000
+
+/**
  * 把 adapter 的 ask 折成 OpenAI chat body（交给 bili 压缩的形状）。
  *
  * ask.history 本身就是 OpenAI 形状的 messages（role/content/tool_calls/tool_call_id），
@@ -379,7 +389,13 @@ async function collectTargets(ctx, wasmPath) {
     notes.push('读取 __mfQoderEncryptor 失败：' + (err && err.message ? err.message.slice(0, 60) : String(err)))
   }
 
-  // 注册表里的实际 adapter：只用来装「传送门」——见 installPortals。
+  // 注册表里的实际 adapter：既装「传送门」，也顺手把它的**真实类原型**纳入目标。
+  //
+  // ⚠️ 只靠 globalThis 注入口与磁盘上那份 qoder-wasm.js 是不够的：宿主里同时存在
+  // 好几份 QoderEncryptedInfer（pack.js 内联一份、dsh-codearts-auth 的 lib 一份，
+  // 盘符大小写还会再分裂一次 ESM 实例），而运行时真正 new 出来的是哪一份，取决于
+  // 谁先注册进 llm 注册表 —— 实测另外几份全打上了、prepareInfer 计数仍是 0。所以
+  // 这里直接从**活着的 adapter 实例**反查它的类原型，无论它是哪份拷贝。
   const adapters = []
   let registry = null
   try { registry = ctx?.get?.('llm')?.adapters ?? null } catch { registry = null }
@@ -415,7 +431,82 @@ function createImpl(context) {
     }
   }
 
-  /** 用该实例自己的原始 prepareInfer 加密，node:https 直连上游，SSE 原样穿回。 */
+  /**
+   * 是否是一条「非 OpenAI 帧」的噪声：既不带 choices/usage，也不带任何错误字段。
+   *
+   * qoder 的包装层里混着 firstTokenDuration、serverDuration 这类计时心跳；它们既不是
+   * 正文也不是终止信号，透传下去只会让下游多解析一条无用帧。
+   *
+   * @param value 已解析的 JSON 值（解析失败时传 null/undefined）
+   * @returns 是噪声帧则为 true
+   */
+  const isHeartbeatFrame = (value) => value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    value.choices === undefined && value.usage === undefined &&
+    value.code === undefined && value.message === undefined &&
+    value.error === undefined && value.statusCodeValue === undefined && value.type === undefined
+
+  /**
+   * 把 qoder 的**包装** SSE 拆成裸 OpenAI SSE。
+   *
+   * qoder 上游每一帧都是 `data:{"headers":{…},"body":"<真正的 JSON 或 [DONE]>"}`，
+   * 之外还有 `event:finish` 这类非 data 行。adapter 自己有 unwrapQoderEnvelopeStream
+   * 负责拆它，但 bili 读的是**同一份字节**、按裸 OpenAI 协议解析：包装帧里没有
+   * choices、也没有 finish_reason，于是 bili 到 EOF 都等不到终止事件，判「流被截断」，
+   * 丢掉它本地的 reply 记录并在客户端塞一个 in-band error。
+   *
+   * 拆干净以后两种解析器都满意：bili 看到标准帧（含 [DONE]），adapter 的 unwrap 对
+   * 裸帧原样放行（innerTextOf 返回 null 就 pass through）。
+   *
+   * @param state 逐字节缓冲状态 {buffer}
+   * @param chunk 一段上游文本
+   * @returns 该输出的文本（可能为空）
+   */
+  const unwrapEnvelopeChunk = (state, chunk) => {
+    state.buffer += chunk
+    let out = ''
+    let newline
+    while ((newline = state.buffer.indexOf('\n')) !== -1) {
+      const line = state.buffer.slice(0, newline).replace(/\r$/, '')
+      state.buffer = state.buffer.slice(newline + 1)
+      // 空行是**帧分隔符**：bili 按 \n\n 切帧，只给 \n 会让它把多帧并成一段 JSON 解不出来，
+      // 于是到 EOF 都看不到 [DONE]（就是「stream truncated」的真因）。非 data 行
+      // （event:finish 之类）直接丢掉，它们只属于包装层。
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (payload === '[DONE]') { out += 'data: [DONE]\n\n'; continue }
+      let envelope = null
+      try { envelope = JSON.parse(payload) } catch { envelope = null }
+      // 不是包装帧（上游直接给了裸 OpenAI 帧）也要过一遍心跳过滤：qoder 的
+      // `event:finish` 后面跟的就是一段裸 data（firstTokenDuration 之类），
+      // 它不是 OpenAI 帧，留着只会让下游多解析一条无用行。
+      if (envelope === null || typeof envelope !== 'object' || envelope.body === undefined) {
+        if (isHeartbeatFrame(envelope)) continue
+        out += 'data: ' + payload + '\n\n'
+        continue
+      }
+      const inner = typeof envelope.body === 'string' ? envelope.body : JSON.stringify(envelope.body)
+      const trimmed = inner.trim()
+      if (trimmed === '[DONE]') { out += 'data: [DONE]\n\n'; continue }
+      if (trimmed.length === 0) continue
+      let parsed = null
+      try { parsed = JSON.parse(trimmed) } catch { parsed = undefined }
+      // 心跳：既没有 choices/usage，也没有错误字段 —— bili 与 adapter 都应当看不到它。
+      if (isHeartbeatFrame(parsed)) continue
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.choices === undefined &&
+        (parsed.code !== undefined || parsed.message !== undefined || parsed.error !== undefined ||
+          parsed.statusCodeValue !== undefined || parsed.type !== undefined)) {
+        // 与 adapter 的 unwrap 一致：把包装层里的错误摊平成一行 model_error，
+        // 否则 adapter 侧读到的是一段没有 choices 的正文，报错文案会丢。
+        const message = typeof parsed.message === 'string' ? parsed.message : inner
+        out += 'data: ' + JSON.stringify({ ...parsed.code === undefined ? {} : { code: parsed.code }, message, type: 'model_error' }) + '\n\n'
+        continue
+      }
+      out += 'data: ' + trimmed + '\n\n'
+    }
+    return out
+  }
+
+  /** 用该实例自己的原始 prepareInfer 加密，node:https 直连上游，SSE 拆包装后穿回。 */
   const forward = (real, res) => {
     const target = new URL(real.url)
     const transport = target.protocol === 'https:' ? https : http
@@ -430,8 +521,41 @@ function createImpl(context) {
       method: 'POST',
       headers,
     }, (up) => {
-      res.writeHead(up.statusCode === undefined ? 502 : up.statusCode, up.headers)
-      up.pipe(res)
+      // 正文被拆包改写过了，上游声明的长度与编码都不再成立：留着 content-length 会让
+      // 客户端按原长度读，读到一半就截断（正是改写后最容易踩的坑）。
+      const outHeaders = {}
+      for (const [k, v] of Object.entries(up.headers)) {
+        const key = k.toLowerCase()
+        if (key === 'content-length' || key === 'content-encoding' || key === 'transfer-encoding') continue
+        outHeaders[k] = v
+      }
+      res.writeHead(up.statusCode === undefined ? 502 : up.statusCode, outHeaders)
+      // 只有流式正文才需要拆包。错误回包（JSON）原样穿回：它没有包装层，
+      // 拆一遍反而会把错误正文改坏。
+      const isStream = String(up.headers?.['content-type'] ?? '').includes('text/event-stream')
+      if (!isStream) {
+        up.pipe(res)
+        up.on('error', () => res.destroy())
+        return
+      }
+      // 上游是 qoder 的包装 SSE，bili 只会当裸 OpenAI 帧解析（见 unwrapEnvelopeChunk）。
+      // 逐段拆包再写回，客户端与 bili 读到的是同一种形状。
+      up.setEncoding('utf8')
+      const state = { buffer: '' }
+      let tail = ''
+      up.on('data', (chunk) => {
+        const out = unwrapEnvelopeChunk(state, chunk)
+        if (out.length === 0) return
+        tail = (tail + out).slice(-512)
+        if (!res.write(out)) { up.pause(); res.once('drain', () => up.resume()) }
+      })
+      up.on('end', () => {
+        // 收尾：缓冲区里剩下的半行也过一遍，别把最后一帧吞掉。
+        const rest = unwrapEnvelopeChunk(state, '\n')
+        if (rest.length > 0) { tail = (tail + rest).slice(-512); res.write(rest) }
+        stats.lastUpstreamTail = tail
+        res.end()
+      })
       up.on('error', () => res.destroy())
     })
     upstream.on('error', (err) => {
@@ -469,7 +593,9 @@ function createImpl(context) {
       try {
         const names = Array.isArray(body.tools) ? body.tools.map((t) => String(t?.function?.name ?? t?.name ?? '')) : []
         stats.lastPreparedTools = names.slice(0, 12)
-        stats.lastPreparedBiliTools = names.filter((n) => /bili/i.test(n))
+        // bili 的工具叫 acp_status / acp_cache / search_context / compress / decompress，
+        // 名字里没有 "bili" —— 按品牌名匹配永远为空，会被误读成「bili 没注入工具」。
+        stats.lastPreparedBiliTools = names.filter((n) => /^(acp_|compress$|decompress$|search_context$)/.test(n))
         stats.lastPreparedSystemChars = contentOf(body.messages[0]).length
       } catch { /* 诊断字段，失败不影响转发 */ }
       return {
@@ -538,6 +664,13 @@ function createImpl(context) {
         // 但条数与正文长度不变 —— 那不是压缩，看 diff 就能分辨。
         diff: messages === null ? [] : diffMessages(entry.sentList, messages).slice(0, 8),
       }
+      // bili 压缩回来的这次请求里带了哪些工具：只有带了 ACP 压缩工具，模型才真的能
+      // 主动压缩，而不是被动等 bili 在阈值处改写。这里记录**回来后**的工具名。
+      try {
+        const toolNames = Array.isArray(body?.tools) ? body.tools.map((t) => String(t?.function?.name ?? t?.name ?? '')) : []
+        stats.lastCompactedTools = toolNames.slice(0, 12)
+        stats.lastCompactedBiliTools = toolNames.filter((n) => /^(acp_|compress$|decompress$|search_context$)/.test(n))
+      } catch { /* 诊断字段，失败不影响转发 */ }
       // 诊断环：只留最近几次交换的规模与结果。lastExchange 只保留最后一条，
       // 而一次探针会打出多次重试，单看最后一条无法判断「大请求到底进没进来」。
       if (!Array.isArray(stats.recentExchanges)) stats.recentExchanges = []
@@ -589,6 +722,42 @@ function createImpl(context) {
  */
 function installPortals(adapters, stats) {
   const restores = []
+  // 探针：给活着的 adapter 的**类原型**包一层 stream。它的存在与否直接回答
+  // 「注册表里这个实例到底是不是在跑的那个」——fetchImpl 传送门为 0 时，
+  // 这个计数能区分「实例不对」和「实例对但走了别的出口」。
+  if (!Array.isArray(stats.streamProbe)) stats.streamProbe = []
+  for (const item of adapters) {
+    const adapter = item.adapter
+    let proto
+    try { proto = Object.getPrototypeOf(adapter) } catch { proto = null }
+    if (proto === null || typeof proto !== 'object') continue
+    const originalStream = proto.stream
+    if (typeof originalStream !== 'function' || originalStream.__mfStreamProbe === true) continue
+    const proxied = function mfQoderStreamProbe(options) {
+      try {
+        stats.streamCalls = (stats.streamCalls === undefined ? 0 : stats.streamCalls) + 1
+        const seen = stats.streamProbe.find((s) => s.id === item.id)
+        const entry = {
+          id: item.id,
+          ctor: String(this?.constructor?.name ?? '?').slice(0, 60),
+          provider: String(options?.provider ?? ''),
+          model: String(options?.model ?? ''),
+          msgs: Array.isArray(options?.messages) ? options.messages.length : -1,
+          ownFetch: Object.prototype.hasOwnProperty.call(this ?? {}, 'fetchImpl'),
+          fetchIsPortal: this?.fetchImpl?.__mfPortal === true,
+          at: Date.now(),
+        }
+        if (seen === undefined) stats.streamProbe.push(entry)
+        else Object.assign(seen, entry)
+      } catch { /* 诊断字段，失败不影响转发 */ }
+      return originalStream.call(this, options)
+    }
+    proxied.__mfStreamProbe = true
+    try {
+      proto.stream = proxied
+      restores.push(() => { try { proto.stream = originalStream } catch { /* 卸载期忽略 */ } })
+    } catch { /* 只读原型，跳过 */ }
+  }
   for (const item of adapters) {
     const adapter = item.adapter
     let current
@@ -765,6 +934,28 @@ export async function startQoderShim(options) {
   for (const t of collected.targets) patchTarget(t.label, t.holder, t.original)
 
   /**
+   * 让补丁**跟着注册表走**，而不是只在挂载那一刻打一次。
+   *
+   * dsh-our-free-model 的 adapter 会被它自己的 fiber 重启/自更新替换成新实例（新实例
+   * 的类原型也可能是另一份模块拷贝），那一刻我们挂上去的 prepareInfer 就随旧实例一起
+   * 消失，而 /status 仍然报「已接管」——2026-10-30 的现场就是这样：三个目标全在、
+   * 计数全 0、qoder 请求照常加密直发。
+   *
+   * 所以每拍重新扫一遍注册表里的活实例，把还没打过的原型补上。开销是一次 Map 查找，
+   * 且只在流的**间隔**里跑（没有请求时不做任何事）。
+   */
+  const rescanTargets = async () => {
+    try {
+      const fresh = await collectTargets(ctx, wasmPath)
+      for (const t of fresh.targets) patchTarget(t.label, t.holder, t.original)
+      return fresh
+    } catch (err) {
+      stats.rescanError = err && err.message ? String(err.message).slice(0, 120) : String(err)
+      return null
+    }
+  }
+
+  /**
    * 认领运行时真正在用的加密器（pack.js 内联那份），成功即打上补丁。
    *
    * pack 的 apply 与「本插件 apply」没有顺序保证：宿主冷启动时本插件先 apply，
@@ -828,10 +1019,41 @@ export async function startQoderShim(options) {
     if (typeof retry.timer.unref === 'function') retry.timer.unref()
   }
 
+  /**
+   * 对账定时器：跨热替换共用一份，只换回调。
+   *
+   * 类原型的补丁只在「同一份模块拷贝」的实例之间传递。宿主换了拷贝（pack 自更新、
+   * fiber 重启后重新 import）就会冒出一个没打过补丁的类，而进程里其它几份补丁仍在，
+   * /status 依旧报已接管 —— 这正是 2026-10-30 之前 counters 全 0 的成因。对账间隔里
+   * 重新扫一遍注册表，把新冒出来的拷贝补上，代价是每拍两次 Map 查找（ESM import 已被
+   * 模块缓存挡住）。unref 让它不拖住进程退出。
+   */
+  const reconcile = previous !== undefined && previous.reconcile !== undefined
+    ? previous.reconcile
+    : { fn: null, timer: null, ticks: 0 }
+  reconcile.fn = rescanTargets
+  stats.reconcileTicks = reconcile.ticks
+  if (reconcile.timer === null && typeof setInterval === 'function') {
+    reconcile.timer = setInterval(() => {
+      reconcile.ticks += 1
+      const state = globalThis[STATE_KEY]
+      if (state === undefined || reconcile.fn === null) {
+        clearInterval(reconcile.timer)
+        reconcile.timer = null
+        return
+      }
+      state.stats.reconcileTicks = reconcile.ticks
+      state.stats.lastReconcileAt = Date.now()
+      Promise.resolve(reconcile.fn()).catch(() => { /* 对账失败下一拍再来 */ })
+    }, RECONCILE_INTERVAL_MS)
+    if (typeof reconcile.timer.unref === 'function') reconcile.timer.unref()
+  }
+
   if (previous !== undefined && previous.port === port && previous.server !== undefined) {
     previous.impl = impl
     previous.patched = patched
     previous.retry = retry
+    previous.reconcile = reconcile
     info('[model-failover] qoder 压缩 shim 已热替换实现（继续复用 127.0.0.1:' + port + '，覆盖 ' + patched.length + ' 个目标）')
     return { status: () => ({ ...stats, liveSeen: readLiveEncryptor() !== null }), stop: previous.stop }
   }
@@ -855,6 +1077,10 @@ export async function startQoderShim(options) {
     for (const p of patched) {
       try { if (p.holder !== undefined && p.holder.prepareInfer === p.fn) p.holder.prepareInfer = p.box.original } catch { /* 还原失败不影响进程退出 */ }
     }
+    if (reconcile.timer !== null) {
+      try { clearInterval(reconcile.timer) } catch { /* 已停 */ }
+      reconcile.timer = null
+    }
     for (const restore of portals) { try { restore() } catch { /* 同上 */ } }
     try {
       const state = globalThis[STATE_KEY]
@@ -875,7 +1101,7 @@ export async function startQoderShim(options) {
   }
 
   await new Promise((done) => { server.listen(port, '127.0.0.1', done) })
-  globalThis[STATE_KEY] = { port, wasmPath, stats, impl, patched, portals, retry, server, stop }
+  globalThis[STATE_KEY] = { port, wasmPath, stats, impl, patched, portals, retry, reconcile, server, stop }
   info('[model-failover] qoder 压缩 shim 已监听 127.0.0.1:' + port + '（明文经 bili 压缩后再加密发往上游；覆盖 ' + patched.length + ' 个目标：' + stats.targets.join(', ') + '）')
 
   /**

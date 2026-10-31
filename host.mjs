@@ -78,7 +78,7 @@ import { pathToFileURL } from 'node:url'
 // 而监听端口与 prototype 补丁由 shim 的 globalThis 槽跨重载保持。
 const QODER_SHIM_MODULE = './qoder-compress-shim.mjs'
 /** shim 构建号：每次改动 qoder-compress-shim.mjs 就把它 +1，否则 ESM 仍用缓存的旧模块。 */
-const QODER_SHIM_BUILD = '62'
+const QODER_SHIM_BUILD = '63'
 /** shim 只换得掉这两家的加密端点（QoderEncryptedInfer#prepareInfer 的使用者）。 */
 const QODER_SHIM_PROVIDERS = new Set(['qoder', 'qodercn'])
 
@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v85'
+const HOST_VERSION = 'v86'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -119,6 +119,25 @@ const DEFAULT_UNCOMPRESSED_PROVIDERS = ['qoder', 'qodercn']
  * 本插件读它比去问 bili 的 HTTP 状态更可靠（不依赖端口、鉴权与网络）。
  */
 const BILI_COMPACTION_VERDICT_KEY = '__BILI_DSH_COMPACTION_VERDICT__'
+/**
+ * 免费渠道推荐：装上就能多几条免费模型的三个插件。
+ *
+ * 这里只放不随文案漂移的事实（包名、安装 spec、代表它的 provider 正则）。介绍文案与
+ * GitHub 地址在 client.js 的 FREE_CHANNEL_COPY（加渠道要两边一起改）；provider 是否在线
+ * 由 llm 注册表现场查询，「装没装」由 pluginManager.listBundles() 现场查询——这两件都不写死。
+ */
+const FREE_CHANNELS = [
+  { id: 'codearts', pkg: 'dsh-codearts', spec: 'dsh-codearts', providers: /^codearts/i },
+  { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', spec: 'dsh-connect-workbuddy', providers: /^workbuddy/i },
+  {
+    id: 'our-free-model',
+    pkg: 'dsh-our-free-model',
+    spec: 'github:Ebony-Vinyl/dsh-our-free-model',
+    // Our Free Model 按渠道各注册一个 provider（qoder、trae、cline…），没有统一前缀，
+    // 所以逐个点名；新增渠道时这里要一起加，否则界面只显示一部分已接入渠道。
+    providers: /^(qoder|qodercn|trae|cline|lobster|loomy|raccoon|minimax|zcode|gemini|eac|our-free)/i,
+  },
+]
 
 function failKey(provider, model) { return `${provider}/${model}` }
 /**
@@ -2035,6 +2054,79 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * 免费渠道推荐现场：每个渠道装没装、装的哪版、此刻有哪些 provider 在线。
+   *
+   * 「装没装」只认 pluginManager.listBundles()：它读的是当前 profile 的依赖，
+   * 与「模型列表里有没有它的模型」是两件事——有的包装了但没登录，provider 就不在。
+   * 服务取不到时 installed 返回 null（界面显示「未检测」），而不是谎报「未安装」。
+   *
+   * @returns {Promise<{managerAvailable: boolean, channels: {id: string, pkg: string, spec: string, installed: boolean|null, version: string|null, providers: string[]}[]}>} 现场快照
+   */
+  async function describeFreeChannels() {
+    /** @type {Map<string, string>} */
+    const installed = new Map()
+    let managerAvailable = false
+    try {
+      const manager = ctx.get('pluginManager')
+      if (manager && typeof manager.listBundles === 'function') {
+        managerAvailable = true
+        for (const bundle of (await manager.listBundles()) ?? []) {
+          const name = String(bundle?.name ?? '')
+          // installed 才是「当前 profile 依赖里声明了它」；目录里可装但没装的条目也会出现在
+          // listBundles 里，只看名字会把「市场里有」误判成「已经装了」。
+          if (name && bundle?.installed !== false) installed.set(name, String(bundle?.version ?? ''))
+        }
+      }
+    } catch { /* 服务不可用时保持空表，界面按「未检测」展示 */ }
+    /** @type {string[]} */
+    let providerIds = []
+    try {
+      providerIds = (ctx.get('llm')?.listProviders?.() ?? []).map(p => String(p?.id ?? '')).filter(Boolean)
+    } catch { /* 只读诊断：注册表读不到就当没有在线渠道 */ }
+    return {
+      managerAvailable,
+      channels: FREE_CHANNELS.map(c => ({
+        id: c.id,
+        pkg: c.pkg,
+        spec: c.spec,
+        installed: managerAvailable ? installed.has(c.pkg) : null,
+        version: installed.get(c.pkg) ?? null,
+        providers: providerIds.filter(id => c.providers.test(id)),
+      })),
+    }
+  }
+
+  /**
+   * 从推荐表里安装一个渠道，走的是插件市场同一个引擎（pluginManager.installBundle）。
+   *
+   * 装包可能要执行安装脚本，那一步必须由用户批准；这里不代批，只把待批准项原样抛回界面，
+   * 否则一键安装就成了「绕过审批执行构建脚本」的入口。
+   *
+   * @param {string} id - 推荐表的渠道 id。
+   * @returns {Promise<{ok: boolean, message: string, pendingBuilds?: string[]}>} 安装结论（可直接展示）
+   */
+  async function installFreeChannel(id) {
+    const channel = FREE_CHANNELS.find(c => c.id === id)
+    if (!channel) return { ok: false, message: `推荐表里没有这个渠道：${id}` }
+    let manager
+    try { manager = ctx.get('pluginManager') } catch { /* 下面统一处理 */ }
+    if (!manager || typeof manager.installBundle !== 'function') {
+      return { ok: false, message: `当前宿主没有插件管理服务，无法一键安装；请手动安装 ${channel.spec}` }
+    }
+    let result
+    try {
+      result = await manager.installBundle(channel.spec)
+    } catch (e) {
+      return { ok: false, message: `安装 ${channel.pkg} 失败：${e?.message || e}` }
+    }
+    const pending = Array.isArray(result?.pendingBuilds) ? result.pendingBuilds.map(String) : []
+    if (pending.length > 0) {
+      return { ok: false, pendingBuilds: pending, message: `${channel.pkg} 需要先批准执行构建脚本：${pending.join('、')}` }
+    }
+    return { ok: true, message: `已安装 ${channel.pkg}；热加载完成后它的模型会出现在模型列表里。` }
+  }
+
+  /**
    * codearts 失败后的处置：先分辨成因，再决定能否自救。
    *
    * @param {string} provider - 失败请求用的 provider。
@@ -3112,6 +3204,18 @@ export function apply(ctx, config = {}) {
           .filter(([, cd]) => cd.until > Date.now())
           .map(([key, cd]) => ({ key, until: cd.until, reason: cd.reason })),
       })
+      return
+    }
+
+    /* ----- 免费渠道推荐：装了什么、要不要我装 ----- */
+    if (path === `${API_PATH}/free-channels` && req.method === 'GET') {
+      sendJson(res, 200, await describeFreeChannels())
+      return
+    }
+    if (path === `${API_PATH}/free-channels/install` && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}')
+      const outcome = await installFreeChannel(typeof body?.id === 'string' ? body.id : '')
+      sendJson(res, outcome.ok ? 200 : 409, outcome)
       return
     }
 
