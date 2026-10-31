@@ -1980,6 +1980,20 @@ await api('DELETE', '/groups/' + encodeURIComponent(gId))
 ok('㉟ 自检用的临时分组已清掉',
   (await api('GET', '/status')).body.groups.every(g => g.id !== gId))
 
+// ── ㊱ 数据看板：口径说明默认收起，P50 / P90 有解释 ─────────────────────
+// 说明常驻会白白吃掉表格高度，改成可折叠；P90 是分位数，不写清楚没人该猜得出。
+ok('㊱ 看板的指标说明默认收起，点一下才展开',
+  clientText.includes('var metricsHelpPair = React.useState(false)')
+  && clientText.includes("metricsHelp && e('div', { style: { fontSize: '11px'")
+  && clientText.includes("metricsHelp && e('div', { style: S.metricsNote }")
+  && clientText.includes('setMetricsHelp(!metricsHelp)')
+  && clientText.includes("'收起指标说明 ▴'"))
+
+ok('㊱ 说明里解释 P50 / P90 是分位数（P90 = 90% 的请求都比它快）',
+  clientText.includes('P50 / P90 是同一批采样的分位数')
+  && clientText.includes('P90 表示 90% 的请求都比它快')
+  && clientText.includes('首字给 P90'))
+
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

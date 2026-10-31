@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v21'
+    var VERSION = 'v22'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -290,6 +290,12 @@ window.__ModuleLoader__.load({
         display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
         padding: '2px 0 8px',
       },
+      /** 指标说明的折叠开关：文字按钮，常驻一行，不跟表格抢注意力 */
+      helpToggle: {
+        background: 'none', border: 'none', padding: '0 2px 6px', cursor: 'pointer',
+        textAlign: 'left', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)',
+      },
+      helpToggleOn: { color: 'var(--dsw-alias-label-secondary)' },
       metricsNote: {
         fontSize: '11px', lineHeight: '1.6', color: 'var(--dsw-alias-label-tertiary)',
         padding: '0 2px 8px',
@@ -648,6 +654,8 @@ window.__ModuleLoader__.load({
       var orderNoticePair = React.useState(null); var orderNotice = orderNoticePair[0]; var setOrderNotice = orderNoticePair[1]
       /** 路由分组页签的移动/移除回执：{ ok, text }。与看板的 orderNotice 分开，两边不会互相顶掉 */
       var groupNoticePair = React.useState(null); var groupNotice = groupNoticePair[0]; var setGroupNotice = groupNoticePair[1]
+      /** 数据看板的指标说明是否展开：默认收起，把高度留给表格 */
+      var metricsHelpPair = React.useState(false); var metricsHelp = metricsHelpPair[0]; var setMetricsHelp = metricsHelpPair[1]
       /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
       var rangePair = React.useState({ since: '', until: '' })
       var range = rangePair[0]; var setRange = rangePair[1]
@@ -1892,14 +1900,27 @@ window.__ModuleLoader__.load({
             }, '全部'),
             (range.since || range.until) && e('span', { style: { fontSize: '11px', opacity: .5 } },
               '已筛选，结果不含区间外的样本')),
-          e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px' } },
+          // 口径说明默认收起：表头已经写着列名，说明只在真要抠口径时展开，
+          // 否则它占掉的两三行正好是表格最需要的空间
+          e('button', {
+            style: metricsHelp ? Object.assign({}, S.helpToggle, S.helpToggleOn) : S.helpToggle,
+            title: '各列的口径、副行灰字是什么、P50 / P90 怎么读',
+            onClick: function () { setMetricsHelp(!metricsHelp) },
+          }, metricsHelp
+            ? '收起指标说明 ▴'
+            : '指标说明：成功率 / 首字（P50、P90）/ 速度 / token / 并发怎么读 ▾'),
+          metricsHelp && e('div', { style: { fontSize: '11px', opacity: .6, padding: '0 2px 6px', lineHeight: '1.6' } },
             '成功率 = 区间内成功调用 / 区间内全部采样（历史全部保留，不按条数截断）；'
             + '首字 = 请求发出到第一个输出增量的时间；速度 = 输出 token / 生成耗时（大字是区间中位数 P50，'
             + '小字是该模型活跃并发区间内的合计速度——这批在跑请求从最早开始产出的那一刻算到现在，总输出字符 ÷ 4 ÷ 区间秒数）；'
             + 'token = 所选区间内该模型的输入/输出/缓存用量合计（只统计适配器报了 usage 的调用）；'
             + '并发 = 正在进行的请求 / 生效上限（模型自己的上限直接在「并发」列改，按模型持久化、对所有分组统一生效；'
             + '没单独设上限的模型跟随标题栏的「默认并发」，那里改一次就全表生效；达到上限时立刻换组内其它模型，不排队）。'),
-          e('div', { style: S.metricsNote },
+          metricsHelp && e('div', { style: S.metricsNote },
+            'P50 / P90 是同一批采样的分位数（percentile）：P50 就是中位数，一半请求比它快；'
+            + 'P90 表示 90% 的请求都比它快，只有最慢的一成超过它——所以 P90 明显高于 P50，说明偶发慢请求拖着一条长尾巴，'
+            + '平均数会被少数慢样本带偏，才用这两个数一起看。'),
+          metricsHelp && e('div', { style: S.metricsNote },
             '副行灰字是该列的补充：成功率给成功数 / 采样数，首字给 P90，速度给活跃区间合计速度（没请求在产出时不显示），'
             + 'token 一行一个数给输入 / 缓存命中 / 缓存写入 / 输出（鼠标悬停大字看历史总量），'
             + '并发给等槽时间与等槽位数（闸门里不排队，只有整组都满时才有人等），模型给所属分组。'
