@@ -26,7 +26,7 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v17'
+    var VERSION = 'v18'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -2439,7 +2439,7 @@ window.__ModuleLoader__.load({
           }, e('span', { style: Object.assign({}, S.toggleKnob, dialogMode ? S.toggleKnobOn : {}) })),
           e('div', null,
             e('div', { style: { fontSize: '13px', fontWeight: 600 } }, '模型选择使用弹窗'),
-            e('div', { style: { fontSize: '11px', opacity: .6 } }, '开启后会话输入框的模型选择改为左右分区弹窗（左：提供商，右：模型）；关闭时使用紧凑下拉列表。'))),
+            e('div', { style: { fontSize: '11px', opacity: .6 } }, '开启后会话输入框的模型选择改为左右分区弹窗（左：提供商，右：模型）；关闭时使用紧凑下拉列表。新装默认开启。'))),
 
         e('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' } },
           e('span', { style: { fontSize: '13px', fontWeight: 600 } }, '路由分组'),

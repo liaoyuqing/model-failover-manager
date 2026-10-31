@@ -104,7 +104,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v84'
+const HOST_VERSION = 'v85'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -424,10 +424,15 @@ export function apply(ctx, config = {}) {
   })()
   /** @type {{ key: string; day: string; count: number; provider: string; model: string }[]} */
   let failedList = readJson(failedFile, [])
+  // dialogMode：模型选择用左右分区弹窗（true）还是紧凑下拉（false）。
+  // 出厂为 true：模型多的时候只有弹窗装得下提供商分栏与「路由分组 / 数据看板 /
+  // 失败模型」页签，下拉一屏只够列十几个模型。用户在设置里关掉后写进
+  // settings.json，此后以存下的值为准，不再回落到这里的出厂值。
+  //
   // metricsSort：数据看板上次使用的排序（{ key, dir } 或 null = 默认序）。
   // 存在 settings.json 里而不是浏览器 localStorage：同一台宿主的多个浏览器
   // 与刷新后的页面都看到同一份排序，换机器也不会各记一套。
-  let settings = Object.assign({ dialogMode: false, metricsSort: null, defaultConcurrency: null }, readJson(settingsFile, {}))
+  let settings = Object.assign({ dialogMode: true, metricsSort: null, defaultConcurrency: null }, readJson(settingsFile, {}))
 
   /**
    * 看板排序列的合法键。与 client.js 的 metricsSortValue 一一对应；

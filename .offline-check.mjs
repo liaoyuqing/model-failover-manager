@@ -1736,6 +1736,53 @@ if (typeof agentErrorHandler !== 'function') throw new Error('agent/error 没有
 // 上面那段需要一个「取回假 Agent」的辅助（续跑链路用的是 session id，不是 agent 对象）
 function sa2(id) { return agents.find(a => a.id === id) }
 
+// ── ㉜ 模型选择弹窗出厂即开启（settings.dialogMode） ────────────────────────
+//     新装用户第一次点模型位就该看到左右分区弹窗：出厂值是 true。用户关掉后
+//     写进 settings.json，重新 apply 必须仍读到 false —— 出厂值只在「没存过」
+//     时生效，不能把用户自己的选择顶回去。
+{
+  /** 用给定 dataDir 重新 apply 一次，返回该实例的 HTTP 调用器（等价于一次宿主重启） */
+  const mountOn = (dataDir) => {
+    let handler = null
+    const c = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
+    c.get = baseGet
+    c.on = ctx.on
+    c.inject = (_n, cb) => cb({
+      webServer: { register(spec) { handler = spec.handler; return () => {} } },
+      effect() {}, interval() { return () => {} },
+    })
+    applyTwice(c, { dataDir })
+    return (method, path, body) => {
+      const req = new EventEmitter()
+      req.method = method
+      req.url = `/api/model-failover${path}`
+      const res = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
+      const done = handler(req, res)
+      if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
+      req.emit('end')
+      return Promise.resolve(done).then(() => ({ status: res.statusCode, body: JSON.parse(res.body || 'null') }))
+    }
+  }
+
+  const freshDir = mkdtempSync(join(tmpdir(), 'mfm-dialog-'))
+  const freshApi = mountOn(freshDir)
+  const freshStatus = (await freshApi('GET', '/status')).body
+  ok('㉜ 新装（还没有 settings.json）默认就是弹窗模式',
+    freshStatus.settings?.dialogMode === true, JSON.stringify(freshStatus.settings))
+  ok('㉜ 出厂值不落盘（用户没改过就不该生成 settings.json）',
+    !existsSync(join(freshDir, 'settings.json')))
+
+  await freshApi('POST', '/settings', { dialogMode: false })
+  ok('㉜ 关掉弹窗会写进 settings.json',
+    JSON.parse(readFileSync(join(freshDir, 'settings.json'), 'utf8')).dialogMode === false)
+  const restartedApi = mountOn(freshDir)
+  ok('㉜ 重启后仍是用户关掉的状态（出厂 true 不顶回已存的值）',
+    (await restartedApi('GET', '/status')).body.settings?.dialogMode === false)
+  ok('㉜ 重新打开又回到 true 并存盘',
+    (await restartedApi('POST', '/settings', { dialogMode: true })).body.settings?.dialogMode === true
+    && JSON.parse(readFileSync(join(freshDir, 'settings.json'), 'utf8')).dialogMode === true)
+}
+
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

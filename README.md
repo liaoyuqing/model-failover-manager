@@ -13,8 +13,8 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 ## 它做什么
 
 - **接管模型选择位**：以 `priority: -1` 注册 `conversation.input.model`，遮蔽内置选择器。
-  - 打开「弹窗模式」时为左右分区弹窗（左：供应商，右：模型），含「路由分组」「失败模型」两个页签。
-  - 关闭时为紧凑下拉。
+  - 「弹窗模式」为左右分区弹窗（左：供应商，右：模型），右侧含「模型」「路由分组」「数据看板」「失败模型」四个页签。**新装默认开启**。
+  - 关掉后是紧凑下拉，一屏只列十几个模型，没有分栏与页签。
   - 触发按钮显示 **供应商 · 模型名 · 思考强度**；已绑定分组时另有一个分组徽标。
 - **路由分组**：可建多个分组，每组是一份有序模型列表（`priority` 决定尝试顺序）。
   - 每个模型可配**生效时段**：多段，两端包含（`from` 与 `to` 都算在时段内），`from > to` 表示跨午夜（如 22 → 6）。
@@ -235,7 +235,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 ## 使用
 
-1. 打开 **设置 → 模型故障转移**：切换弹窗模式，增删改路由分组（模型优先级、生效时段、截止日），或恢复失败的模型。
+1. 打开 **设置 → 模型故障转移**：切换弹窗模式（新装默认开启），增删改路由分组（模型优先级、生效时段、截止日），或恢复失败的模型。
 2. 在会话里点模型位：选模型，并（可选）把某个分组**绑定到当前会话**，选择 `route` 或 `failover` 模式。
 3. 之后该会话按绑定策略工作；绑定会落盘，重启后继续生效。
 
@@ -308,7 +308,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`） |
-| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`）。`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
+| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`）。`dialogMode` 出厂为 `true`（新装即弹窗），只有显式传 `false` 才落成下拉；`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组。`PUT` 的 `models` 是**整体替换**：看板的「移除」用它把某个模型从所属分组的清单里摘掉，其余模型与优先级保持不变 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
@@ -347,7 +347,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `session-bindings.json` | 会话 → 分组 + 模式的绑定 |
 | `default-binding.json` | 新会话沿用的默认绑定 |
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
-| `settings.json` | 界面设置（含看板排序与默认并发覆盖值） |
+| `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
 | `model-concurrency.json` | 按模型记录的并发上限（`provider/model` → 上限），对所有分组生效 |
 
 ## 配置
@@ -395,7 +395,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 A DSH plugin that replaces the composer's model seat with a grouped model picker, and automatically fails over to the next usable model in the bound group once a model has exhausted every retry policy.
 
-- Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector (dialog mode or a compact dropdown).
+- Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector: a split-pane dialog by default (providers on the left, models and tabs on the right), or a compact dropdown once the dialog toggle is turned off. A fresh install runs in dialog mode.
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.
