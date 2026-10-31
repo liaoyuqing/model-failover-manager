@@ -1,1 +1,1 @@
-{"meta": {"title": "Model Failover Manager", "description": "Dialog-based model picker (on by default) + route failover groups. Auto-switch to next group model when all retries are exhausted."}}
+{"meta": {"title": "Model Failover Manager", "description": "Dialog-based model picker (on by default) + route failover groups. Depends on dsh-llm-error-retry and embeds its config as a dialog tab; auto-switch to next group model when all retries are exhausted."}}

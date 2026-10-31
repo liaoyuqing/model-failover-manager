@@ -46,6 +46,14 @@
 #            before it may switch back to the original one (default: 30000), so
 #            two busy models cannot bounce a session back and forth.
 
+# Installing this bundle also installs dsh-llm-error-retry (declared under
+# "dependencies") and mounts its row here, so one install gives both plugins.
+# The row reuses the id dsh-llm-error-retry's own bundle patch uses: loader
+# entries are kept by id, so a profile that also selected that bundle composes
+# two rows with this id and the loader mounts one entry from the later row —
+# never two retry instances that would each retry the same request.
 - insert:
     - id: model-failover-manager
       name: 'model-failover-manager'
+    - id: llm-error-retry
+      name: 'dsh-llm-error-retry'

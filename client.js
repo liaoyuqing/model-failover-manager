@@ -26,7 +26,9 @@ window.__ModuleLoader__.load({
     var createPortal = ReactDOM.createPortal
     var e = React.createElement
     var API = '/api/model-failover'
-    var VERSION = 'v18'
+    // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
+    var RETRY_UI = '/llm-error-retry'
+    var VERSION = 'v19'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -125,6 +127,14 @@ window.__ModuleLoader__.load({
         maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       },
       hint: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)', padding: '6px 2px' },
+      // 错误重试页签：状态栏 + 内嵌的重试插件配置页
+      retryPane: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 },
+      retryBar: {
+        display: 'flex', alignItems: 'center', gap: '10px', padding: '6px 10px',
+        fontSize: '11px', color: 'var(--dsw-alias-label-caption)',
+        borderBottom: '1px solid var(--dsw-alias-border-l2)',
+      },
+      retryFrame: { flex: 1, width: '100%', border: 'none', minHeight: 0, background: 'var(--dsw-alias-bg-layer-2)' },
       btn: {
         padding: '3px 10px', fontSize: '11px', cursor: 'pointer',
         border: '0.5px solid var(--dsw-alias-border-l3)',
@@ -622,6 +632,8 @@ window.__ModuleLoader__.load({
       /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
       var rangePair = React.useState({ since: '', until: '' })
       var range = rangePair[0]; var setRange = rangePair[1]
+      /** 错误重试页签的探测结果：null = 尚未探测，{ absent: true } = 没挂载那个插件，否则是它 /api/config 的返回 */
+      var retryPair = React.useState(null); var retryProbe = retryPair[0]; var setRetryProbe = retryPair[1]
       /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
       var concPair = React.useState({}); var concDraft = concPair[0]; var setConcDraft = concPair[1]
       /**
@@ -720,6 +732,33 @@ window.__ModuleLoader__.load({
         setSpeedTest(null)
         setSpeedScope([])
       }, [tab])
+
+      /**
+       * 错误重试页签只做探测与展示：规则编辑界面由 dsh-llm-error-retry 自己挂在
+       * /llm-error-retry 上，这边再把校验、脏保存、生效时机重写一遍，只会让两处
+       * 说法不一致（它保存后立即生效，还写 rules.json）。
+       */
+      function probeRetry() {
+        setRetryProbe(null)
+        fetch(RETRY_UI + '/api/config', { credentials: 'same-origin', cache: 'no-store' })
+          .then(function (res) {
+            return res.text().then(function (text) {
+              if (!res.ok) return { absent: true, status: res.status }
+              try { return JSON.parse(text) } catch (err) {
+                // 页面在但响应不是 JSON（被别的插件占了路径）也按不可用处理
+                return { absent: true, status: res.status, detail: '响应不是 JSON' }
+              }
+            })
+          })
+          .then(function (data) { setRetryProbe(data) })
+          .catch(function (err) { setRetryProbe({ absent: true, detail: String((err && err.message) || err) }) })
+      }
+
+      // 停在这个页签时才探测：其它页签不该为它发请求，离开页签后也不必再维持状态
+      React.useEffect(function () {
+        if (!open || tab !== 'retry') return
+        probeRetry()
+      }, [open, tab])
 
       if (!props.available) return null
       // 内置模型目录对有归属的子代理会话不给快照；子代理位改用 Host 的
@@ -938,6 +977,37 @@ window.__ModuleLoader__.load({
       }
 
       /* ---- 分组页签 ---- */
+      /**
+       * 错误重试页签。配置页由 dsh-llm-error-retry 自己渲染（内嵌 iframe），这里只留
+       * 一条状态栏和两个入口：重新探测、新窗口打开。
+       */
+      function retryTab() {
+        if (retryProbe === null) return e('div', { style: S.pane }, e('div', { style: S.hint }, '正在读取错误重试状态…'))
+        if (retryProbe.absent) {
+          var why = retryProbe.detail ? '（' + retryProbe.detail + '）' : (retryProbe.status ? '（HTTP ' + retryProbe.status + '）' : '')
+          return e('div', { style: S.pane },
+            e('div', { style: S.hint }, '当前 profile 没有挂载 dsh-llm-error-retry' + why + '，重试规则暂时改不了。'),
+            // 依赖装不上时 pnpm 会整体失败并报错，提示同时给出「重装」和「单独装」两条路
+            e('div', { style: S.hint }, '它在本插件 2.23 起的依赖里：重新安装本插件（dsh plugin add model-failover-manager，或对应的发布 tarball）会一起装上它。'),
+            e('div', { style: S.hint }, '已经在别的 profile 里单独装过，也可以照常单独安装它，再用这里的「重新探测」。'),
+            e('button', { style: S.btn, onClick: function () { probeRetry() } }, '重新探测'))
+        }
+        var cfg = retryProbe
+        var source = typeof cfg.source === 'string' ? cfg.source : '—'
+        var rules = Array.isArray(cfg.rules) ? cfg.rules : []
+        var waiting = typeof cfg.waiting === 'number' ? cfg.waiting : 0
+        return e('div', { style: S.retryPane },
+          e('div', { style: S.retryBar },
+            e('span', null, '规则 ' + rules.length + ' 条'),
+            e('span', null, '来源 ' + source),
+            e('span', null, '等待中 ' + waiting),
+            // 状态栏靠右的两个入口：重新探测（插件可能刚被装上），新窗口（配置页窄时看全）
+            e('span', { style: { flex: 1 } }),
+            e('button', { style: S.btn, onClick: function () { probeRetry() } }, '刷新状态'),
+            e('button', { style: S.btn, onClick: function () { window.open(RETRY_UI, '_blank', 'noopener') } }, '新窗口打开')),
+          e('iframe', { src: RETRY_UI, title: 'LLM 错误重试配置', style: S.retryFrame }))
+      }
+
       function groupTab() {
         var avail = poolOf(catalog, status)
         return e('div', { style: S.pane },
@@ -2019,6 +2089,9 @@ window.__ModuleLoader__.load({
           right = groupTab()
         } else if (tab === 'dashboard') {
           right = dashboardTab()
+        } else if (tab === 'retry') {
+          // 重试配置页自己排版，整个右边栏给它（提供商列在下面隐藏）
+          right = retryTab()
         } else {
           right = failedTab()
         }
@@ -2032,7 +2105,8 @@ window.__ModuleLoader__.load({
               boundGroup && e('span', { style: S.badge }, '分组：' + boundGroup.name),
               e('button', { style: S.btn, onClick: function () { setOpen(false); setQuery('') } }, '关闭')),
             e('div', { style: S.body },
-              e('div', { style: S.left },
+              // 错误重试页由重试插件自己的页面渲染，规则表格更吃宽度，左栏让位
+              tab === 'retry' ? null : e('div', { style: S.left },
                 e('div', { style: S.leftTitle }, '提供商'),
                 e('div', { style: S.leftList }, visible.map(function (g) {
                   var isActive = g.id === activeId
@@ -2051,7 +2125,8 @@ window.__ModuleLoader__.load({
                   e('button', { style: Object.assign({}, S.tab, tab === 'models' ? S.tabActive : {}), onClick: function () { setTab('models') } }, '模型'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'groups' ? S.tabActive : {}), onClick: function () { setTab('groups') } }, '路由分组'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'dashboard' ? S.tabActive : {}), onClick: function () { setTab('dashboard') } }, '数据看板'),
-                  e('button', { style: Object.assign({}, S.tab, tab === 'failed' ? S.tabActive : {}), onClick: function () { setTab('failed') } }, '失败模型' + (failedList.length ? ' (' + failedList.length + ')' : ''))),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'failed' ? S.tabActive : {}), onClick: function () { setTab('failed') } }, '失败模型' + (failedList.length ? ' (' + failedList.length + ')' : '')),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'retry' ? S.tabActive : {}), onClick: function () { setTab('retry') } }, '错误重试')),
                 right))),
           // 编辑器提到弹窗根层级：从任意页签（含模型页签的 ＋ 快捷入组）触发都能显示
           editing && groupEditor(poolOf(catalog, status))),

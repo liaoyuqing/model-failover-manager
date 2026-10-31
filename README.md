@@ -1,10 +1,10 @@
 # model-failover-manager
 
-DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择弹窗，并在模型彻底失败后自动切换到组内下一个可用模型。
+DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择弹窗，并在模型彻底失败后自动切换到组内下一个可用模型。依赖 [dsh-llm-error-retry](https://github.com/liaoyuqing/dsh-llm-error-retry)，并在弹窗里内嵌它的「错误重试」页签——一次安装即可用。
 
 > 界面里叫「模型故障转移」。设置入口：**设置 → 模型故障转移**。
 
-![模型选择界面：左侧供应商列表，右侧「模型 / 路由分组 / 失败模型」三个页签与路由分组选择](docs/preview-model-selection.png)
+![模型选择界面：左侧供应商列表，右侧「模型 / 路由分组 / 数据看板 / 失败模型」页签与路由分组选择](docs/preview-model-selection.png)
 
 ![路由分组界面：已绑定「免费」分组、37 个模型按优先级排列，每个模型带失败与禁用开关](docs/preview-routing-groups.png)
 
@@ -13,7 +13,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 ## 它做什么
 
 - **接管模型选择位**：以 `priority: -1` 注册 `conversation.input.model`，遮蔽内置选择器。
-  - 「弹窗模式」为左右分区弹窗（左：供应商，右：模型），右侧含「模型」「路由分组」「数据看板」「失败模型」四个页签。**新装默认开启**。
+  - 「弹窗模式」为左右分区弹窗（左：供应商，右：模型），右侧含「模型」「路由分组」「数据看板」「失败模型」「错误重试」五个页签；「错误重试」整块留给重试插件自己渲染的配置页（左栏让位）。**新装默认开启**。
   - 关掉后是紧凑下拉，一屏只列十几个模型，没有分栏与页签。
   - 触发按钮显示 **供应商 · 模型名 · 思考强度**；已绑定分组时另有一个分组徽标。
 - **路由分组**：可建多个分组，每组是一份有序模型列表（`priority` 决定尝试顺序）。
@@ -53,6 +53,16 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 它的 `chatCompletions` 里，`pool.pick()` 从第一次就返回 `undefined` 时一个上游请求都不会发出去，直接回这句 429 —— 真实含义是「本地池挑不出号」。而它的账号池只有 `coolUntil`（冷却，成功或到期可清）和 `disabled`（停用，**没有任何清除路径**）；`disabled` 由 `session_dead` 写入，而它的 `classify()` 把 HTTP 401 和 403 都判成 `session_dead` —— 上游偶发一次 403（临时凭证临期、并发上限、权益校验）就让该号永久停用，两个号都撞上后池彻底变空，此后每次请求都是这句 429，直到重启宿主。
 
 本插件的处置：识别这句固定文案 → 重启承载 `dsh-codearts` 的 Loader 条目（`entry.fiber.restart()`，让它重新 apply、重建账号池；不写配置、不改 cordis.yml、不重启整个宿主）→ 等它的 provider 重新注册回 `llm` 注册表 → 同一步重试（selection 没变，retry 安全）。30 秒冷却防抖；自救失败时不把模型标成「当日失败」，也不切模型，只记一条诊断。
+
+## 与 dsh-llm-error-retry 的配合
+
+「所有重试耗尽后才换模型」里的重试由 [dsh-llm-error-retry](https://github.com/liaoyuqing/dsh-llm-error-retry) 负责，本插件不重写它的规则引擎：
+
+- **一次安装两件**：`package.json` 的 `dependencies` 声明了它，装本插件时会一并装上；本插件的 `cordis.patch.yml` 又同时插入它的 Loader 行。两件都做是因为它虽然声明了 `dsh.bundle`，但作为**传递依赖**不会被自动选中——profile 只给直接依赖里声明 bundle 的包自动加行，所以缺了那一行就是「装上了但没生效」。
+- **配置在同一个弹窗里**：弹窗的「错误重试」页签直接内嵌它的配置页（同源 `/llm-error-retry`，用 `iframe` 而不是重写一份编辑器）。规则表、首字超时、`Retry-After` 上限、最大续写这些的编辑与保存都在它自己的页面里完成，保存即生效（写 `$DSH_HOME/llm-error-retry/rules.json`）；本插件只探测它有没有挂载，没挂载时给出安装提示和「重新探测」。分开写一份表单会变成同一份规则两套说法，校验、生效时机、落盘位置都会各说各话。
+- **重复安装不会跑两份**：两条安装路径（本插件带进来的、以及单独装它的）插入的 Loader 行都用同一个 `id: llm-error-retry`。Loader 的条目按 `id` 存放，同 `id` 的多行只合成一个条目（后出现的那行生效），所以两个插件都在的 profile 里仍然只有一个重试实例——一次失败不会被两条重试链各重试一遍。行里的 `name` 写裸包名 `dsh-llm-error-retry`，由 profile 的 `node_modules` 解析，与哪种路径装进来的无关。
+- **它在路由前面**：重试先跑完才轮到本插件换模型（见「失败切换的判定过程」），所以给 `400` 这类「换个模型才有意义」的错误配规则会拖慢切换——在「错误重试」页签里放宽或删掉那条规则即可。
+- **数据各管各的**：本插件写 `$DSH_HOME/model-failover-manager/`，重试规则与等待状态在 `$DSH_HOME/llm-error-retry/`。
 
 ## 与 billion-context 的配合
 
@@ -220,12 +230,16 @@ lastExchange.diff[1] = {kind:"shrunk", role:"user", beforeLen:6003, afterLen:410
 dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```
 
-也可以手工放置：把仓库放进 `$DSH_HOME/plugins/model-failover-manager/`，然后在 `$DSH_HOME/cordis.patch.yml` 里注册：
+这一条会连 `dsh-llm-error-retry` 一起装上：它在 `dependencies` 里，固定到 [5543c34](https://github.com/liaoyuqing/dsh-llm-error-retry/commit/5543c344e926edb1b3a7c9872af92934be897deb)（0.20.0）。它不在 npm 上，拉的是 GitHub 源，所以这一步要能连上 github.com；拉不下来时整次安装会失败并报错，不会留下半个插件。
+
+也可以手工放置：把本仓库放进 `$DSH_HOME/plugins/model-failover-manager/`、把依赖放进 `$DSH_HOME/plugins/dsh-llm-error-retry/`，然后在 `$DSH_HOME/cordis.patch.yml` 里注册两行：
 
 ```yaml
 - insert:
     - id: model-failover-manager
       name: ./plugins/model-failover-manager/host.mjs
+    - id: llm-error-retry
+      name: ./plugins/dsh-llm-error-retry/host.mjs
 ```
 
 ### DSH 版本要求
@@ -236,12 +250,13 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ## 使用
 
 1. 打开 **设置 → 模型故障转移**：切换弹窗模式（新装默认开启），增删改路由分组（模型优先级、生效时段、截止日），或恢复失败的模型。
+   重试规则不在这里改——模型弹窗的「错误重试」页签内嵌了 `dsh-llm-error-retry` 自己的配置页。
 2. 在会话里点模型位：选模型，并（可选）把某个分组**绑定到当前会话**，选择 `route` 或 `failover` 模式。
 3. 之后该会话按绑定策略工作；绑定会落盘，重启后继续生效。
 
 ## 失败切换的判定过程
 
-1. 一次请求失败，内层重试策略（内置 `llm-retry`、`llm-error-retry` 等）先依次表态。
+1. 一次请求失败，内层重试策略（内置 `llm-retry`、本插件带进来的 `dsh-llm-error-retry` 等）先依次表态；后者的规则就在弹窗的「错误重试」页签里。
 2. 只有它们都放弃后，本插件才接手。**两条入口**都接：`agent/request-error`（流已经开起来、随后以 error/aborted 结束）与 `agent/error`（请求还没发出就抛，例如 `UNKNOWN_MODEL`、适配器同步报错）。任一条入口处置过的轮次，另一条按 `turn` 认出并跳过，不会一次失败连跳两个模型——所以本插件不再依赖「自己恰好是最外层」这个前提。
 3. 若错误是 `dsh-codearts` 的「本地池挑不出号」那句 429：重启它的 Loader 条目重建账号池，等适配器就绪后同一步重试（见「与 dsh-codearts 的配合」）。
 4. 若失败模型属于 Our Free Model 且该 provider 不在 `ofmHandoffExcludeProviders` 里：先换账号重试（见上一节）。
@@ -293,7 +308,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 代价是「不写当日失败」意味着下一轮按优先级还会选中它。为此插件按会话维护一份「本轮已因请求被拒跳过」的名单，选下一个模型时把这些排除掉；切到新模型后清空。否则同一轮会反复选中那个超限模型，每次都白烧一次上游请求。
 
-注意这类失败的**先后顺序由重试插件决定**：如果 `llm-error-retry` 给 `400` 配了规则，它会先把这条请求重试到预算耗尽（默认 5 次 × 5 秒 ≈ 25 秒），之后才轮到本插件路由。要减少这段等待，需要在重试插件的规则里放宽或去掉 `400`。本插件只负责在轮到它时把模型换对。
+注意这类失败的**先后顺序由重试插件决定**：如果 `llm-error-retry` 给 `400` 配了规则，它会先把这条请求重试到预算耗尽（默认 5 次 × 5 秒 ≈ 25 秒），之后才轮到本插件路由。要减少这段等待，需要在重试插件的规则里放宽或去掉 `400`（弹窗的「错误重试」页签就是它的规则页）。本插件只负责在轮到它时把模型换对。
 
 ## 切换不会暂停目标
 
@@ -326,6 +341,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | GET | `/debug/status-log?sessionId=&limit=` | 只读诊断：最近 200 条运行态事件（`agent/status`、转发给界面的 `api-session/status`、续跑排队与投递），带自增 `seq` 与毫秒时间戳 |
 | GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略。每行另带 `lifetimeInTokens`/`lifetimeOutTokens`/`lifetimeCacheReadTokens`/`lifetimeCacheWriteTokens`/`lifetimeTokenSamples`——该模型的**全量历史**用量（含缓存命中），不随筛选变化；`lastErrorCode`/`lastErrorMessage` 是区间内最后一次失败的错误码与完整报错文案（看板上悬停显示的就是它）；`aggregateTps` 是该模型**活跃并发区间内的合计速度**：把此刻还在跑、且已经吐出过增量的请求放进同一区间（起点 = 它们中间最早吐首字的那一刻，终点 = 采样时刻），区间内的总输出字符 ÷ 4 ÷ 区间秒数（拿不到真实 token，按输出字符估，1 token ≈ 4 字符）；等首字的请求既不贡献字符也不拉长区间，没有请求在产出时为 `null`——它只描述当下，不参与区间统计 |
 
+「错误重试」页签不经过这里的接口：它直接读写 `dsh-llm-error-retry` 自己的 `GET/POST /llm-error-retry/api/config`（同源，`iframe` 内嵌），本插件只负责探测与把页面放对位置。
+
 ### 数据看板
 
 - **排序会被记住**：点表头（升序 → 降序 → 回到默认序）后写回 `settings.json`，刷新页面、换个浏览器、甚至重启宿主之后打开看板，仍是上次那一列与方向；认不出的旧值回落成默认序，不会让插件带病启动。
@@ -349,6 +366,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
 | `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
 | `model-concurrency.json` | 按模型记录的并发上限（`provider/model` → 上限），对所有分组生效 |
+
+重试规则不在这里：它属于 `dsh-llm-error-retry`，存在 `$DSH_HOME/llm-error-retry/`（`rules.json` 保存界面改过的规则，`status.json` 是等待与最近事件）。两个插件的目录互不读写。
 
 ## 配置
 
@@ -376,8 +395,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | --- | --- |
 | `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
-| `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」页签 |
-| `cordis.patch.yml` | 安装用的 bundle patch |
+| `client.js` | 浏览器半（DSH dynamic client bundle），含「数据看板」与「错误重试」页签 |
+| `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
 | `locale/en.json`、`locale/zh.json` | 界面文案 |
 | `icon.svg` | 图标 |
 
@@ -389,6 +408,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 - 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
+- 对 `dsh-llm-error-retry` 的依赖固定到具体 commit（`5543c34`，0.20.0），不是版本范围：「错误重试」页签内嵌的是它的页面与 `/llm-error-retry/api/config`，字段或路径一变页签就空，所以升级它要连这个页签一起验。
 - `pack.js` 有两份副本（`$DSH_HOME/plugins/` 下的开发副本与 `$DSH_HOME/profiles/<name>/node_modules/` 下宿主真正 import 的那份），尺寸与 mtime 会不同。插件对每一份都做检查，`hookRepair.copies` 逐份列出；只补 `plugins` 那份是不够的。
 
 ## English

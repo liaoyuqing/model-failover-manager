@@ -1783,6 +1783,58 @@ function sa2(id) { return agents.find(a => a.id === id) }
     && JSON.parse(readFileSync(join(freshDir, 'settings.json'), 'utf8')).dialogMode === true)
 }
 
+// ── ㉝ 依赖 dsh-llm-error-retry：一次装两件、重复安装只跑一份 ────────────────
+// 只读静态文件、不联网：依赖能不能真拉下来是安装时 pnpm 的事，这里守的是
+// 「拉下来之后一定被装载」与「两条安装路径不会各跑一个重试实例」这两件事。
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+const depSpec = pkg.dependencies?.['dsh-llm-error-retry']
+ok('㉝ package.json 依赖 dsh-llm-error-retry，且固定到 GitHub 上的具体 commit',
+  typeof depSpec === 'string' && /^github:liaoyuqing\/dsh-llm-error-retry#[0-9a-f]{40}$/.test(depSpec),
+  String(depSpec))
+
+const patchText = readFileSync(new URL('./cordis.patch.yml', import.meta.url), 'utf8')
+// 只认本 patch 的形状（文件由本仓库自己维护）：id 与 name 认不出来就说明有行没按
+// 预期装载，让它在自检里挂掉，好过悄悄少一行。
+function insertRows(text) {
+  const out = []
+  let cur = null
+  for (const line of text.split(/\r?\n/)) {
+    const id = line.match(/^\s*- id:\s*(\S+)\s*$/)
+    const name = line.match(/^\s*name:\s*'([^']+)'\s*$/)
+    if (id) { cur = { id: id[1], name: null }; out.push(cur); continue }
+    if (name && cur && !cur.name) cur.name = name[1]
+  }
+  return out
+}
+const rows = insertRows(patchText)
+ok('㉝ patch 插入两行：本插件 + 重试插件（裸包名，由 profile 的 node_modules 解析）',
+  rows.length === 2
+  && rows[0].id === 'model-failover-manager' && rows[0].name === 'model-failover-manager'
+  && rows[1].id === 'llm-error-retry' && rows[1].name === 'dsh-llm-error-retry',
+  JSON.stringify(rows))
+
+// 重复安装：dsh-llm-error-retry 自己的 bundle patch 也插一行，id 与本 patch 相同、名字
+// 是相对路径。Loader 的条目按 id 存放、后写覆盖先写（EntryGroup.update 按 id 建 map），
+// 这里按同一语义走一遍，证明两个 id 相等就会收敛成一条。
+const upstreamRow = { id: 'llm-error-retry', name: './host.mjs' }
+const composed = new Map()
+for (const row of [...rows, upstreamRow]) composed.set(row.id, row)
+ok('㉝ 两条安装路径的两行同 id → 合成一个条目（不会跑两个重试实例）',
+  composed.size === 2
+  && composed.has('llm-error-retry')
+  && rows.filter(r => r.id === 'llm-error-retry').length === 1
+  && upstreamRow.name !== rows[1].name,
+  JSON.stringify([...composed.keys()]))
+
+const clientText = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+ok('㉝ 弹窗新增「错误重试」页签，且只在停在该页签时探测',
+  clientText.includes("var RETRY_UI = '/llm-error-retry'")
+  && clientText.includes("setTab('retry')")
+  && clientText.includes("tab !== 'retry'"))
+ok('㉝ 页签内容内嵌重试插件自己的页面与配置接口（不在本插件里重写一份编辑器）',
+  clientText.includes("fetch(RETRY_UI + '/api/config'")
+  && clientText.includes("e('iframe', { src: RETRY_UI"))
+
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)
