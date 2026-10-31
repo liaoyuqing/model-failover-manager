@@ -1855,13 +1855,20 @@ llmStub = { listProviders: () => [{ id: 'codearts' }, { id: 'qoder' }, { id: 'un
 
 const fc = (await api('GET', '/free-channels')).body
 const chOf = (id) => fc.channels.find(c => c.id === id) || {}
-ok('㉞ GET /free-channels 回三个推荐渠道：装没装读 profile 依赖，在线渠道读 llm 注册表',
+ok('㉞ GET /free-channels 回五个推荐渠道：装没装读 profile 依赖，在线渠道读 llm 注册表',
   fc.managerAvailable === true
-  && fc.channels.length === 3
+  && fc.channels.length === 5
+  && fc.channels.map(c => c.id).join(',') === 'codearts,workbuddy,trae,qoder,our-free-model'
   && fc.channels.every(c => typeof c.pkg === 'string' && typeof c.spec === 'string')
+  && chOf('trae').pkg === 'dsh-connect-trae' && chOf('trae').spec === 'dsh-connect-trae'
+  && chOf('qoder').pkg === '@dmh2002/dsh-connect-qoder' && chOf('qoder').spec === '@dmh2002/dsh-connect-qoder'
   && chOf('workbuddy').installed === true && chOf('workbuddy').version === '5.16.0'
   && chOf('codearts').installed === false && chOf('codearts').version === null
+  && chOf('trae').installed === false && chOf('qoder').installed === false
   && JSON.stringify(chOf('codearts').providers) === '["codearts"]'
+  // trae / qoder 的专用连接器没装，同名 provider 归聚合渠道（否则聚合卡片会显示「无在线渠道」）
+  && JSON.stringify(chOf('trae').providers) === '[]'
+  && JSON.stringify(chOf('qoder').providers) === '[]'
   && JSON.stringify(chOf('our-free-model').providers) === '["qoder"]',
   JSON.stringify(fc))
 
@@ -1881,6 +1888,30 @@ ok('㉞ 需要执行构建脚本时按失败回执原样抛出待批准项，不
 
 const unknownChannel = await api('POST', '/free-channels/install', { id: 'nope' })
 ok('㉞ 未知渠道 id 直接拒绝', unknownChannel.status === 409 && unknownChannel.body.ok === false, JSON.stringify(unknownChannel.body))
+
+// 专用连接器装了就由它认领同名的 trae / qoder；聚合渠道只列没人认领的在线渠道，不重复计数。
+managerStub = {
+  bundles: [
+    { name: 'dsh-connect-trae', version: '4.6.12' },
+    { name: '@dmh2002/dsh-connect-qoder', version: '1.16.4' },
+    { name: 'dsh-our-free-model', version: '2.0.0' },
+  ],
+  async listBundles() { return this.bundles },
+  async installBundle() { return { applied: true } },
+}
+llmStub = {
+  listProviders: () => [{ id: 'trae' }, { id: 'trae-global' }, { id: 'qoder' }, { id: 'qoder-global' }, { id: 'qodercn' }],
+}
+const fcOwned = (await api('GET', '/free-channels')).body
+const ownOf = (id) => fcOwned.channels.find(c => c.id === id) || {}
+ok('㉞ trae / qoder 装了就归专用连接器，聚合渠道只列剩下的（同名 provider 不重复计数）',
+  ownOf('trae').installed === true && ownOf('trae').version === '4.6.12'
+  && ownOf('qoder').installed === true && ownOf('qoder').version === '1.16.4'
+  && ownOf('our-free-model').installed === true
+  && JSON.stringify(ownOf('trae').providers) === '["trae","trae-global"]'
+  && JSON.stringify(ownOf('qoder').providers) === '["qoder","qoder-global"]'
+  && JSON.stringify(ownOf('our-free-model').providers) === '["qodercn"]',
+  JSON.stringify(fcOwned))
 
 managerStub = undefined
 llmStub = undefined
@@ -1908,6 +1939,8 @@ ok('㉞ 每个渠道给出 GitHub 仓库地址，并提供一键复制',
   clientText.includes("repo: 'https://github.com/elegant01/dsh-codearts'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-workbuddy'")
   && clientText.includes("repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model'")
+  && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-trae'")
+  && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-qoder'")
   && clientText.includes('function copyText(')
   && clientText.includes("navigator.clipboard.writeText")
   && clientText.includes("'复制链接'"))
@@ -1993,6 +2026,125 @@ ok('㊱ 说明里解释 P50 / P90 是分位数（P90 = 90% 的请求都比它快
   clientText.includes('P50 / P90 是同一批采样的分位数')
   && clientText.includes('P90 表示 90% 的请求都比它快')
   && clientText.includes('首字给 P90'))
+
+// ── ㊲ CodeArts 凭据镜像：并入本插件后仍按原判据镜像（原 dsh-codearts-resign-bridge）──
+// 这段既守静态接线（宿主挂载 / 设置页 / 手动同步入口），也用临时账号库跑一遍真实同步：
+// 镜像的判据是「每个可用账号 → 一个候选 ref」，写进去的字段名必须是 bili 解析认的那三个。
+const bridgeModule = await import(new URL('./codearts-resign-bridge.mjs', import.meta.url))
+const hostText = readFileSync(new URL('./host.mjs', import.meta.url), 'utf8')
+ok('㊲ 宿主静态挂载了凭据镜像，并把现场放进 /status.resignBridge',
+  hostText.includes("from './codearts-resign-bridge.mjs'")
+  && hostText.includes('startCodeartsResignBridge({')
+  && hostText.includes('resignBridge: describeResignBridge(),')
+  && hostText.includes('if (resignBridgeHandle) resignBridgeHandle.stop()'))
+
+ok('㊲ 设置页可改开关与间隔，另有「立即同步」的独立入口',
+  hostText.includes('settings.resignBridgeEnabled')
+  && hostText.includes('settings.resignBridgeIntervalSeconds')
+  && hostText.includes('/resign-bridge/sync')
+  && clientText.includes("'CodeArts 凭据镜像'")
+  && clientText.includes("API + '/resign-bridge/sync'"))
+
+// 真跑一遍：临时账号库 + 假 credentials 服务，不碰真实凭据
+const bridgeDir = mkdtempSync(join(tmpdir(), 'mfm-resign-'))
+const accountsPath = join(bridgeDir, 'accounts.json')
+const jetHubPath = join(bridgeDir, 'state.json')
+const expired = new Date(Date.now() - 3600_000).toISOString()
+// 同一份到期时间在下面两次写盘里复用：轮换必须只因为 AK 变，不能因为时间戳变
+const expSoon = new Date(Date.now() + 3600_000).toISOString()
+writeFileSync(accountsPath, JSON.stringify({
+  order: ['a-old', 'a-1', 'a-2'],
+  accounts: {
+    'a-old': { accessKeyId: 'AKOLD', secretAccessKey: 'SKOLD', token: 'TOLD', expiration: expired },
+    'a-1': { accessKeyId: 'AK1', secretAccessKey: 'SK1', token: 'T1', expiration: expSoon },
+    'a-2': { accessKeyId: 'AK2', secretAccessKey: 'SK2', token: '', expiration: expSoon },
+  },
+}))
+writeFileSync(jetHubPath, JSON.stringify({
+  accounts: [
+    { provider: 'codearts', credentialRef: 'REF_A', enabled: true },
+    { provider: 'other', credentialRef: 'REF_X' },
+    { provider: 'codearts', credentialRef: 'REF_B', enabled: false },
+  ],
+}))
+const writes = []
+const bridgeLogger = { info() {}, warn() {}, error() {}, debug() {} }
+const bridgeHandle = bridgeModule.startCodeartsResignBridge({
+  ctx: { get: (n) => (n === 'credentials' ? { set: (ref, payload) => writes.push({ ref, payload }) } : undefined) },
+  logger: bridgeLogger,
+  settings: { enabled: true, intervalSeconds: 10 },
+  fallbackRefs: ['REF_FALLBACK'],
+  accountsFile: accountsPath,
+  jetHubStateFile: jetHubPath,
+})
+const firstSync = await bridgeHandle.syncNow()
+ok('㊲ 每个可用账号各写一个 ref：过期账号跳过，禁用/非 codearts 的 ref 不进候选',
+  JSON.stringify(firstSync.mirroredRefs) === '["REF_A","REF_FALLBACK"]'
+  && firstSync.accountCount === 2
+  && writes.length === 2
+  && writes[0].ref === 'REF_A' && writes[1].ref === 'REF_FALLBACK',
+  JSON.stringify({ refs: firstSync.mirroredRefs, writes: writes.map(w => w.ref) }))
+
+const firstPayload = JSON.parse(writes[0].payload)
+ok('㊲ 凭据字段名与 bili 解析一致（access_key_id / secret_access_key / security_token）',
+  firstPayload.access_key_id === 'AK1' && firstPayload.secret_access_key === 'SK1'
+  && firstPayload.security_token === 'T1' && typeof firstPayload.expires_at === 'string',
+  JSON.stringify(Object.keys(firstPayload)))
+
+const secondSync = await bridgeHandle.syncNow()
+ok('㊲ 内容没变就不重写（每 10 秒一轮，不能每次都往凭据库塞一遍）',
+  secondSync.lastWroteCount === 0 && writes.length === 2, String(secondSync.lastWroteCount))
+
+// 密钥轮换：AK 变了必须立刻落库
+writeFileSync(accountsPath, JSON.stringify({
+  order: ['a-1', 'a-2'],
+  accounts: {
+    'a-1': { accessKeyId: 'AK1-NEW', secretAccessKey: 'SK1', token: 'T1', expiration: expSoon },
+    'a-2': { accessKeyId: 'AK2', secretAccessKey: 'SK2', token: '', expiration: expSoon },
+  },
+}))
+const rotated = await bridgeHandle.syncNow()
+ok('㊲ 账号轮换后立刻把新 AK 写进去（不等到下一轮、也不比对时间戳）',
+  rotated.lastWroteCount === 1 && JSON.parse(writes.filter(w => w.ref === 'REF_A').at(-1).payload).access_key_id === 'AK1-NEW',
+  String(rotated.lastWroteCount))
+
+const off = bridgeHandle.reconfigure({ enabled: false })
+ok('㊲ 关掉后状态里说清「已关闭」，同步不再写任何东西',
+  off.enabled === false && off.skipReason === '已关闭')
+bridgeHandle.stop()
+
+const noCredHandle = bridgeModule.startCodeartsResignBridge({
+  ctx: { get: () => undefined }, logger: bridgeLogger,
+  settings: { enabled: true, intervalSeconds: 10 }, accountsFile: accountsPath, jetHubStateFile: jetHubPath,
+})
+const noCred = await noCredHandle.syncNow()
+ok('㊲ 没有 credentials 服务时只记录原因，不报错也不写',
+  noCred.skipReason && noCred.skipReason.includes('credentials') && noCred.lastSyncAt === null,
+  String(noCred.skipReason))
+noCredHandle.stop()
+
+// 宿主 HTTP：/status 现场 + 设置项校验 + 手动同步
+const hostStatus = (await api('GET', '/status')).body
+ok('㊲ /status.resignBridge 回开关、间隔、落点与最近结果',
+  hostStatus.resignBridge && typeof hostStatus.resignBridge.enabled === 'boolean'
+  && typeof hostStatus.resignBridge.intervalSeconds === 'number'
+  && Array.isArray(hostStatus.resignBridge.mirroredRefs)
+  && 'skipReason' in hostStatus.resignBridge,
+  JSON.stringify(hostStatus.resignBridge))
+
+const intervalTooSmall = await api('POST', '/settings', { resignBridgeIntervalSeconds: 5 })
+const intervalOk = await api('POST', '/settings', { resignBridgeIntervalSeconds: 30 })
+const intervalStatus = (await api('GET', '/status')).body
+ok('㊲ 同步间隔的下限是 10 秒（5 秒被拒，30 秒生效）',
+  intervalTooSmall.status === 400
+  && intervalOk.body.settings.resignBridgeIntervalSeconds === 30
+  && intervalStatus.resignBridge.intervalSeconds === 30,
+  JSON.stringify({ rejected: intervalTooSmall.status, live: intervalStatus.resignBridge.intervalSeconds }))
+
+const syncCall = await api('POST', '/resign-bridge/sync', {})
+ok('㊲ POST /resign-bridge/sync 手动触发一轮并回传现场',
+  syncCall.status === 200 && syncCall.body.ok === true && syncCall.body.resignBridge !== undefined,
+  JSON.stringify(syncCall.body.resignBridge || syncCall.body))
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)

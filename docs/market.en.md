@@ -17,7 +17,7 @@ Six tabs, ordered the way you actually triage:
 | **Dashboard** | First-token latency, output speed, token usage, live concurrency and success rate per model; one-click speed tests and re-prioritising by the current sort. |
 | **Failed models** | Today's exhausted models with the latest failure reason; restore one or all. |
 | **Error retry** | dsh-llm-error-retry's own configuration page: rules, first-token timeout, Retry-After cap, max continuations. Saving applies immediately. |
-| **Free channels** | Three plugins that add free models — CodeArts / WorkBuddy / Our Free Model — with a copyable GitHub address and one-click install. |
+| **Free channels** | Five plugins that add free models — CodeArts / WorkBuddy / Trae / Qoder / Our Free Model — with a copyable GitHub address and one-click install. |
 
 ![Routing groups tab](preview-routing-groups.png)
 
@@ -42,7 +42,7 @@ Requires DSH `>=0.2.1-0 <0.3.0` (pre-releases such as rc/alpha included).
 - **A failure no longer interrupts you.** Inner retry policies run first; once they all decline, the plugin records the model as failed for the day, switches to the next routable model in the group, and continues the same turn on its own — no manual resend.
 - **Accounts and models are handled separately.** Our Free Model channels try another account first and only then switch models; a CodeArts pool poisoned by 401/403 is restarted through its own loader entry.
 - **State is visible.** Which model failed today and why, first-token latency, concurrency, success rate — all on the dashboard, no log digging.
-- **Free channels install in one click.** CodeArts, WorkBuddy and Our Free Model install from the tab through the same engine the plugin market uses.
+- **Free channels install in one click.** CodeArts, WorkBuddy, Trae, Qoder and Our Free Model install from the tab through the same engine the plugin market uses.
 
 ## Free channels tab
 
@@ -52,9 +52,13 @@ Each recommendation adds a few models you can run without paying:
 
 - **CodeArts** (`dsh-codearts`): models bundled with a Huawei Cloud CodeArts account, with built-in OAuth2 login (PKCE + DPoP).
 - **WorkBuddy** (`dsh-connect-workbuddy`): the WorkBuddy account already signed in on this machine (domestic / international), with per-model rate multipliers, account switching and daily check-in.
-- **Our Free Model** (`dsh-our-free-model`): a no-login, no-API-key channel including DeepSeek V4.1 Flash and Kimi K3.
+- **Trae** (`dsh-connect-trae`): the Trae desktop account already signed in on this machine; domestic, enterprise and international each register a provider, with daily check-in and credit readouts.
+- **Qoder** (`@dmh2002/dsh-connect-qoder`): a Qoder account's model quota through a single PAT, with a multi-account pool and automatic switching; domestic and international can run side by side.
+- **Our Free Model** (`dsh-our-free-model`): a no-login, no-API-key channel including DeepSeek V4.1 Flash and Kimi K3, which also routes Trae and Qoder accounts since 2.0.
 
 Three separate facts per card: **installed** (read from the profile dependencies), **providers online** (read from the live `llm` registry), and the **GitHub address** (one click to copy). A channel that is installed but not logged in therefore never reads as "not installed".
+
+Trae and Qoder are dedicated connectors whose provider ids overlap with the ones Our Free Model registers for the same accounts: an installed connector owns them, an absent one leaves them to the aggregator, so no id is counted twice and none disappears.
 
 The install button calls the host's `pluginManager.installBundle` — the same path as the plugin market and `dsh plugin add`. When a package needs its install scripts approved the tab reports the pending builds and never approves on your behalf. Installed channels show up in the Models tab and can join a routing group like any other model.
 

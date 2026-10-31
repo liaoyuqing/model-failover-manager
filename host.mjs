@@ -73,6 +73,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { pathToFileURL } from 'node:url'
+// CodeArts 凭据镜像：把 dsh-codearts 轮换中的 AK/SK 持续写进 billion-context 重签用的 ref
+// （见 codearts-resign-bridge.mjs 顶部）。原先是一个独立插件，并入本插件后由这里挂载。
+import { startCodeartsResignBridge, normalizeIntervalSeconds } from './codearts-resign-bridge.mjs'
 // 明文进 bili、密文出上游的 shim（见 qoder-compress-shim.mjs 顶部）。
 // 用带构建号的动态 import：改 shim 后重载插件即可换上新代码（ESM 按 URL 缓存），
 // 而监听端口与 prototype 补丁由 shim 的 globalThis 槽跨重载保持。
@@ -104,7 +107,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v86'
+const HOST_VERSION = 'v88'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -113,6 +116,14 @@ const HOST_VERSION = 'v86'
  */
 const DEFAULT_UNCOMPRESSED_PROVIDERS = ['qoder', 'qodercn']
 /**
+ * CodeArts 凭据镜像的候选 ref 兜底名单。
+ *
+ * bili 遍历 `jet-hub/state.json` 里 provider=codearts 的 credentialRef 去挑凭据；
+ * 账号顺序变动或某条记录被临时停用时这些 ref 就查不到，用这里的名单补齐落点。
+ * 只影响「镜像到哪几把 key」，不影响「镜像谁」—— 账号始终来自 dsh-codearts 的账号库。
+ */
+const DEFAULT_CODEARTS_RESIGN_FALLBACK_REFS = ['CODEARTS_ACCOUNT_FFEFCE9A', 'CODEARTS_ACCOUNT_8B3F0C8E']
+/**
  * billion-context 用它宣告「bili 现在就是唯一的压缩器」。
  *
  * bili-compaction-gate 读同一个全局量来决定是否把宿主的 compaction-basic 关掉；
@@ -120,21 +131,29 @@ const DEFAULT_UNCOMPRESSED_PROVIDERS = ['qoder', 'qodercn']
  */
 const BILI_COMPACTION_VERDICT_KEY = '__BILI_DSH_COMPACTION_VERDICT__'
 /**
- * 免费渠道推荐：装上就能多几条免费模型的三个插件。
+ * 免费渠道推荐：装上就能多几条免费模型的插件。
  *
  * 这里只放不随文案漂移的事实（包名、安装 spec、代表它的 provider 正则）。介绍文案与
  * GitHub 地址在 client.js 的 FREE_CHANNEL_COPY（加渠道要两边一起改）；provider 是否在线
  * 由 llm 注册表现场查询，「装没装」由 pluginManager.listBundles() 现场查询——这两件都不写死。
+ *
+ * 顺序有意义：装好会自己注册 provider 的专用连接器排在前面，聚合渠道 our-free-model 排最后。
  */
 const FREE_CHANNELS = [
   { id: 'codearts', pkg: 'dsh-codearts', spec: 'dsh-codearts', providers: /^codearts/i },
   { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', spec: 'dsh-connect-workbuddy', providers: /^workbuddy/i },
+  // trae / qoder 与 Our Free Model 内置的同名渠道撞号（聚合渠道也接 Trae、Qoder 账号）。
+  // 谁认领由 describeFreeChannels 按「专用连接器装没装」现场决定，这里只声明各自的正则。
+  { id: 'trae', pkg: 'dsh-connect-trae', spec: 'dsh-connect-trae', providers: /^(trae|trae-enterprise|trae-global)$/i },
+  { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', spec: '@dmh2002/dsh-connect-qoder', providers: /^(qoder|qoder-global)$/i },
   {
     id: 'our-free-model',
     pkg: 'dsh-our-free-model',
     spec: 'github:Ebony-Vinyl/dsh-our-free-model',
-    // Our Free Model 按渠道各注册一个 provider（qoder、trae、cline…），没有统一前缀，
-    // 所以逐个点名；新增渠道时这里要一起加，否则界面只显示一部分已接入渠道。
+    // 聚合渠道：按渠道各注册一个 provider（qoder、trae、cline…），没有统一前缀，所以逐个
+    // 点名；新增渠道时这里要一起加，否则界面只显示一部分已接入渠道。被专用连接器认领走的
+    // 同名 id 不再重复列出。
+    aggregator: true,
     providers: /^(qoder|qodercn|trae|cline|lobster|loomy|raccoon|minimax|zcode|gemini|eac|our-free)/i,
   },
 ]
@@ -281,6 +300,27 @@ export function apply(ctx, config = {}) {
     ctx.logger.warn(`[model-failover] config.qoderShimPort=${JSON.stringify(qoderShimPortRaw)} 非法（需 1..65535 整数），回退 47001`)
   }
   const qoderShimWasmPath = typeof config.qoderShimWasmPath === 'string' && config.qoderShimWasmPath.trim() ? config.qoderShimWasmPath.trim() : undefined
+
+  // CodeArts 凭据镜像（见 codearts-resign-bridge.mjs）：dsh-codearts 的 AK/SK 随刷新轮换，
+  // 而 billion-context 改写请求体后必须用「入站 AK 对应的那份」凭据重签，否则 403
+  // signed_request_requires_resign → 账号被连带 disable。默认开启：它只在装了 CodeArts
+  // 且配了 bili 的部署里做写入，其它部署读不到账号库就静默跳过。
+  const resignBridgeRaw = config.codeartsResignBridge
+  const codeartsResignBridgeEnabled = typeof resignBridgeRaw === 'boolean' ? resignBridgeRaw : true
+  if (resignBridgeRaw !== undefined && typeof resignBridgeRaw !== 'boolean') {
+    ctx.logger.warn(`[model-failover] config.codeartsResignBridge=${JSON.stringify(resignBridgeRaw)} 非法（需布尔值），回退 true`)
+  }
+  const resignIntervalRaw = config.codeartsResignBridgeIntervalSeconds
+  const codeartsResignIntervalSeconds = normalizeIntervalSeconds(resignIntervalRaw)
+  if (resignIntervalRaw !== undefined && resignIntervalRaw !== codeartsResignIntervalSeconds) {
+    ctx.logger.warn(`[model-failover] config.codeartsResignBridgeIntervalSeconds=${JSON.stringify(resignIntervalRaw)} 非法（需 >=10 的整数秒），回退 ${codeartsResignIntervalSeconds}`)
+  }
+  const resignFallbackRaw = config.codeartsResignBridgeFallbackRefs
+  const resignFallbackValid = Array.isArray(resignFallbackRaw) && resignFallbackRaw.every(v => typeof v === 'string' && v.trim())
+  const codeartsResignFallbackRefs = resignFallbackValid ? resignFallbackRaw.map(v => v.trim()) : DEFAULT_CODEARTS_RESIGN_FALLBACK_REFS
+  if (resignFallbackRaw !== undefined && !resignFallbackValid) {
+    ctx.logger.warn(`[model-failover] config.codeartsResignBridgeFallbackRefs=${JSON.stringify(resignFallbackRaw)} 非法（需字符串数组），回退默认名单`)
+  }
 
   // 默认并发上限：模型没有单独配置并发时用它；0 = 不限。
   // 默认不限是刻意的——绝大多数 provider 自己会排队，凭据池也有自己的上限；
@@ -451,7 +491,13 @@ export function apply(ctx, config = {}) {
   // metricsSort：数据看板上次使用的排序（{ key, dir } 或 null = 默认序）。
   // 存在 settings.json 里而不是浏览器 localStorage：同一台宿主的多个浏览器
   // 与刷新后的页面都看到同一份排序，换机器也不会各记一套。
-  let settings = Object.assign({ dialogMode: true, metricsSort: null, defaultConcurrency: null }, readJson(settingsFile, {}))
+  //
+  // resignBridgeEnabled / resignBridgeIntervalSeconds：设置页上的「CodeArts 凭据镜像」。
+  // null = 跟随 config 的出厂值（默认开启、10 秒），用户改过就以存下的值为准。
+  let settings = Object.assign({
+    dialogMode: true, metricsSort: null, defaultConcurrency: null,
+    resignBridgeEnabled: null, resignBridgeIntervalSeconds: null,
+  }, readJson(settingsFile, {}))
 
   /**
    * 看板排序列的合法键。与 client.js 的 metricsSortValue 一一对应；
@@ -2083,17 +2129,28 @@ export function apply(ctx, config = {}) {
     try {
       providerIds = (ctx.get('llm')?.listProviders?.() ?? []).map(p => String(p?.id ?? '')).filter(Boolean)
     } catch { /* 只读诊断：注册表读不到就当没有在线渠道 */ }
-    return {
-      managerAvailable,
-      channels: FREE_CHANNELS.map(c => ({
+    // 同一个 provider id 可能被多个渠道认领（专用连接器与聚合渠道都接 trae / qoder）。
+    // 认领规则：撞号的 id 上，专用连接器只在它自己装了时认领，没装就让给聚合渠道；
+    // 不撞号的 id（codearts、workbuddy）照旧显示，装没装不影响它「此刻在不在线」。
+    // 取不到插件管理服务时 installed 一律 null，退回按表顺序静态认领（同前行为）。
+    const aggregators = FREE_CHANNELS.filter(other => other.aggregator === true)
+    const contested = c => aggregators.some(a => providerIds.some(id => c.providers.test(id) && a.providers.test(id)))
+    const claimed = new Set()
+    const channels = FREE_CHANNELS.map(c => {
+      const installedNow = managerAvailable ? installed.has(c.pkg) : null
+      const mayClaim = c.aggregator === true || installedNow === null || installedNow === true || !contested(c)
+      const mine = mayClaim ? providerIds.filter(id => !claimed.has(id) && c.providers.test(id)) : []
+      for (const id of mine) claimed.add(id)
+      return {
         id: c.id,
         pkg: c.pkg,
         spec: c.spec,
-        installed: managerAvailable ? installed.has(c.pkg) : null,
+        installed: installedNow,
         version: installed.get(c.pkg) ?? null,
-        providers: providerIds.filter(id => c.providers.test(id)),
-      })),
-    }
+        providers: mine,
+      }
+    })
+    return { managerAvailable, channels }
   }
 
   /**
@@ -3183,6 +3240,8 @@ export function apply(ctx, config = {}) {
         hostVersion: HOST_VERSION,
         // qoder 压缩 shim：截获 prepareInfer 的明文请求 + 经 bili 转发回来的压缩结果
         qoderShim: { ...describeQoderShim(), registryProbe: shimRegistryProbe, startError: shimStartError },
+        // CodeArts 凭据镜像：谁被镜像到哪几个 ref、上次成功/失败在什么时候
+        resignBridge: describeResignBridge(),
         // codearts 自救是否具备执行条件：loader 可见 + 找得到运行中的条目。
         // 这两项缺一就先在这里暴露出来，而不是等真失败时才发现救不了。
         codeartsSelfHeal: await describeCodeartsSelfHeal(),
@@ -3358,9 +3417,47 @@ export function apply(ctx, config = {}) {
             ctx.logger.info(`[model-failover] 默认并发设为 ${n === 0 ? '不限' : n}`)
           }
         }
+        // CodeArts 凭据镜像：开关与同步间隔。null = 跟随 config 的出厂值。
+        // 改完立刻 reconfigure，不必重启宿主 —— 这是「AK 轮换窗口尽量短」的前提。
+        let resignChanged = false
+        if ('resignBridgeEnabled' in body) {
+          const raw = body.resignBridgeEnabled
+          if (raw === null) settings.resignBridgeEnabled = null
+          else if (typeof raw === 'boolean') settings.resignBridgeEnabled = raw
+          else { sendJson(res, 400, { ok: false, error: 'resignBridgeEnabled 需为布尔值，或 null 表示跟随 config' }); return }
+          resignChanged = true
+        }
+        if ('resignBridgeIntervalSeconds' in body) {
+          const raw = body.resignBridgeIntervalSeconds
+          if (raw === null || raw === '') settings.resignBridgeIntervalSeconds = null
+          else {
+            const n = Number(raw)
+            if (!Number.isInteger(n) || n < 10 || n > 3600) {
+              sendJson(res, 400, { ok: false, error: 'resignBridgeIntervalSeconds 需为 10..3600 的整数秒，或 null / 留空表示跟随 config' })
+              return
+            }
+            settings.resignBridgeIntervalSeconds = n
+          }
+          resignChanged = true
+        }
+        if (resignChanged && resignBridgeHandle !== null) {
+          const eff = resignEffectiveSettings()
+          const st = resignBridgeHandle.reconfigure({ enabled: eff.enabled, intervalSeconds: eff.intervalSeconds })
+          ctx.logger.info(`[model-failover] codearts 凭据镜像：${st.enabled ? '开' : '关'}，每 ${st.intervalSeconds} 秒同步一次`)
+        }
         saveSettings()
         sendJson(res, 200, { ok: true, settings })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
+      return
+    }
+
+    // 手动同步一次 CodeArts 凭据（设置页「立即同步」；排障时也用得上）
+    if (path === `${API_PATH}/resign-bridge/sync` && req.method === 'POST') {
+      if (resignBridgeHandle === null) { sendJson(res, 503, { ok: false, error: 'CodeArts 凭据镜像未挂载' }); return }
+      try {
+        const st = await resignBridgeHandle.syncNow()
+        sendJson(res, 200, { ok: true, resignBridge: st })
+      } catch (e) { sendJson(res, 500, { ok: false, error: String(e) }) }
       return
     }
 
@@ -3763,6 +3860,40 @@ export function apply(ctx, config = {}) {
     })()
   }
 
+  /* ==================== CodeArts 凭据镜像 ==================== */
+  //
+  // 把 dsh-codearts 账号库里的 AK/SK/token 持续写进 bili 重签用的 credentials ref。
+  // 与 qoder shim 不同，这里没有「装不上就只告警」的分支：没有 credentials 服务或没有
+  // 账号库时模块自己跳过并记录原因，/status.resignBridge 会把原因原样回传。
+  /** 设置页改了开关/间隔就按新值重挂，不重启宿主。 */
+  function resignEffectiveSettings() {
+    return {
+      enabled: typeof settings.resignBridgeEnabled === 'boolean' ? settings.resignBridgeEnabled : codeartsResignBridgeEnabled,
+      intervalSeconds: Number.isInteger(settings.resignBridgeIntervalSeconds)
+        ? settings.resignBridgeIntervalSeconds
+        : codeartsResignIntervalSeconds,
+    }
+  }
+  let resignBridgeHandle = null
+  try {
+    resignBridgeHandle = startCodeartsResignBridge({
+      ctx,
+      logger: ctx.logger,
+      settings: resignEffectiveSettings(),
+      fallbackRefs: codeartsResignFallbackRefs,
+    })
+  } catch (e) {
+    ctx.logger.warn(`[model-failover] codearts 凭据镜像挂载失败：${String((e && e.message) || e)}`)
+  }
+  /** /status 用：镜像此刻的开关、间隔、落点与最近一次结果 */
+  function describeResignBridge() {
+    if (resignBridgeHandle !== null) return resignBridgeHandle.status()
+    return {
+      enabled: false, intervalSeconds: codeartsResignIntervalSeconds, fallbackRefs: codeartsResignFallbackRefs,
+      lastSyncAt: null, lastWroteCount: 0, lastError: null, skipReason: '挂载失败（见日志）', mirroredRefs: [], accountCount: 0,
+    }
+  }
+
   // 挂载即体检：配置里本来就有的压缩旁路模型，不必等它失败一次才让人知道。
   //
   // bili 的原生通道可能在本插件之后才 apply（判定量是它 apply 时置位的），所以「此刻
@@ -3786,7 +3917,7 @@ export function apply(ctx, config = {}) {
     })()
   }
 
-  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe)`)
+  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + codearts resign bridge + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe)`)
 
   /* ==================== 清理 ==================== */
   ctx.effect(() => () => {
@@ -3800,6 +3931,7 @@ export function apply(ctx, config = {}) {
     disposeAgentError()
     disposeStop()
     if (qoderShimHandle) qoderShimHandle.stop()
+    if (resignBridgeHandle) resignBridgeHandle.stop()
     if (routeDisposer) routeDisposer()
     // 兜底闹钟随插件一起结束：卸载后既没人投递，也不该再留定时器
     for (const timer of continuationTimers.values()) clearTimeout(timer)

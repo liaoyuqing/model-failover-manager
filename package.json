@@ -1,7 +1,7 @@
 {
   "name": "model-failover-manager",
-  "version": "2.24.3",
-  "description": "DSH 插件：会话模型选择弹窗 + 路由分组 + 免费渠道推荐，模型彻底失败后自动切换到组内下一个可用模型",
+  "version": "2.25.0",
+  "description": "DSH 插件：会话模型选择弹窗 + 路由分组 + 免费渠道推荐 + CodeArts 凭据镜像，模型彻底失败后自动切换到组内下一个可用模型",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -23,6 +23,7 @@
   "files": [
     "host.mjs",
     "qoder-compress-shim.mjs",
+    "codearts-resign-bridge.mjs",
     "client.js",
     "cordis.patch.yml",
     "locale/en.json",

@@ -17,7 +17,7 @@
 | **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 dsh-llm-error-retry 自己的配置页：规则、首字超时、Retry-After 上限、最大续写，保存即生效 |
-| **免费渠道** | CodeArts / WorkBuddy / Our Free Model 三个能直接补免费模型的插件，带 GitHub 地址（一键复制）与一键安装 |
+| **免费渠道** | CodeArts / WorkBuddy / Trae / Qoder / Our Free Model 五个能直接补免费模型的插件，带 GitHub 地址（一键复制）与一键安装 |
 
 ![路由分组页签](preview-routing-groups.png)
 
@@ -42,19 +42,23 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 - **失败不再打断你**：一次失败，内层重试先按规则重试；全都放弃后本插件标记该模型当日失败、切到组内下一个可用模型，并自动续跑当前这一轮 —— 不用手动重发。
 - **账号和模型分开处理**：Our Free Model 的渠道先尝试换账号，账号试完才换模型；CodeArts 池被 401/403 打成「无可用账号」时自动重启它自己的 Loader 条目自救。
 - **状态看得见**：哪个模型今天失败过、为什么失败、首字多慢、并发多少、成功率如何，都在看板里，不用翻日志。
-- **免费渠道一步装上**：CodeArts、WorkBuddy、Our Free Model 三个插件在页签里直接安装，走的是插件市场同一个引擎。
+- **免费渠道一步装上**：CodeArts、WorkBuddy、Trae、Qoder、Our Free Model 五个插件在页签里直接安装，走的是插件市场同一个引擎。
 
 ## 免费渠道页签
 
 ![免费渠道页签](preview-free-channels.png)
 
-三个推荐渠道都能让模型列表多出几条可以白跑的模型：
+五个推荐渠道都能让模型列表多出几条可以白跑的模型：
 
 - **CodeArts**（`dsh-codearts`）：华为云 CodeArts 账号自带的模型额度，内置 OAuth2 登录（PKCE + DPoP）。
 - **WorkBuddy**（`dsh-connect-workbuddy`）：本机已登录的 WorkBuddy 账号（国内版 / 国际版），按上游目录读积分倍率，支持换号与每日签到。
-- **Our Free Model**（`dsh-our-free-model`）：不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等。
+- **Trae**（`dsh-connect-trae`）：本机已登录的 Trae 桌面端账号，国内版 / 企业版 / 国际版各注册一个 provider，附每日签到与积分读数。
+- **Qoder**（`@dmh2002/dsh-connect-qoder`）：Qoder（通义灵码）账号额度，只需一个 PAT（`pt-` 开头），支持多账号池与自动换号，国内版与国际版可同时启用。
+- **Our Free Model**（`dsh-our-free-model`）：不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起也接 Trae、Qoder 等账号渠道。
 
 卡片上三件事分开写清楚：**装没装**（读 profile 依赖）、**在线渠道**（读当前 llm 注册表）、**GitHub 地址**（一键复制）。所以「装了但没登录」不会显示成「没装」。
+
+Trae 与 Qoder 是专用连接器，与 Our Free Model 内置的同名渠道撞号：专用连接器装了，`trae` / `qoder` 这类 provider 就归它；没装则留给聚合渠道。同一时刻只算一次，两张卡片不会重复计数，也不会凭空丢渠道。
 
 安装按钮调的是宿主的 `pluginManager.installBundle` —— 与插件市场、`dsh plugin add` 同一条路径。需要批准构建脚本时只回报待批准项，**不代批**。装好之后它们的模型会出现在「模型」页签里，排进路由分组即可参与失败切换。
 

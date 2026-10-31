@@ -15,7 +15,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 | **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 `dsh-llm-error-retry` 自己的配置页，保存即生效 |
-| **免费渠道** | CodeArts / WorkBuddy / Our Free Model 三个能直接补免费模型的插件，带 GitHub 地址与一键安装 |
+| **免费渠道** | CodeArts / WorkBuddy / Trae / Qoder / Our Free Model 五个能直接补免费模型的插件，带 GitHub 地址与一键安装 |
 
 ## 界面
 
@@ -75,6 +75,16 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 本插件的处置：识别这句固定文案 → 重启承载 `dsh-codearts` 的 Loader 条目（`entry.fiber.restart()`，让它重新 apply、重建账号池；不写配置、不改 cordis.yml、不重启整个宿主）→ 等它的 provider 重新注册回 `llm` 注册表 → 同一步重试（selection 没变，retry 安全）。30 秒冷却防抖；自救失败时不把模型标成「当日失败」，也不切模型，只记一条诊断。
 
+### CodeArts 凭据镜像（原 `dsh-codearts-resign-bridge` 已并入）
+
+`billion-context`（bili）改写请求体之前必须用**当前账号**的 AK/SK 重算签名，而它只按入站请求里的 AK 去 `credentials` 的 ref 里挑匹配的那份。CodeArts 的 AK/SK 随刷新轮换，静态 ref 里的副本很快过期，于是签名对不上 → 403 `signed_request_requires_resign` → 该账号被标 `disabled` → 最终又冒成「429 没有可用账号」。这一层原先是独立插件 `dsh-codearts-resign-bridge` 的活，现在由本插件直接做，**那个插件可以卸掉**（装两个不会跑两份，但也没必要）。
+
+- **候选 ref 从哪来**：`$DSH_HOME/jet-hub/state.json` 里 provider 为 `codearts` 且未禁用的记录，按出现顺序取 `credentialRef`；不足时用 `codeartsResignBridgeFallbackRefs` 补齐。这里只读状态文件，不碰任何凭据内容。
+- **写什么**：每 `codeartsResignBridgeIntervalSeconds`（下限 10 秒）读 `$DSH_HOME/.codearts-accounts.json`（`dsh-codearts` 自己的账号库，唯一持有可刷新凭据的一方），把每个**未过期**账号写成 bili 认识的 `access_key_id` / `secret_access_key` / `security_token` / `expires_at`，各自写进对应的 ref。多账号必须分别镜像：bili 会按 AK 挑匹配的那份，只镜像一个号时另一个号的请求只能拿到错误凭据重签而 401。
+- **没变化就不写**：内容与上一轮相同就跳过写入，所以稳定的账号不会每 10 秒刷一次磁盘，只有 CodeArts 侧轮换那次才落盘。
+- **缺东西时不硬来**：没有 `credentials` 服务（`dsh-credentials` 未装载）或没有可用账号时不动手，只把原因写进现场（`skipReason`），日志压成「首次一次 + 之后每 10 次一次」。
+- **怎么调**：设置页有「CodeArts 凭据镜像」开关、间隔输入框与「立即同步」；`POST /resign-bridge/sync` 也能量外触发一轮。间隔越短，轮换后「用旧 AK 签出来的请求被上游判 401」的窗口越小——10 秒是可设的最小值。
+
 ## 与 dsh-llm-error-retry 的配合
 
 「所有重试耗尽后才换模型」里的重试由 [dsh-llm-error-retry](https://github.com/liaoyuqing/dsh-llm-error-retry) 负责，本插件不重写它的规则引擎：
@@ -87,12 +97,14 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ## 免费渠道推荐
 
-弹窗的「免费渠道」页签列三个「装上一登录就多几条免费模型」的插件，每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
+弹窗的「免费渠道」页签列五个「装上一登录就多几条免费模型」的插件，每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
 
 | 渠道 | 包 | 提供什么 |
 | --- | --- | --- |
 | CodeArts | `dsh-codearts` | 华为云 CodeArts 账号自带的模型额度，内置 OAuth2 登录（PKCE + DPoP） |
 | WorkBuddy | `dsh-connect-workbuddy` | 本机已登录的 WorkBuddy 账号（国内版 / 国际版），按上游目录读每个模型的积分倍率，支持多账号换号与每日签到 |
+| Trae | `dsh-connect-trae` | 本机已登录的 Trae 账号，国内版 / 企业版 / 国际版各注册一个 provider；附每日签到与积分读数，企业版默认关闭 |
+| Qoder | `@dmh2002/dsh-connect-qoder` | Qoder（通义灵码）账号额度，只需一个 PAT（`pt-` 开头），支持多账号池、每日签到与自动换号；国内版 `qoder` 与国际版 `qoder-global` 可同时启用 |
 | Our Free Model | `dsh-our-free-model` | 不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道 |
 
 装完之后它们提供的模型就和别的模型一样出现在「模型」页签里，可以排进路由分组——本插件的失败切换与「与 Our Free Model 的配合」里的换号逻辑对它们同样生效。
@@ -101,7 +113,9 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 - **不代批构建脚本。** 装包需要执行安装/构建脚本时，宿主返回待批准项；页签只把这件事原样显示出来（`pendingBuilds`），批准与否由你在插件管理里决定。
 - **状态是现场的。** 「已安装 / 未安装」读 `pluginManager.listBundles()` 里该 profile 的依赖，**在线渠道**读 `llm` 注册表现场算——装了但没登录时，卡片会显示「已安装」而「在线渠道」为空，这两个本来就该分开看。
-- **推荐表是固定的三条。** 候选写死在宿主半的 `FREE_CHANNELS`（包名、安装 spec、provider 匹配），介绍文案与 GitHub 地址写在 `client.js` 的 `FREE_CHANNEL_COPY`。加一条要两边同时改；宿主不认识的新 id 不会出现在页签里。
+- **推荐表是固定的五条。** 候选写死在宿主半的 `FREE_CHANNELS`（包名、安装 spec、provider 匹配），介绍文案与 GitHub 地址写在 `client.js` 的 `FREE_CHANNEL_COPY`。加一条要两边同时改；宿主不认识的新 id 不会出现在页签里。
+
+Trae 与 Qoder 这两条是**专用连接器**，与 Our Free Model 内置的同名渠道（它也接 Trae、Qoder 账号）撞号。归属按现场状态定：专用连接器**装了**就由它认领这些 provider id，没装则留给聚合渠道——所以只装 Our Free Model 时，`trae` / `qoder` 仍会算在它那一张卡片上，不会凭空消失，也不会两张卡片重复计数。
 
 已知不足：这一页只负责「装上」，登录、扫码、账号池这些各自的引导在它们自己的界面上；`Our Free Model` 的安装 spec 指向 GitHub 主干，拉不下来时按钮会给出错误原文，可以照卡片里的地址手动 `dsh plugin add`。
 
@@ -291,7 +305,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ## 使用
 
 1. 打开 **设置 → 模型故障转移**：切换弹窗模式（新装默认开启），增删改路由分组（模型优先级、生效时段、截止日），或恢复失败的模型。
-   重试规则不在这里改——模型弹窗的「错误重试」页签内嵌了 `dsh-llm-error-retry` 自己的配置页。
+   重试规则不在这里改——模型弹窗的「错误重试」页签内嵌了 `dsh-llm-error-retry` 自己的配置页。CodeArts 凭据镜像的开关、同步间隔与「立即同步」也在这页（见「CodeArts 凭据镜像」）。
 2. 在会话里点模型位：选模型，并（可选）把某个分组**绑定到当前会话**，选择 `route` 或 `failover` 模式。
 3. 之后该会话按绑定策略工作；绑定会落盘，重启后继续生效。
 
@@ -363,8 +377,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`） |
-| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`）。`dialogMode` 出厂为 `true`（新装即弹窗），只有显式传 `false` 才落成下拉；`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
+| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`）、凭据镜像现场（`resignBridge`：开关、间隔、`lastSyncAt`、`mirroredRefs`、`skipReason`） |
+| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`、凭据镜像 `resignBridgeEnabled` 与 `resignBridgeIntervalSeconds`）。`dialogMode` 出厂为 `true`（新装即弹窗），只有显式传 `false` 才落成下拉；`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组。`PUT` 的 `models` 是**整体替换**：看板的「移除」用它把某个模型从所属分组的清单里摘掉，其余模型与优先级保持不变 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
@@ -373,10 +387,11 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | POST | `/failed/reset` | 恢复一个模型的失败状态 |
 | POST | `/groups/model-disabled` | 禁用/启用某个模型参与路由（写 `disabled` 字段，覆盖所有含它的分组） |
 | POST | `/model-concurrency` | 设置/清除某个模型的并发上限（`concurrency` 正整数即设置，`null`/`0`/`""` 清除覆盖回落到 `defaultConcurrency`）；按模型索引，作用于所有分组 |
+| POST | `/resign-bridge/sync` | 立刻同步一轮 CodeArts 凭据镜像：成功回 200 `{ok:true, resignBridge}`；镜像没挂载时回 503 |
 | POST | `/groups/reorder-priority` | 按看板当前排序重设某个分组的优先级：`{groupId, start, order: [{provider, model}]}`，按 `order` 的顺序从 `start` 起连续写回（`start` 缺省 1，需 1..999）。不在该分组里的名字被忽略，重复条目只认第一次 |
 | GET | `/speedtest` | 测速的进度快照：`{running, startedAt, finishedAt, total, done, targets, results}`；`targets` 是本次覆盖的模型清单（界面用它标出「哪几行正在测」），`results` 每项含 `provider/model/ok/ttftMs/tps/inTokens/outTokens/errorCode` |
 | POST | `/speedtest` | 启动一次测速：`{models: [{provider, model}]}`（整组或**单个模型**都走这里）或 `{groupId}`（整组，跳过已禁用的模型；显式点名的清单不排除禁用模型，方便排查一个被禁用的模型到底通不通），可选 `timeoutMs`（5s..120s，默认 45s）与 `parallel`（1..6，默认 2）。立即返回任务快照，任务在后台跑；已有任务在跑时返回 409 |
-| GET | `/free-channels` | 免费渠道推荐现场：`{managerAvailable, channels:[{id, pkg, spec, installed, version, providers}]}`。`installed` 读 `pluginManager.listBundles()`（`null` = 取不到插件管理服务，界面显示「状态未检测」），`providers` 是此刻 `llm` 注册表里匹配该渠道的 provider id |
+| GET | `/free-channels` | 免费渠道推荐现场：`{managerAvailable, channels:[{id, pkg, spec, installed, version, providers}]}`。`installed` 读 `pluginManager.listBundles()`（`null` = 取不到插件管理服务，界面显示「状态未检测」），`providers` 是此刻 `llm` 注册表里匹配该渠道的 provider id；被前面已安装的渠道认领走的 id 不重复列出（Trae / Qoder 与 Our Free Model 撞号时按安装状态归属） |
 | POST | `/free-channels/install` | 一键安装某个推荐渠道：`{id}`，转调 `pluginManager.installBundle(spec)`。成功回 200 `{ok:true, message}`；需要批准构建脚本、未知 id、没有插件管理服务都回 409 `{ok:false, message, pendingBuilds?}`——待批准项原样抛回，不代批 |
 | GET | `/session-info?sessionId=` | 单个会话解析后的有效分组、是否继承、当前模型覆盖 |
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
@@ -407,10 +422,12 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `session-bindings.json` | 会话 → 分组 + 模式的绑定 |
 | `default-binding.json` | 新会话沿用的默认绑定 |
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
-| `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
+| `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值、凭据镜像开关与间隔覆盖值（`resignBridgeEnabled` / `resignBridgeIntervalSeconds`，`null` = 跟随 config）。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
 | `model-concurrency.json` | 按模型记录的并发上限（`provider/model` → 上限），对所有分组生效 |
 
 重试规则不在这里：它属于 `dsh-llm-error-retry`，存在 `$DSH_HOME/llm-error-retry/`（`rules.json` 保存界面改过的规则，`status.json` 是等待与最近事件）。两个插件的目录互不读写。
+
+凭据镜像也不在这里：它读 `$DSH_HOME/.codearts-accounts.json` 与 `$DSH_HOME/jet-hub/state.json`，写入目标在 `credentials` 服务（文件是 `$DSH_HOME/.credentials.yaml`），自己不落盘。
 
 ## 配置
 
@@ -427,6 +444,9 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `concurrencyQueueTimeoutMs` | `180000` | 整组模型都满、路由无处可换时，等目标模型槽位释放的上限；超时记为 `all-capacity`、本轮不再切换。`0` = 无限等 |
 | `capacityCooldownMs` | `30000` | 并发类失败后的临时冷却时长：期间该模型不参与路由挑选，到期自动恢复 |
 | `capacitySwitchRevertMs` | `30000` | 因并发临时切走后，至少待这么久才允许切回原模型（防止两个模型来回抖） |
+| `codeartsResignBridge` | `true` | CodeArts 凭据镜像总开关（原 `dsh-codearts-resign-bridge` 的功能）。关掉后不再向 `credentials` 的 ref 写账号凭据，bili 的重签会重新退化成「匹配不到 → 403」 |
+| `codeartsResignBridgeIntervalSeconds` | `10` | 镜像同步间隔（秒，下限 10、上限 3600）。界面里改过的值存 `settings.json`，优先于这里 |
+| `codeartsResignBridgeFallbackRefs` | `["CODEARTS_ACCOUNT_FFEFCE9A", "CODEARTS_ACCOUNT_8B3F0C8E"]` | `jet-hub/state.json` 里的候选 ref 不够分给每个账号时，按顺序用这些 ref 补齐 |
 
 所有时间口径固定按**北京时间**计算，与宿主机时区、`TZ`、`LANG` 无关。路由时段（`windows` 的 `from`/`to`）的小时也按北京时间解释；截止日 `until` 按自然日比较。
 
@@ -436,7 +456,8 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
+| `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、CodeArts 凭据镜像的接线、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
+| `codearts-resign-bridge.mjs` | CodeArts 凭据镜像（原独立插件 `dsh-codearts-resign-bridge` 的功能，已并进来）：读账号库与候选 ref，把每个可用账号写成 bili 认识的字段 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
 | `client.js` | 浏览器半（DSH dynamic client bundle），六个页签、免费渠道卡片与 GitHub 复制都在这里 |
 | `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
@@ -452,7 +473,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 - 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
-- 「免费渠道」页签只负责安装，不负责登录与账号配置：三个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定三条，也只在这三个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
+- 「免费渠道」页签只负责安装，不负责登录与账号配置：五个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定五条，也只在这五个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
 - 对 `dsh-llm-error-retry` 的依赖固定到具体 commit（`5543c34`，0.20.0），不是版本范围：「错误重试」页签内嵌的是它的页面与 `/llm-error-retry/api/config`，字段或路径一变页签就空，所以升级它要连这个页签一起验。
 - `pack.js` 有两份副本（`$DSH_HOME/plugins/` 下的开发副本与 `$DSH_HOME/profiles/<name>/node_modules/` 下宿主真正 import 的那份），尺寸与 mtime 会不同。插件对每一份都做检查，`hookRepair.copies` 逐份列出；只补 `plugins` 那份是不够的。
 
@@ -462,7 +483,8 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 
 - Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector: a split-pane dialog by default (providers on the left, models on the right, six tabs above them: models, routing groups, dashboard, failed models, error retry, free channels), or a compact dropdown once the dialog toggle is turned off. A fresh install runs in dialog mode.
 - The *error retry* tab embeds `dsh-llm-error-retry`'s own configuration page in an iframe (same origin, `/llm-error-retry`) instead of re-implementing the editor: one rule table, one place to save it. The tab probes the plugin, and when it is not mounted it says so and offers a re-probe.
-- The *free channel* tab recommends three plugins that add free models — CodeArts (`dsh-codearts`), WorkBuddy (`dsh-connect-workbuddy`), and Our Free Model (`dsh-our-free-model`) — each with a one-line pitch, its facts, a copyable GitHub address, and an install button. Installing goes through `pluginManager.installBundle`, the same engine as the plugin market and `dsh plugin add`; a package that needs its install scripts approved comes back as a pending-build report rather than being approved for you. "Installed" is read from the profile dependencies and "providers online" from the live `llm` registry, so a channel that is installed but not logged in shows both facts separately.
+- It also mirrors CodeArts credentials (the job the standalone `dsh-codearts-resign-bridge` plugin used to do, so that plugin can be uninstalled): every `codeartsResignBridgeIntervalSeconds` (minimum 10 s) it reads `dsh-codearts`'s account store, maps each unexpired account onto the refs `billion-context` scans for re-signing, and writes `access_key_id` / `secret_access_key` / `security_token` / `expires_at` only when the value actually changed. bili matches credentials by the inbound AK, so each account needs its own ref; a static ref outlives the rotated key and the request is rejected with `403 signed_request_requires_resign`. Toggle, interval and a manual sync live in Settings.
+- The *free channel* tab recommends five plugins that add free models — CodeArts (`dsh-codearts`), WorkBuddy (`dsh-connect-workbuddy`), Trae (`dsh-connect-trae`), Qoder (`@dmh2002/dsh-connect-qoder`), and Our Free Model (`dsh-our-free-model`) — each with a one-line pitch, its facts, a copyable GitHub address, and an install button. Installing goes through `pluginManager.installBundle`, the same engine as the plugin market and `dsh plugin add`; a package that needs its install scripts approved comes back as a pending-build report rather than being approved for you. "Installed" is read from the profile dependencies and "providers online" from the live `llm` registry, so a channel that is installed but not logged in shows both facts separately. Trae and Qoder are dedicated connectors whose provider ids (`trae`, `trae-enterprise`, `trae-global`, `qoder`, `qoder-global`) overlap with the ones Our Free Model registers for the same accounts; a dedicated connector owns those ids once it is installed, and the aggregator card gets only what nobody claimed, so no id is counted twice.
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.

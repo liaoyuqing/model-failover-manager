@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v22'
+    var VERSION = 'v24'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -1134,6 +1134,24 @@ window.__ModuleLoader__.load({
             '多账号切换与账号池自动换号，附带每日签到与积分读数',
           ],
         },
+        trae: {
+          repo: 'https://github.com/dingminhua/dsh-connect-trae',
+          title: 'Trae',
+          tagline: '本机已登录的 Trae 账号（国内版 / 企业版 / 国际版）',
+          facts: [
+            '不用填 token：装好重启就读本机 Trae 桌面客户端的登录态，国内版、企业版、国际版各注册一个 provider',
+            '附每日签到领取与积分读数；企业版默认关闭，可单独打开，多账号可切换',
+          ],
+        },
+        qoder: {
+          repo: 'https://github.com/dingminhua/dsh-connect-qoder',
+          title: 'Qoder',
+          tagline: 'Qoder（通义灵码）账号自带的模型额度',
+          facts: [
+            '只需一个 PAT（pt- 开头）：无桌面端登录也能用，支持多账号池、每日签到与自动换号',
+            '国内版 qoder 与国际版 qoder-global 可同时启用，签名与双层 SSE 由插件自己处理',
+          ],
+        },
         'our-free-model': {
           repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model',
           title: 'Our Free Model',
@@ -1157,7 +1175,7 @@ window.__ModuleLoader__.load({
           })
         }
         return e('div', { style: S.channelPane },
-          e('div', { style: S.hint }, '下面三个插件都能直接补几条免费模型进模型列表。装完刷新本页确认，再回「模型」页签把它们排进路由分组。'),
+          e('div', { style: S.hint }, '下面几个插件都能直接补几条免费模型进模型列表。装完刷新本页确认，再回「模型」页签把它们排进路由分组。'),
           stale && e('div', { style: S.hint }, '当前宿主还没有推荐表接口（改完宿主需要重启 DSH 才生效），所以这里只列介绍、不显示安装状态。'),
           list.map(function (ch) {
             var copy = FREE_CHANNEL_COPY[ch.id] || { title: ch.pkg, tagline: '', facts: [] }
@@ -2790,6 +2808,38 @@ window.__ModuleLoader__.load({
         apiSend(API + '/settings', 'POST', { dialogMode: !dialogMode }).then(refresh)
       }
 
+      // CodeArts 凭据镜像（原独立插件 dsh-codearts-resign-bridge，已并入本插件）：
+      // 开关与间隔写 settings.json，落点/最近结果来自 /status.resignBridge。
+      var resign = (status && status.resignBridge) || {}
+      var resignEnabled = resign.enabled === true
+      function toggleResign() {
+        apiSend(API + '/settings', 'POST', { resignBridgeEnabled: !resignEnabled }).then(refresh)
+      }
+      function syncResignNow() {
+        apiSend(API + '/resign-bridge/sync', 'POST', {}).then(refresh)
+      }
+      function setResignInterval(seconds) {
+        var n = String(seconds == null ? '' : seconds).trim()
+        apiSend(API + '/settings', 'POST', { resignBridgeIntervalSeconds: n === '' ? null : Number(n) }).then(refresh)
+      }
+      /** 相对时间：镜像每 10 秒一轮，报「多久以前」比报时间戳更直观。 */
+      function resignAgoText(at) {
+        if (!at) return '还没同步过'
+        var sec = Math.max(0, Math.round((Date.now() - at) / 1000))
+        if (sec < 60) return sec + ' 秒前'
+        if (sec < 3600) return Math.round(sec / 60) + ' 分钟前'
+        return Math.round(sec / 3600) + ' 小时前'
+      }
+      /** 镜像现场一句话：落点 + 最近写入；没跑起来时说清原因。 */
+      function resignStatusText() {
+        if (resign.lastError) return resign.lastError
+        if (resign.skipReason) return resign.skipReason
+        var refs = resign.mirroredRefs || []
+        return '已镜像 ' + (resign.accountCount || refs.length) + ' 个账号到 ' + (refs.length ? refs.join('、') : '（无）')
+          + ' · ' + resignAgoText(resign.lastSyncAt)
+          + (resign.lastWroteCount ? ' · 本轮写入 ' + resign.lastWroteCount + ' 个' : ' · 内容无变化未重写')
+      }
+
       return e('div', { style: S.settingsRoot },
         e('div', { style: S.settingsTitle }, '模型故障转移'),
         e('div', { style: S.settingsSub }, '按优先级路由模型：会话绑定分组后，每次请求使用组内优先级最高（数字最小）的可用模型；模型在所有重试后彻底失败会被标记为当日（按北京时间）失败并自动跳到下一个。会话成功跑完一轮会自动恢复该模型。'),
@@ -2803,6 +2853,37 @@ window.__ModuleLoader__.load({
           e('div', null,
             e('div', { style: { fontSize: '13px', fontWeight: 600 } }, '模型选择使用弹窗'),
             e('div', { style: { fontSize: '11px', opacity: .6 } }, '开启后会话输入框的模型选择改为左右分区弹窗（左：提供商，右：模型）；关闭时使用紧凑下拉列表。新装默认开启。'))),
+
+        e('div', { style: S.toggleRow },
+          e('button', {
+            style: Object.assign({}, S.toggle, resignEnabled ? S.toggleOn : {}),
+            'aria-pressed': resignEnabled, 'aria-label': 'CodeArts 凭据镜像',
+            onClick: toggleResign,
+          }, e('span', { style: Object.assign({}, S.toggleKnob, resignEnabled ? S.toggleKnobOn : {}) })),
+          e('div', { style: { flex: 1, minWidth: 0 } },
+            e('div', { style: { fontSize: '13px', fontWeight: 600 } }, 'CodeArts 凭据镜像'),
+            e('div', { style: { fontSize: '11px', opacity: .6 } },
+              'billion-context 改写请求体后要用当前账号的 AK/SK 重签，而 CodeArts 的密钥每次刷新都会轮换。'
+              + '开启后本插件定时把 dsh-codearts 账号库里的每组密钥写进它重签用的凭据 ref，'
+              + '这条线路才能既走 CodeArts 又保留上下文压缩；镜像迟到的那几秒里，上游会判签名过期并把账号标成禁用。'),
+            e('div', {
+              style: { fontSize: '11px', marginTop: '2px', color: resign.lastError || (!resignEnabled || resign.skipReason) ? 'var(--dsw-alias-label-caption)' : 'var(--dsw-alias-label-tertiary)' },
+            }, resignStatusText()),
+            e('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', flexWrap: 'wrap' } },
+              e('span', { style: { fontSize: '11px', opacity: .6 } }, '每'),
+              e('input', {
+                style: Object.assign({}, S.prio, { width: '44px' }),
+                type: 'number', min: 10, max: 3600, value: String(resign.intervalSeconds || 10),
+                'aria-label': 'CodeArts 凭据同步间隔（秒）',
+                title: '同步间隔（秒）。CodeArts 密钥轮换后到镜像完成之间的窗口越短越好，下限 10 秒。',
+                onChange: function (ev) {
+                  var v = Number(ev.currentTarget.value)
+                  if (!Number.isInteger(v) || v < 10 || v > 3600) return
+                  setResignInterval(v)
+                },
+              }),
+              e('span', { style: { fontSize: '11px', opacity: .6 } }, '秒同步一次'),
+              e('button', { style: S.btn, onClick: syncResignNow }, '立即同步')))),
 
         e('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' } },
           e('span', { style: { fontSize: '13px', fontWeight: 600 } }, '路由分组'),
