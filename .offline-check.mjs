@@ -1919,6 +1919,67 @@ ok('㉞ 弹窗有「免费渠道」页签，只在停在该页签时读一次，
   && clientText.includes("apiSend(API + '/free-channels/install', 'POST'")
   && clientText.includes("'免费渠道'"))
 
+// ── ㉟ 路由分组页签：调优先级与移出分组 ────────────────────────────────────
+// 这两件事在页签里就地做（不用开「编辑」弹窗），落到宿主已有的两个入口：
+// 上/下移 = 交换两个条目的 priority 后整表送回 PUT /groups；移出 = 同一入口去掉一条。
+// 下面既守界面接线，也守宿主这两个入口真的「只动被动的条目」。
+ok('㉟ 分组页签每个模型带 ↑ ↓ ✕，分别调顺序与移出本分组',
+  clientText.includes("moveGroupModel(g, idx, -1)")
+  && clientText.includes("moveGroupModel(g, idx, 1)")
+  && clientText.includes("removeGroupModel(g, m.provider, m.model)")
+  && clientText.includes("}, '↑')") && clientText.includes("}, '↓')") && clientText.includes("}, '✕')"))
+
+ok('㉟ 首/末位没有可去方向时按钮压暗并禁用，而不是点了没反应',
+  clientText.includes('disabled: idx === 0')
+  && clientText.includes('disabled: idx === sorted.length - 1')
+  && clientText.includes('idx === 0 ? { opacity: .25, cursor: \'default\' }'))
+
+ok('㉟ 调顺序只交换相邻两条的 priority（不整体重排，没动过的优先级保持原样）',
+  clientText.includes('var a = Object.assign({}, sorted[index])')
+  && clientText.includes('var b = Object.assign({}, sorted[j])')
+  && clientText.includes('if (pa !== pb) { a.priority = pb; b.priority = pa }')
+  && clientText.includes("apiSend(API + '/groups', 'PUT', { id: g.id, models: sorted })"))
+
+// 宿主侧：整表替换要保持每条自己的时段/截止日/禁用，移走一条不动其余
+const gCreated = (await api('POST', '/groups', {
+  name: 'zz-move-check',
+  models: [
+    { provider: 'a', model: 'm1', priority: 5, windows: [{ from: 1, to: 2 }], until: '2027-01-01' },
+    { provider: 'a', model: 'm2', priority: 9 },
+  ],
+})).body
+const gId = gCreated.group.id
+const gNow = (await api('GET', '/status')).body.groups.find(g => g.id === gId)
+ok('㉟ 新建分组的条目按给定 priority（5 / 9）落库',
+  JSON.stringify(gNow.models.map(m => m.priority)) === '[5,9]', JSON.stringify(gNow.models))
+
+// 与 client.js 相同的做法：把 m2 上移一位
+const ordered = gNow.models.slice().sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
+const up = { ...ordered[1] }
+const down = { ...ordered[0] }
+const pa = up.priority ?? 99
+const pb = down.priority ?? 99
+if (pa !== pb) { up.priority = pb; down.priority = pa }
+ordered[0] = up
+ordered[1] = down
+const moved = await api('PUT', '/groups', { id: gId, models: ordered })
+const m1 = moved.body.group.models.find(m => m.model === 'm1')
+const m2 = moved.body.group.models.find(m => m.model === 'm2')
+ok('㉟ 上移一位：两条交换 priority，而 m1 的时段与截止日原样带过去',
+  m2.priority === 5 && m1.priority === 9
+  && JSON.stringify(m1.windows) === '[{"from":1,"to":2}]' && m1.until === '2027-01-01',
+  JSON.stringify(moved.body.group.models))
+
+const removed = await api('PUT', '/groups', { id: gId, models: moved.body.group.models.filter(m => m.model !== 'm1') })
+ok('㉟ 移出分组：只少那一条，剩下那条的 order 与内容不动',
+  removed.body.group.models.length === 1
+  && removed.body.group.models[0].model === 'm2'
+  && removed.body.group.models[0].priority === 5,
+  JSON.stringify(removed.body.group.models))
+await api('DELETE', '/groups/' + encodeURIComponent(gId))
+ok('㉟ 自检用的临时分组已清掉',
+  (await api('GET', '/status')).body.groups.every(g => g.id !== gId))
+
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

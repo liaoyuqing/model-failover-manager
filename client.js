@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v20'
+    var VERSION = 'v21'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -192,6 +192,10 @@ window.__ModuleLoader__.load({
         borderRadius: '3px',
       },
       chipBtnOn: { color: 'var(--dsw-alias-state-warn-primary, var(--dsw-alias-label-primary))', fontWeight: 600 },
+      /** 上移/下移：只改顺序，比「禁用」轻；箭头本身说明方向，按钮做小一号 */
+      chipBtnMove: { fontSize: '11px', lineHeight: '12px', padding: '0 3px' },
+      /** 移出分组：条目直接删掉，要加回来得回「模型」页签，用错误色提醒 */
+      chipBtnDanger: { color: 'var(--dsw-alias-state-error-primary, var(--dsw-alias-label-tertiary))' },
       modalBg: {
         position: 'fixed', inset: 0, zIndex: 1300, display: 'flex',
         alignItems: 'center', justifyContent: 'center',
@@ -642,6 +646,8 @@ window.__ModuleLoader__.load({
       var speedScopePair = React.useState([]); var speedScope = speedScopePair[0]; var setSpeedScope = speedScopePair[1]
       /** 重设优先级 / 启动测速的操作回执：{ ok, text }，只保留最近一条 */
       var orderNoticePair = React.useState(null); var orderNotice = orderNoticePair[0]; var setOrderNotice = orderNoticePair[1]
+      /** 路由分组页签的移动/移除回执：{ ok, text }。与看板的 orderNotice 分开，两边不会互相顶掉 */
+      var groupNoticePair = React.useState(null); var groupNotice = groupNoticePair[0]; var setGroupNotice = groupNoticePair[1]
       /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
       var rangePair = React.useState({ since: '', until: '' })
       var range = rangePair[0]; var setRange = rangePair[1]
@@ -1182,10 +1188,73 @@ window.__ModuleLoader__.load({
           e('div', { style: S.hint }, '安装走插件管理服务，与插件市场同一个引擎；需要执行构建脚本时宿主只会提示「需要批准」，不会替你批准。GitHub 源装不上时，可以手动 dsh plugin add 对应 spec。'))
       }
 
+      /**
+       * 组内上移/下移一位：交换相邻两个模型的位置，并交换它们的 priority。
+       *
+       * 为什么交换而不是整体重排：分组里的优先级是用户手设的稀疏值（P9、P12…），
+       * 整体重排会把没动过的模型的数字一起改掉。交换只动这两个条目。
+       * 两者优先级相同时（比如都还是默认 99）没有数字可换，改由数组顺序决定先后——
+       * 宿主按 priority 升序、同优先级按登记顺序排，所以调换数组位置同样生效。
+       *
+       * 两个对象先浅拷贝再改：g.models 是刷新状态里的对象，直接改写会在下一次
+       * 拉取到来前把界面弄成「本地已经改了、服务器还没收到」的半状态。
+       */
+      function moveGroupModel(g, index, delta) {
+        var sorted = (g.models || []).slice().sort(function (a, b) { return (a.priority ?? 99) - (b.priority ?? 99) })
+        var j = index + delta
+        if (index < 0 || index >= sorted.length || j < 0 || j >= sorted.length) return
+        var a = Object.assign({}, sorted[index])
+        var b = Object.assign({}, sorted[j])
+        var pa = a.priority ?? 99
+        var pb = b.priority ?? 99
+        if (pa !== pb) { a.priority = pb; b.priority = pa }
+        sorted[index] = b
+        sorted[j] = a
+        setGroupNotice({ ok: true, text: '正在调整「' + g.name + '」的顺序…' })
+        apiSend(API + '/groups', 'PUT', { id: g.id, models: sorted })
+          .then(function (res) {
+            if (res && res.ok) {
+              setGroupNotice({ ok: true, text: '已把 ' + b.provider + '/' + b.model + ' 调到 P' + (b.priority ?? 99) })
+            } else {
+              setGroupNotice({ ok: false, text: (res && res.error) || '调整失败' })
+            }
+          })
+          .then(refreshStatus)
+          .catch(function (e) { setGroupNotice({ ok: false, text: '调整失败：' + String(e && e.message ? e.message : e) }) })
+      }
+
+      /**
+       * 把一个模型移出本分组：只删这一条，组里其它条目的顺序、时段、截止日都不动。
+       * 与「禁用」的区别：禁用留着条目、只是不参与路由；移除后要加回来得去「模型」页签。
+       * 同一模型在别的分组里还有条目时只会少掉这一处。
+       */
+      function removeGroupModel(g, provider, model) {
+        var models = g.models || []
+        var rest = models.filter(function (m) { return !(m.provider === provider && m.model === model) })
+        if (rest.length === models.length) return
+        setGroupNotice({ ok: true, text: '正在把 ' + provider + '/' + model + ' 移出「' + g.name + '」…' })
+        apiSend(API + '/groups', 'PUT', { id: g.id, models: rest })
+          .then(function (res) {
+            if (res && res.ok) {
+              setGroupNotice({ ok: true, text: '已把 ' + provider + '/' + model + ' 移出「' + g.name + '」' })
+            } else {
+              setGroupNotice({ ok: false, text: (res && res.error) || '移除失败' })
+            }
+          })
+          .then(refreshStatus)
+          .catch(function (e) { setGroupNotice({ ok: false, text: '移除失败：' + String(e && e.message ? e.message : e) }) })
+      }
+
       function groupTab() {
         var avail = poolOf(catalog, status)
         return e('div', { style: S.pane },
-          e('div', { style: S.hint }, '会话绑定分组后，本会话的每次请求都按组内优先级（数字越小越优先）选模型；彻底失败会自动跳到下一个可用模型。'),
+          e('div', { style: S.hint }, '会话绑定分组后，本会话的每次请求都按组内优先级（数字越小越优先）选模型；彻底失败会自动跳到下一个可用模型。↑ ↓ 调优先级，✕ 把模型移出本分组。'),
+          groupNotice && e('div', {
+            style: {
+              fontSize: '11px', padding: '4px 6px', marginBottom: '6px',
+              color: groupNotice.ok ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-state-error-primary)',
+            },
+          }, groupNotice.text),
           e('button', { style: Object.assign({}, S.btnPrimary, { marginBottom: '8px' }), onClick: function () { setEditing({ action: 'new', name: '', models: [] }) } }, '＋ 新建分组'),
           routeGroups.length === 0 && e('div', { style: S.hint }, '还没有分组。'),
           routeGroups.map(function (g) {
@@ -1201,7 +1270,7 @@ window.__ModuleLoader__.load({
                     ? e('button', { style: S.btn, onClick: function () { bindGroup(null) } }, '解除绑定')
                     : e('button', { style: S.btnPrimary, onClick: function () { bindGroup(g.id) } }, '绑定到本会话'),
                   e('button', { style: S.btn, onClick: function () { setEditing({ action: 'edit', id: g.id, name: g.name, models: (g.models || []).slice() }) } }, '编辑'))),
-              e('div', null, sorted.map(function (m) {
+              e('div', null, sorted.map(function (m, idx) {
                 var k = keyOf(m.provider, m.model)
                 var f = failedMap[k] === true
                 var off = m.disabled === true
@@ -1233,6 +1302,20 @@ window.__ModuleLoader__.load({
                     },
                   }, '并发 ' + cdLeft + 's'),
                   f && e('span', { style: { fontSize: '10px', opacity: .8 } }, '✕'),
+                  // 上移/下移：一步一位。首/末位没有可去的方向，按钮压暗并禁用，
+                  // 而不是点了没反应——那样看起来像坏了
+                  e('button', {
+                    style: Object.assign({}, S.chipBtnMove, idx === 0 ? { opacity: .25, cursor: 'default' } : {}),
+                    disabled: idx === 0,
+                    title: '上移一位（数字更小、更优先）',
+                    onClick: function (ev) { ev.stopPropagation(); moveGroupModel(g, idx, -1) },
+                  }, '↑'),
+                  e('button', {
+                    style: Object.assign({}, S.chipBtnMove, idx === sorted.length - 1 ? { opacity: .25, cursor: 'default' } : {}),
+                    disabled: idx === sorted.length - 1,
+                    title: '下移一位（数字更大、更靠后）',
+                    onClick: function (ev) { ev.stopPropagation(); moveGroupModel(g, idx, 1) },
+                  }, '↓'),
                   // 失败：已失败则提供恢复，否则提供手动标记
                   f
                     ? e('button', {
@@ -1263,7 +1346,13 @@ window.__ModuleLoader__.load({
                         provider: m.provider, model: m.model, disabled: !off,
                       }).then(refreshStatus)
                     },
-                  }, off ? '启用' : '禁用'))
+                  }, off ? '启用' : '禁用'),
+                  // 移出分组：与「禁用」区分开——那个留条目，这个删条目
+                  e('button', {
+                    style: Object.assign({}, S.chipBtn, S.chipBtnDanger),
+                    title: '移出本分组：删掉这条（其它分组与禁用状态不受影响），要加回来去「模型」页签',
+                    onClick: function (ev) { ev.stopPropagation(); removeGroupModel(g, m.provider, m.model) },
+                  }, '✕'))
               })))
           }))
       }
