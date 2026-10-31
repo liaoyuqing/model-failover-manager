@@ -107,7 +107,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v88'
+const HOST_VERSION = 'v89'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -137,15 +137,10 @@ const BILI_COMPACTION_VERDICT_KEY = '__BILI_DSH_COMPACTION_VERDICT__'
  * GitHub 地址在 client.js 的 FREE_CHANNEL_COPY（加渠道要两边一起改）；provider 是否在线
  * 由 llm 注册表现场查询，「装没装」由 pluginManager.listBundles() 现场查询——这两件都不写死。
  *
- * 顺序有意义：装好会自己注册 provider 的专用连接器排在前面，聚合渠道 our-free-model 排最后。
+ * 数组顺序就是页签里的卡片顺序（聚合渠道 Our Free Model 排第一）。认领顺序不由它决定：
+ * describeFreeChannels 里聚合渠道永远最后认领，只拿专用连接器没装时剩下的 id。
  */
 const FREE_CHANNELS = [
-  { id: 'codearts', pkg: 'dsh-codearts', spec: 'dsh-codearts', providers: /^codearts/i },
-  { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', spec: 'dsh-connect-workbuddy', providers: /^workbuddy/i },
-  // trae / qoder 与 Our Free Model 内置的同名渠道撞号（聚合渠道也接 Trae、Qoder 账号）。
-  // 谁认领由 describeFreeChannels 按「专用连接器装没装」现场决定，这里只声明各自的正则。
-  { id: 'trae', pkg: 'dsh-connect-trae', spec: 'dsh-connect-trae', providers: /^(trae|trae-enterprise|trae-global)$/i },
-  { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', spec: '@dmh2002/dsh-connect-qoder', providers: /^(qoder|qoder-global)$/i },
   {
     id: 'our-free-model',
     pkg: 'dsh-our-free-model',
@@ -156,6 +151,12 @@ const FREE_CHANNELS = [
     aggregator: true,
     providers: /^(qoder|qodercn|trae|cline|lobster|loomy|raccoon|minimax|zcode|gemini|eac|our-free)/i,
   },
+  { id: 'codearts', pkg: 'dsh-codearts', spec: 'dsh-codearts', providers: /^codearts/i },
+  { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', spec: 'dsh-connect-workbuddy', providers: /^workbuddy/i },
+  // trae / qoder 与 Our Free Model 内置的同名渠道撞号（聚合渠道也接 Trae、Qoder 账号）。
+  // 谁认领由 describeFreeChannels 按「专用连接器装没装」现场决定，这里只声明各自的正则。
+  { id: 'trae', pkg: 'dsh-connect-trae', spec: 'dsh-connect-trae', providers: /^(trae|trae-enterprise|trae-global)$/i },
+  { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', spec: '@dmh2002/dsh-connect-qoder', providers: /^(qoder|qoder-global)$/i },
 ]
 
 function failKey(provider, model) { return `${provider}/${model}` }
@@ -2132,24 +2133,32 @@ export function apply(ctx, config = {}) {
     // 同一个 provider id 可能被多个渠道认领（专用连接器与聚合渠道都接 trae / qoder）。
     // 认领规则：撞号的 id 上，专用连接器只在它自己装了时认领，没装就让给聚合渠道；
     // 不撞号的 id（codearts、workbuddy）照旧显示，装没装不影响它「此刻在不在线」。
-    // 取不到插件管理服务时 installed 一律 null，退回按表顺序静态认领（同前行为）。
+    // 取不到插件管理服务时 installed 一律 null，退回按静态顺序认领（同前行为）。
+    // 认领顺序与展示顺序分开：聚合渠道无论排第几都最后认领，否则它会把专用连接器的 id 全吃掉。
     const aggregators = FREE_CHANNELS.filter(other => other.aggregator === true)
     const contested = c => aggregators.some(a => providerIds.some(id => c.providers.test(id) && a.providers.test(id)))
+    const claimOrder = [
+      ...FREE_CHANNELS.filter(c => c.aggregator !== true),
+      ...FREE_CHANNELS.filter(c => c.aggregator === true),
+    ]
     const claimed = new Set()
-    const channels = FREE_CHANNELS.map(c => {
+    /** @type {Map<string, string[]>} */
+    const owned = new Map()
+    for (const c of claimOrder) {
       const installedNow = managerAvailable ? installed.has(c.pkg) : null
       const mayClaim = c.aggregator === true || installedNow === null || installedNow === true || !contested(c)
       const mine = mayClaim ? providerIds.filter(id => !claimed.has(id) && c.providers.test(id)) : []
       for (const id of mine) claimed.add(id)
-      return {
-        id: c.id,
-        pkg: c.pkg,
-        spec: c.spec,
-        installed: installedNow,
-        version: installed.get(c.pkg) ?? null,
-        providers: mine,
-      }
-    })
+      owned.set(c.id, mine)
+    }
+    const channels = FREE_CHANNELS.map(c => ({
+      id: c.id,
+      pkg: c.pkg,
+      spec: c.spec,
+      installed: managerAvailable ? installed.has(c.pkg) : null,
+      version: installed.get(c.pkg) ?? null,
+      providers: owned.get(c.id) ?? [],
+    }))
     return { managerAvailable, channels }
   }
 

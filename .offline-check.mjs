@@ -1858,7 +1858,8 @@ const chOf = (id) => fc.channels.find(c => c.id === id) || {}
 ok('㉞ GET /free-channels 回五个推荐渠道：装没装读 profile 依赖，在线渠道读 llm 注册表',
   fc.managerAvailable === true
   && fc.channels.length === 5
-  && fc.channels.map(c => c.id).join(',') === 'codearts,workbuddy,trae,qoder,our-free-model'
+  // 卡片顺序 = FREE_CHANNELS 顺序，Our Free Model 排第一；认领顺序另算（它仍最后认领）
+  && fc.channels.map(c => c.id).join(',') === 'our-free-model,codearts,workbuddy,trae,qoder'
   && fc.channels.every(c => typeof c.pkg === 'string' && typeof c.spec === 'string')
   && chOf('trae').pkg === 'dsh-connect-trae' && chOf('trae').spec === 'dsh-connect-trae'
   && chOf('qoder').pkg === '@dmh2002/dsh-connect-qoder' && chOf('qoder').spec === '@dmh2002/dsh-connect-qoder'

@@ -15,7 +15,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 | **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 `dsh-llm-error-retry` 自己的配置页，保存即生效 |
-| **免费渠道** | CodeArts / WorkBuddy / Trae / Qoder / Our Free Model 五个能直接补免费模型的插件，带 GitHub 地址与一键安装 |
+| **免费渠道** | Our Free Model / CodeArts / WorkBuddy / Trae / Qoder 五个能直接补免费模型的插件，带 GitHub 地址与一键安装（Our Free Model 排第一张） |
 
 ## 界面
 
@@ -27,7 +27,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ![错误重试页签：内嵌 dsh-llm-error-retry 自己的配置页，顶部一条只读状态栏](docs/preview-error-retry.png)
 
-![免费渠道页签：三张卡片，各带 GitHub 地址、复制链接与一键安装](docs/preview-free-channels.png)
+![免费渠道页签：Our Free Model 排在最上面，每张卡片带 GitHub 地址、复制链接与一键安装](docs/preview-free-channels.png)
 
 ---
 
@@ -97,7 +97,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ## 免费渠道推荐
 
-弹窗的「免费渠道」页签列五个「装上一登录就多几条免费模型」的插件，每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
+弹窗的「免费渠道」页签列五个「装上一登录就多几条免费模型」的插件，顺序固定、Our Free Model 排第一张（不登录、不填 Key 就能用，其余四条都要登录本机账号），每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
 
 | 渠道 | 包 | 提供什么 |
 | --- | --- | --- |

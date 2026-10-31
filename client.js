@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v24'
+    var VERSION = 'v25'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -1116,6 +1116,15 @@ window.__ModuleLoader__.load({
        * 加渠道要同时改宿主 FREE_CHANNELS 与本表：宿主不认识新 id 就拿不到安装状态。
        */
       var FREE_CHANNEL_COPY = {
+        'our-free-model': {
+          repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model',
+          title: 'Our Free Model',
+          tagline: '不登录、不填 API Key 也能用的免费通道',
+          facts: [
+            '含 DeepSeek V4.1 Flash、Kimi K3 等前沿模型，匿名免费通道保留',
+            '2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道',
+          ],
+        },
         codearts: {
           repo: 'https://github.com/elegant01/dsh-codearts',
           title: 'CodeArts',
@@ -1150,15 +1159,6 @@ window.__ModuleLoader__.load({
           facts: [
             '只需一个 PAT（pt- 开头）：无桌面端登录也能用，支持多账号池、每日签到与自动换号',
             '国内版 qoder 与国际版 qoder-global 可同时启用，签名与双层 SSE 由插件自己处理',
-          ],
-        },
-        'our-free-model': {
-          repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model',
-          title: 'Our Free Model',
-          tagline: '不登录、不填 API Key 也能用的免费通道',
-          facts: [
-            '含 DeepSeek V4.1 Flash、Kimi K3 等前沿模型，匿名免费通道保留',
-            '2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道',
           ],
         },
       }
