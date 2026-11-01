@@ -62,6 +62,8 @@ Trae 与 Qoder 是专用连接器，与 Our Free Model 内置的同名渠道撞�
 
 安装按钮调的是宿主的 `pluginManager.installBundle` —— 与插件市场、`dsh plugin add` 同一条路径。需要批准构建脚本时只回报待批准项，**不代批**。装好之后它们的模型会出现在「模型」页签里，排进路由分组即可参与失败切换。
 
+安装 spec 一律用 npm 包名：`github:` 源要拉整个仓库的 tarball（Our Free Model 那份 83MB），pnpm 每次安装 profile 都会重拉一遍，GitHub 一慢就把插件市场的更新拖过 15 分钟上限。
+
 ## 完整文档
 
 配置项、`/api/model-failover` 接口、失败切换的判定顺序、qoder 压缩 shim 的取舍与排障方法，见仓库里的 [README](README.md)。

@@ -62,6 +62,8 @@ Trae and Qoder are dedicated connectors whose provider ids overlap with the ones
 
 The install button calls the host's `pluginManager.installBundle` — the same path as the plugin market and `dsh plugin add`. When a package needs its install scripts approved the tab reports the pending builds and never approves on your behalf. Installed channels show up in the Models tab and can join a routing group like any other model.
 
+Install specs are registry package names on purpose: a `github:` source pulls a whole-repository tarball (83 MB for Our Free Model) that pnpm re-fetches on every profile install, which is what drags the market's own updates past their timeout on a slow GitHub day.
+
 ## Full documentation
 
 Configuration keys, the `/api/model-failover` endpoints, the failover decision order, and the qoder compression shim (including how to tell whether compression is actually happening) are documented in the repository [README](README.md).

@@ -1861,6 +1861,9 @@ ok('㉞ GET /free-channels 回五个推荐渠道：装没装读 profile 依赖�
   // 卡片顺序 = FREE_CHANNELS 顺序，Our Free Model 排第一；认领顺序另算（它仍最后认领）
   && fc.channels.map(c => c.id).join(',') === 'our-free-model,codearts,workbuddy,trae,qoder'
   && fc.channels.every(c => typeof c.pkg === 'string' && typeof c.spec === 'string')
+  // 安装 spec 必须是 npm 包名：github: / git+ 源会拉 codeload tarball，pnpm 每次安装
+  // profile 都重拉一遍（不支持 Range），GitHub 慢时会把插件市场的更新拖过超时。
+  && fc.channels.every(c => /^(?:@[a-z0-9-]+\/)?[a-z0-9][a-z0-9.-]*$/.test(c.spec))
   && chOf('trae').pkg === 'dsh-connect-trae' && chOf('trae').spec === 'dsh-connect-trae'
   && chOf('qoder').pkg === '@dmh2002/dsh-connect-qoder' && chOf('qoder').spec === '@dmh2002/dsh-connect-qoder'
   && chOf('workbuddy').installed === true && chOf('workbuddy').version === '5.16.0'

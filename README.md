@@ -117,7 +117,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 Trae 与 Qoder 这两条是**专用连接器**，与 Our Free Model 内置的同名渠道（它也接 Trae、Qoder 账号）撞号。归属按现场状态定：专用连接器**装了**就由它认领这些 provider id，没装则留给聚合渠道——所以只装 Our Free Model 时，`trae` / `qoder` 仍会算在它那一张卡片上，不会凭空消失，也不会两张卡片重复计数。
 
-已知不足：这一页只负责「装上」，登录、扫码、账号池这些各自的引导在它们自己的界面上；`Our Free Model` 的安装 spec 指向 GitHub 主干，拉不下来时按钮会给出错误原文，可以照卡片里的地址手动 `dsh plugin add`。
+已知不足：这一页只负责「装上」，登录、扫码、账号池这些各自的引导在它们自己的界面上。`Our Free Model` 的安装 spec 走 npm 包名——npm 上的版本比 GitHub 主干旧一些，但 GitHub 源要拉 83MB 的仓库 tarball，而且 pnpm 每次安装 profile 都会重拉一遍，GitHub 慢的时候整个插件市场的更新都会被拖过上限，所以这里不用它。想装最新 GitHub 版本就手动 `dsh plugin add github:Ebony-Vinyl/dsh-our-free-model`，但要清楚这个代价。
 
 ## 与 billion-context 的配合
 
@@ -482,6 +482,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 - 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
 - 「免费渠道」页签只负责安装，不负责登录与账号配置：五个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定五条，也只在这五个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
+- 页签里的安装 spec 一律是 npm 包名，不推荐 `github:` / `git+` 源：那类依赖要拉整个仓库 tarball（`dsh-our-free-model` 有 83MB），pnpm 在每次安装 profile 时都会重拉没缓存的那份、codeload 又不支持断点，GitHub 一慢就把插件市场的更新拖过 15 分钟上限并整批回滚——2026-11-01 这台机器就是这样卡死的。`dsh-llm-error-retry` 没有 npm 包，是本条唯一的例外，它体积很小。
 - 对 `dsh-llm-error-retry` 的依赖固定到具体 commit（`5543c34`，0.20.0），不是版本范围：「错误重试」页签内嵌的是它的页面与 `/llm-error-retry/api/config`，字段或路径一变页签就空，所以升级它要连这个页签一起验。
 - `pack.js` 有两份副本（`$DSH_HOME/plugins/` 下的开发副本与 `$DSH_HOME/profiles/<name>/node_modules/` 下宿主真正 import 的那份），尺寸与 mtime 会不同。插件对每一份都做检查，`hookRepair.copies` 逐份列出；只补 `plugins` 那份是不够的。
 

@@ -107,7 +107,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v89'
+const HOST_VERSION = 'v90'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -144,7 +144,10 @@ const FREE_CHANNELS = [
   {
     id: 'our-free-model',
     pkg: 'dsh-our-free-model',
-    spec: 'github:Ebony-Vinyl/dsh-our-free-model',
+    // 走 npm 包名而不是 GitHub 源：GitHub 版更新（2.7.3）但 tarball 有 83MB，pnpm
+    // 每次安装 profile 都会重新拉一遍（codeload 不支持 Range），GitHub 慢的时候
+    // 整个插件市场的更新都会被拖过 15 分钟上限。npm 版 peer 范围与 provider id 一致。
+    spec: 'dsh-our-free-model',
     // 聚合渠道：按渠道各注册一个 provider（qoder、trae、cline…），没有统一前缀，所以逐个
     // 点名；新增渠道时这里要一起加，否则界面只显示一部分已接入渠道。被专用连接器认领走的
     // 同名 id 不再重复列出。
