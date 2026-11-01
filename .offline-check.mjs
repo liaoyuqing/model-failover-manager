@@ -2147,6 +2147,31 @@ ok('㊲ POST /resign-bridge/sync 手动触发一轮并回传现场',
   syncCall.status === 200 && syncCall.body.ok === true && syncCall.body.resignBridge !== undefined,
   JSON.stringify(syncCall.body.resignBridge || syncCall.body))
 
+// ── ㊳ 插件市场：截图清单、卡片图标、50 字描述 ─────────────────────────────
+// 市场读的是仓库根这一个文件与 locale 里的短描述，改完推送即生效；这里守的是
+// 「不会因为路径写错/漏进 files 而在市场里变空图」与「描述不超字数、两处同句」。
+const shotsJson = JSON.parse(readFileSync(new URL('./screenshots.json', import.meta.url), 'utf8'))
+const shots = Array.isArray(shotsJson) ? shotsJson : shotsJson.screenshots
+ok('㊳ screenshots.json 给市场 1 到 8 张仓库内截图，且都在 package.json 的 files 里',
+  Array.isArray(shots) && shots.length >= 1 && shots.length <= 8
+  && shots.every(p => typeof p === 'string' && !p.startsWith('/') && !p.includes('..')
+    && existsSync(new URL('./' + p, import.meta.url)) && pkg.files.includes(p)),
+  Array.isArray(shots) ? shots.length + ' 张' : String(shots))
+
+const iconBytes = readFileSync(new URL('./assets/icon-180.png', import.meta.url))
+ok('㊳ 市场卡片图标是随包发布的方形 PNG（SVG 会被市场拒绝）',
+  iconBytes[0] === 0x89 && iconBytes.subarray(1, 4).toString('latin1') === 'PNG'
+  && pkg.files.includes('assets/icon-180.png'),
+  iconBytes.length + ' bytes')
+
+const zhMeta = JSON.parse(readFileSync(new URL('./locale/zh.json', import.meta.url), 'utf8')).meta
+const enMeta = JSON.parse(readFileSync(new URL('./locale/en.json', import.meta.url), 'utf8')).meta
+ok('㊳ 市场描述不超过 50 字，且 package.json 与中文 locale 是同一句',
+  [...pkg.description].length <= 50 && zhMeta.description === pkg.description,
+  [...pkg.description].length + ' 字：' + pkg.description)
+ok('㊳ 英文市场描述以句号结尾（awesome-dsh-plugin 的硬性要求）',
+  typeof enMeta.description === 'string' && enMeta.description.trim().endsWith('.'),
+  enMeta.description)
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

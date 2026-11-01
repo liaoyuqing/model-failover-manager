@@ -452,6 +452,12 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 不配置即可正常工作。
 
+## 插件市场
+
+- **卡片图标**：`assets/icon-180.png`（方形位图，卡片约 96px 显示）。市场条目的 `icon:` 指到这张，`icon.svg` 留给插件管理器。
+- **详情截图**：仓库根的 `screenshots.json` 列出 1 到 8 张仓库内相对路径，市场详情页按这个顺序横滑展示。换图只改这一个文件并推送，下一次构建自动生效，不用去市场仓库提 PR。
+- **卡片描述**：来自 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 的 `data/plugins/liaoyuqing__model-failover-manager.yml`，要求不超过 50 字、且每句话都能在代码里对上。改它要往那个仓库提 PR；与 `package.json` 的 `description`、`locale/*.json` 的 `meta.description` 用同一句。
+
 ## 仓库内容
 
 | 文件 | 说明 |
@@ -463,7 +469,9 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
 | `locale/en.json`、`locale/zh.json` | 界面文案。`meta.detail` 指向插件市场详情页要渲染的文档（`docs/market.zh.md` / `docs/market.en.md`），图片按文档所在目录解析 |
 | `docs/` | 六个页签的界面截图（`preview-*.png`，本 README「界面」一节与市场详情文档都引用）与两份市场详情文档 |
-| `icon.svg` | 图标 |
+| `screenshots.json` | 插件市场详情页的截图清单：1 到 8 张仓库内相对路径，第一条是「模型」页签大图 |
+| `assets/icon-180.png`、`assets/icon-512.png` | 卡片图标的位图版（市场条目 `icon:` 指 180 那张） |
+| `icon.svg` | 插件管理器里的矢量图标 |
 
 
 ## 已知限制
