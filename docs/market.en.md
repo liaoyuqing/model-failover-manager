@@ -55,7 +55,7 @@ Each recommendation adds a few models you can run without paying. The card order
 - **WorkBuddy** (`dsh-connect-workbuddy`): the WorkBuddy account already signed in on this machine (domestic / international), with per-model rate multipliers, account switching and daily check-in.
 - **Trae** (`dsh-connect-trae`): the Trae desktop account already signed in on this machine; domestic, enterprise and international each register a provider, with daily check-in and credit readouts.
 - **Qoder** (`@dmh2002/dsh-connect-qoder`): a Qoder account's model quota through a single PAT, with a multi-account pool and automatic switching; domestic and international can run side by side.
-- **Providers Hub** (`dsh-codearts-auth`): the accounts of more than twenty free channels through one plugin — Huawei Cloud CodeArts, Tencent CodeBuddy, Youdao LobsterAI, Qoder, TRAE, Cline, MiniMax, Zhipu ZCode, Gemini, Accio, iFlytek AStudio and others; one login puts that channel's models in the model list, with a multi-account pool, silent renewal and a local OpenAI-compatible gateway.
+- **Providers Hub** (`dsh-providers-hub`, formerly `dsh-codearts-auth`): the accounts of more than twenty free channels through one plugin — Huawei Cloud CodeArts, Tencent CodeBuddy, Youdao LobsterAI, Qoder, TRAE, Cline, MiniMax, Zhipu ZCode, Gemini, Accio, iFlytek AStudio and others; one login puts that channel's models in the model list, with a multi-account pool, silent renewal and a local OpenAI-compatible gateway.
 
 Three separate facts per card: **installed** (read from the profile dependencies), **providers online** (read from the live `llm` registry), and the **GitHub address** (one click to copy). A channel that is installed but not logged in therefore never reads as "not installed".
 
@@ -63,7 +63,7 @@ Trae and Qoder are dedicated connectors whose provider ids overlap with the ones
 
 The install button calls the host's `pluginManager.installBundle` — the same path as the plugin market and `dsh plugin add`. When a package needs its install scripts approved the tab reports the pending builds and never approves on your behalf. Installed channels show up in the Models tab and can join a routing group like any other model.
 
-Providers Hub installs under the spec `dsh-codearts-auth`: the package was renamed to `dsh-providers-hub` on npm from 0.2.0-rc.11 on, the old name still installs, and that is the spec the tab offers (its GitHub address points at the upstream `iJetLi/dsh-providers-hub` repository) — do not install it by the new name.
+Providers Hub installs under the spec `dsh-providers-hub`, the name the plugin market lists it under (its GitHub address points at the upstream `iJetLi/dsh-providers-hub` repository; the market page offers a GitHub-source command, while the tab uses the npm package of the same name). The package was renamed from `dsh-codearts-auth` at 0.2.0-rc.11 and both npm names are published at the same version; a profile that still has the old name installed is reported as installed and needs no reinstall.
 
 Install specs are registry package names on purpose: a `github:` source pulls a whole-repository tarball (83 MB for Our Free Model) that pnpm re-fetches on every profile install, which is what drags the market's own updates past their timeout on a slow GitHub day.
 

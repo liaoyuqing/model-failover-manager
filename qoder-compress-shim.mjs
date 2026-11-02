@@ -35,7 +35,7 @@ const SHIM_PROVIDER_IDS = new Set(['qoder', 'qodercn'])
  *
  * 每个插件都有自己的 provider 前缀（ofm- / caa- / cq- …），所以**同一个裸名会有多个
  * 同时在线**：ofm-qoder 由 dsh-our-free-model 注册（走它内联进 pack.js 的那份加密器），
- * caa-qoder 由 dsh-codearts-auth 注册（走它自己 lib/qoder-wasm.js 的另一份拷贝）——
+ * caa-qoder 由 dsh-providers-hub（旧名 dsh-codearts-auth）注册（走它自己 lib/qoder-wasm.js 的另一份拷贝）——
  * 两份是**不同的类**。本 shim 的整套设计是「给真正在跑的那份 adapter 的类原型打
  * prepareInfer 补丁 + 给每个活 adapter 装 fetchImpl 传送门」（见下面的排障注释：多份
  * 拷贝时只有活的那个打上才算数），所以这里必须**逐个全收**，只挑一条会漏掉另一条，
@@ -185,8 +185,9 @@ import { bareProvider } from './provider-prefix.mjs'
 const HERE = dirname(fileURLToPath(import.meta.url))
 
 /**
- * 找出 dsh-codearts-auth 的 qoder-wasm.js：优先配置，其次从当前 home 下的
- * profiles/<name>/node_modules 里找。找不到就返回 null（调用方据此禁用 shim）。
+ * 找出 Providers Hub（dsh-providers-hub，旧包名 dsh-codearts-auth）的 qoder-wasm.js：
+ * 优先配置，其次从当前 home 下的 profiles/<name>/node_modules 里找。
+ * 找不到就返回 null（调用方据此禁用 shim）。
  *
  * @param explicit 显式配置的绝对路径
  * @returns qoder-wasm.js 的绝对路径，或 null
@@ -201,8 +202,11 @@ export function resolveQoderWasmPath(explicit) {
     try { entries = readdirSync(profiles, { withFileTypes: true }) } catch { continue }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
-      const candidate = join(profiles, entry.name, 'node_modules', 'dsh-codearts-auth', 'lib', 'qoder-wasm.js')
-      if (existsSync(candidate)) return candidate
+      // 新旧两个包名都找：0.2.0-rc.11 起改名，老 profile 里装的仍是旧名。
+      for (const pkg of ['dsh-providers-hub', 'dsh-codearts-auth']) {
+        const candidate = join(profiles, entry.name, 'node_modules', pkg, 'lib', 'qoder-wasm.js')
+        if (existsSync(candidate)) return candidate
+      }
     }
   }
   return null
@@ -398,7 +402,7 @@ const STOP_GRACE_MS = 2000
 /**
  * 找出「运行时真正在用的」QoderEncryptedInfer。
  *
- * ⚠️ 不能只 patch 磁盘上的 dsh-codearts-auth/lib/qoder-wasm.js：
+ * ⚠️ 不能只 patch 磁盘上的 dsh-providers-hub/lib/qoder-wasm.js（旧包名 dsh-codearts-auth 的同名目录同理）：
  * dsh-our-free-model 把整个 qoder adapter + wasm 源码**内联打包**进了自己的
  * vendor/channel-pack/pack.js，并在那里注册 qoder / qodercn。运行时真正在跑的
  * QoderEncryptedInfer 是 pack.js 里那份拷贝 —— 实测给独立包打补丁后，真实请求
@@ -461,7 +465,7 @@ async function collectTargets(ctx, wasmPath) {
   // 注册表里的实际 adapter：既装「传送门」，也顺手把它的**真实类原型**纳入目标。
   //
   // ⚠️ 只靠 globalThis 注入口与磁盘上那份 qoder-wasm.js 是不够的：宿主里同时存在
-  // 好几份 QoderEncryptedInfer（pack.js 内联一份、dsh-codearts-auth 的 lib 一份，
+  // 好几份 QoderEncryptedInfer（pack.js 内联一份、dsh-providers-hub 的 lib 一份，
   // 盘符大小写还会再分裂一次 ESM 实例），而运行时真正 new 出来的是哪一份，取决于
   // 谁先注册进 llm 注册表 —— 实测另外几份全打上了、prepareInfer 计数仍是 0。所以
   // 这里直接从**活着的 adapter 实例**反查它的类原型，无论它是哪份拷贝。

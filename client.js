@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v28'
+    var VERSION = 'v29'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -1252,14 +1252,15 @@ window.__ModuleLoader__.load({
           ],
         },
         'codearts-auth': {
-          // 上游仓库是改名后的 dsh-providers-hub（zhuweiyou/dsh-providers-hub 是它的 fork）；
-          // 安装 spec 仍走旧名 dsh-codearts-auth（宿主 FREE_CHANNELS）。
+          // 插件市场里这条叫 dsh-providers-hub（上游 iJetLi/dsh-providers-hub；zhuweiyou/… 是 fork）；
+          // 安装 spec 跟随市场写新名，旧包名 dsh-codearts-auth 由宿主 legacyPkg 识别。
           repo: 'https://github.com/iJetLi/dsh-providers-hub',
           title: 'Providers Hub',
           tagline: '一个插件接入二十多家免费渠道的账号',
           facts: [
             '华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等，登录一次就在模型列表里多出该渠道的模型',
             '多账号池与凭据静默续期，登录、状态、续期、积分领取都在它自己的设置页；附带一个本机 OpenAI 兼容网关',
+            '0.2.0-rc.11 起改名为 dsh-providers-hub；此前装的旧包名 dsh-codearts-auth 照样识别，不用重装',
           ],
         },
       }
@@ -1306,7 +1307,7 @@ window.__ModuleLoader__.load({
                 e('button', { style: S.btn, onClick: function () { copyText(copy.repo, ch.id) } },
                   copied && copied.id === ch.id ? (copied.ok ? '已复制' : '复制失败') : '复制链接')),
               e('div', { style: S.channelActions },
-                !ch.stale && e('span', { style: S.channelFact }, '包 ' + ch.pkg),
+                !ch.stale && e('span', { style: S.channelFact }, '包 ' + ch.pkg + (ch.installedAs && ch.installedAs !== ch.pkg ? '（装的是旧包名 ' + ch.installedAs + '）' : '')),
                 !ch.stale && e('span', { style: S.channelFact }, '在线渠道 ' + (ch.providers.length ? ch.providers.join(' / ') : '无')),
                 e('span', { style: { flex: 1 } }),
                 e('button', { style: S.btn, onClick: function () { probeFreeChannels() } }, '刷新状态')),

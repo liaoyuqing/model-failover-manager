@@ -118,7 +118,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v95'
+const HOST_VERSION = 'v96'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -174,17 +174,20 @@ const FREE_CHANNELS = [
   // 谁认领由 describeFreeChannels 按「专用连接器装没装」现场决定，这里只声明各自的正则。
   { id: 'trae', pkg: 'dsh-connect-trae', spec: 'dsh-connect-trae', prefix: 'ct-', providers: /^(trae|trae-enterprise|trae-global)$/i },
   { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', spec: '@dmh2002/dsh-connect-qoder', prefix: 'cq-', providers: /^(qoder|qoder-global)$/i },
-  // 第二个聚合渠道（dsh-codearts-auth；0.2.0-rc.11 起改名 dsh-providers-hub，两个包名同发同版本）。
-  // pkg/spec 仍写旧名：旧名包自带的 cordis.patch.yml 里也是 name: 'dsh-codearts-auth'，
-  // 用它装进老 profile 不会触发「两处都写新名」时的 MODULE_NOT_FOUND。
+  // 第二个聚合渠道（Providers Hub：市场名 dsh-providers-hub，上游 iJetLi/dsh-providers-hub）。
+  // 0.2.0-rc.11 起从 dsh-codearts-auth 改名，npm 上两个包名同发同版本，各自 tarball 里
+  // cordis.patch.yml 的 name 都等于自己的包名；pkg/spec 跟随市场写新名，旧名只留
+  // legacyPkg 做「已装检测」——老 profile 里装的是旧名，不认它就会显示未安装，
+  // 一键安装还会再装一份（同一个 codearts-auth 条目，两份包同时加载）。
   // 正则只列不和别人撞号的裸渠道 id —— codearts 与 workbuddy 各有专用卡片（写了会重复计数）；
   // qoder/trae/cline/minimax/lobster… 已被 Our Free Model 的正则先命中（它排在本卡前面），写了也拿不到；
   // aggregate 是聚合路由、jet-hub-auto 是自动路由，两者都不是「某个渠道在线」的事实。
   // 本卡前缀下的 id（caa-codearts 那种）按前缀直接归属，正则不必再列 codearts。
   {
     id: 'codearts-auth',
-    pkg: 'dsh-codearts-auth',
-    spec: 'dsh-codearts-auth',
+    pkg: 'dsh-providers-hub',
+    legacyPkg: 'dsh-codearts-auth',
+    spec: 'dsh-providers-hub',
     prefix: 'caa-',
     aggregator: true,
     providers: /^(buddy|opencode|officeace|accio|astudio|autoclaw|autoclawintl|modelscope|qiniu|codely|magicrew)$/i,
@@ -207,7 +210,7 @@ function failKey(provider, model) { return `${bareProvider(provider)}/${model}` 
  *
  *  · 真实注册表 id：六个免费渠道插件各有一个前缀（dsh-our-free-model 的 ofm-、
  *    dsh-codearts 的 ca-、dsh-connect-workbuddy 的 cw-、dsh-connect-trae 的 ct-、
- *    @dmh2002/dsh-connect-qoder 的 cq-、dsh-codearts-auth 的 caa-），前缀由 llm 门面
+ *    @dmh2002/dsh-connect-qoder 的 cq-、dsh-providers-hub（旧名 dsh-codearts-auth）的 caa-），前缀由 llm 门面
  *    加在真实注册表侧，所以宿主看到的是 ofm-qoder / caa-codearts 这种。
  *  · 裸 id：没打门面的插件仍然是裸 id（qoder、trae…），用户配置、groups.json、
  *    分组条目、界面与失败表也一直是裸 id。
@@ -399,7 +402,7 @@ export function apply(ctx, config = {}) {
 
   // qoder 压缩 shim：把 WASM 加密请求换成明文 OpenAI 请求，先经 bili 压缩，
   // 再由本机转发层重新加密发往上游（见 qoder-compress-shim.mjs）。默认关闭：
-  // 它依赖 dsh-codearts-auth 的内部模块，装不上时只告警、不影响其它功能。
+  // 它依赖 dsh-providers-hub（旧名 dsh-codearts-auth）的内部模块，装不上时只告警、不影响其它功能。
   const qoderShimRaw = config.qoderShim
   const qoderShimEnabled = typeof qoderShimRaw === 'boolean' ? qoderShimRaw : false
   if (qoderShimRaw !== undefined && typeof qoderShimRaw !== 'boolean') {
@@ -2115,7 +2118,7 @@ export function apply(ctx, config = {}) {
   async function handoffToFreeModelAccount(provider, model, failure) {
     // 换号是 dsh-our-free-model 的能力，只对它自己的渠道成立：裸 id（未打门面）或
     // ofm- 前缀。别的插件前缀下的路由一律不换号——ca-codearts 的账号由 dsh-codearts
-    // 管、caa-codearts 由 dsh-codearts-auth 管，池里就算留着同名历史账号，冷却的也是
+    // 管、caa-codearts 由 dsh-providers-hub 管，池里就算留着同名历史账号，冷却的也是
     // 本次没用到的账号，还挡掉了本该发生的分组路由。
     const ident = providerIdentity(provider)
     if (ident.prefix !== '' && ident.prefix !== OFM_PROVIDER_PREFIX) return null
@@ -2212,15 +2215,16 @@ export function apply(ctx, config = {}) {
   /**
    * dsh-codearts 的 provider 前缀（与 FREE_CHANNELS 里那条一致）。
    *
-   * 只认裸 id 与 ca-：caa-codearts 是 dsh-codearts-auth 注册的另一条路由，
+   * 只认裸 id 与 ca-：caa-codearts 是 dsh-providers-hub 注册的另一条路由，
    * providerEquals 会把「一侧无前缀」也算等价，这里不能用它判归属。
    */
   const CODEARTS_PROVIDER_PREFIX = 'ca-'
   /**
    * dsh-codearts 的 Loader 条目名（＝包名）。
    *
-   * 不能写成 includes('dsh-codearts')：dsh-codearts-auth（Providers Hub）的名字以它开头，
-   * 两个条目同时在跑时会把 Provider Hub 的实例当成 codearts 重启，真正的池仍是死的。
+   * 不能写成 includes('dsh-codearts')：Providers Hub 的旧包名 dsh-codearts-auth 以它开头（新名
+   * dsh-providers-hub 不会），老 profile 里装的是旧名，两个条目同时在跑时会把它的实例当成
+   * codearts 重启，真正的池仍是死的。
    */
   const CODEARTS_PLUGIN_NAME = 'dsh-codearts'
   /**
@@ -2255,7 +2259,7 @@ export function apply(ctx, config = {}) {
   const CODEARTS_GATE_HEAL_COOLDOWN_MS = 60_000
   /** 本机宿主的 /api 端口：与 MFM 自己的 API 同源，改端口时两边一起改 */
   const LOCAL_API_ORIGIN = 'http://127.0.0.1:3080'
-  /** Jet Hub 的 RPC 端点（dsh-codearts-auth 的 jet-hub-rpc.js 里导出的 JET_HUB_API_PATH） */
+  /** Jet Hub 的 RPC 端点（Providers Hub 的 jet-hub-rpc.js 里导出的 JET_HUB_API_PATH） */
   const JET_HUB_API_PATH = '/api/jet-hub'
   /** 浏览器会话 cookie 的签名密钥在凭据库里的键（packages/client/connection/src/browser-auth.ts） */
   const BROWSER_SESSION_KEY = 'client-connection/browser-session'
@@ -2331,7 +2335,7 @@ export function apply(ctx, config = {}) {
   /**
    * 经 Jet Hub RPC 重新打开 codearts 供应商。
    *
-   * 打开方向由 dsh-codearts-auth 自己收口（jet-hub-rpc.js 的 provider.setEnabled）：
+   * 打开方向由 Providers Hub 自己收口（jet-hub-rpc.js 的 provider.setEnabled）：
    * 一次清空模型黑名单与 `providerClosed` 意图、启用全部账号并广播目录变更。
    * 插件不自己拼这几步，避免与它「先关模型再停账号」的顺序约定分叉。
    *
@@ -2401,7 +2405,7 @@ export function apply(ctx, config = {}) {
   function isCodeartsFailure(provider, failure) {
     // provider 可能是注册表 id（ca-codearts）；两侧都按裸名比，否则整段自救逻辑不触发。
     // 但归属必须看前缀：providerEquals 认为「任一侧无前缀」即等价，会把 caa-codearts
-    // （dsh-codearts-auth 的路由）也算成 codearts 池故障，去重启一个无关的实例。
+    // （dsh-providers-hub 的路由）也算成 codearts 池故障，去重启一个无关的实例。
     const isCodeartsRoute = (id) => {
       const ident = providerIdentity(id)
       if (ident.bare !== CODEARTS_PROVIDER_ID) return false
@@ -2451,8 +2455,8 @@ export function apply(ctx, config = {}) {
     let target
     try {
       for (const entry of loader.entries()) {
-        // 精确匹配包名：includes('dsh-codearts') 会把 dsh-codearts-auth（Providers Hub）
-        // 也算进来，两个条目同时在跑时会重启错误的实例，真正的 codearts 池仍是死的。
+        // 精确匹配包名：includes('dsh-codearts') 会把 Providers Hub 的旧包名 dsh-codearts-auth
+        // 也算进来（新名不会），老 profile 里装旧名时两个条目同时在跑就会重启错误的实例。
         if (!isCodeartsPluginEntryName(entry?.options?.name)) continue
         if (!entry.fiber || entry.fiber.uid === null) continue
         target = entry
@@ -2543,7 +2547,7 @@ export function apply(ctx, config = {}) {
    * 与「模型列表里有没有它的模型」是两件事——有的包装了但没登录，provider 就不在。
    * 服务取不到时 installed 返回 null（界面显示「未检测」），而不是谎报「未安装」。
    *
-   * @returns {Promise<{managerAvailable: boolean, channels: {id: string, pkg: string, spec: string, installed: boolean|null, version: string|null, providers: string[]}[]}>} 现场快照
+   * @returns {Promise<{managerAvailable: boolean, channels: {id: string, pkg: string, spec: string, installed: boolean|null, installedAs: string|null, version: string|null, providers: string[]}[]}>} 现场快照
    */
   async function describeFreeChannels() {
     /** @type {Map<string, string>} */
@@ -2575,20 +2579,38 @@ export function apply(ctx, config = {}) {
     //    ofm-qoder / caa-codearts 这种，别的插件前缀下的 id 不掺和本渠道的归属。
     //  · 认领集合以**注册表原始 id** 为粒度，所以 ofm-qoder 与 caa-qoder 能同时列出；
     //    返回的也是原始 id（界面展示的是「此刻在线的哪条路由」）。
+    // 「装没装」要认列表里的两个包名：Providers Hub 在 0.2.0-rc.11 从 dsh-codearts-auth
+    // 改名，老 profile 里装的仍是旧名，只看 c.pkg 会把已装的报成未安装。
+    const installedNameOf = (c) => {
+      for (const name of [c.pkg, c.legacyPkg]) {
+        if (typeof name === 'string' && name !== '' && installed.has(name)) return name
+      }
+      return null
+    }
     const owned = claimFreeChannels({
       channels: FREE_CHANNELS,
       providerIds,
-      // 取不到插件管理服务时 installed 一律 null，退回按静态顺序认领（同前行为）
-      isInstalled: (pkg) => (managerAvailable ? installed.has(pkg) : null),
+      // claimFreeChannels 只拿包名问「装了没」：映射回渠道后再查新旧两个包名。
+      // 取不到插件管理服务时一律 null，退回按静态顺序认领（同前行为）。
+      isInstalled: (pkg) => {
+        if (!managerAvailable) return null
+        const channel = FREE_CHANNELS.find(c => c.pkg === pkg || c.legacyPkg === pkg)
+        return channel ? installedNameOf(channel) !== null : installed.has(pkg)
+      },
     })
-    const channels = FREE_CHANNELS.map(c => ({
-      id: c.id,
-      pkg: c.pkg,
-      spec: c.spec,
-      installed: managerAvailable ? installed.has(c.pkg) : null,
-      version: installed.get(c.pkg) ?? null,
-      providers: owned.get(c.id) ?? [],
-    }))
+    const channels = FREE_CHANNELS.map((c) => {
+      const installedAs = installedNameOf(c)
+      return {
+        id: c.id,
+        pkg: c.pkg,
+        spec: c.spec,
+        installed: managerAvailable ? installedAs !== null : null,
+        // 实际装着的那个包名：旧名装的 profile 也报真实版本，界面据此注明「旧包名」
+        installedAs,
+        version: installedAs === null ? null : installed.get(installedAs) ?? null,
+        providers: owned.get(c.id) ?? [],
+      }
+    })
     return { managerAvailable, channels }
   }
 
@@ -2609,6 +2631,16 @@ export function apply(ctx, config = {}) {
     if (!manager || typeof manager.installBundle !== 'function') {
       return { ok: false, message: `当前宿主没有插件管理服务，无法一键安装；请手动安装 ${channel.spec}` }
     }
+    // 新旧包名是同一个插件：老 profile 里已经装了旧名时再装新名，profile 里会多出一条
+    // 同 id（codearts-auth）的 bundle，两个包同时加载。界面本来会把按钮藏掉，这里再兜一次。
+    try {
+      const present = new Set()
+      for (const bundle of (await manager.listBundles?.()) ?? []) {
+        if (bundle?.installed !== false && typeof bundle?.name === 'string') present.add(bundle.name)
+      }
+      const already = [channel.pkg, channel.legacyPkg].find(name => typeof name === 'string' && present.has(name))
+      if (already !== undefined) return { ok: true, message: `已安装 ${already}（同一个插件的新旧包名），不再重复安装` }
+    } catch { /* 读不到已装列表就交给 installBundle 自己判重 */ }
     let result
     try {
       result = await manager.installBundle(channel.spec)
@@ -2757,7 +2789,7 @@ export function apply(ctx, config = {}) {
    * QoderEncryptedInfer#prepareInfer，把加密请求改成明文 OpenAI 先过 bili）。
    *
    * 判据是 shim 的 `effective`（真的接管了运行时在用的加密器），不是 `installed`
-   * （只是把补丁挂上了）。磁盘上 dsh-codearts-auth 那份 qoder-wasm.js 在本部署里不被
+   * （只是把补丁挂上了）。磁盘上 dsh-providers-hub 那份 qoder-wasm.js 在本部署里不被
    * 加载，给它打补丁不改变任何请求；只有 pack.js 暴露的那份才算数。按 installed 判
    * 会让守卫在「补丁挂上了但一个请求都没经过它」时宣布正常，2026-10-26 就是这样静默
    * 失效的。

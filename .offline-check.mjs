@@ -536,10 +536,12 @@ let codeartsStatus = { usage: { slots: [] } }
 let providersHubRestarts = 0
 const fakeLoader = {
   *entries() {
-    // Providers Hub 的名字以 dsh-codearts 开头，且排在前面：旧实现用
-    // includes('dsh-codearts') 匹配会先命中它，把「重建账号池」打在错误的实例上
-    // （真正的 codearts 池仍是死的）。现在按包名精确匹配，命中的是 llm-codearts。
-    yield { options: { id: 'codearts-auth', name: 'dsh-codearts-auth' }, fiber: { uid: 6, async restart() { providersHubRestarts += 1 } } }
+    // Providers Hub 排在前面：旧实现用 includes('dsh-codearts') 匹配会先命中它
+    // （旧包名 dsh-codearts-auth 以 dsh-codearts 开头），把「重建账号池」打在错误的实例上
+    // （真正的 codearts 池仍是死的）。现在按包名精确匹配，命中的是 llm-codearts；
+    // 两种包名都可能出现在已装 profile 里，所以两条都摆上。
+    yield { options: { id: 'codearts-auth', name: 'dsh-providers-hub' }, fiber: { uid: 6, async restart() { providersHubRestarts += 1 } } }
+    yield { options: { id: 'codearts-auth', name: 'dsh-codearts-auth' }, fiber: { uid: 9, async restart() { providersHubRestarts += 1 } } }
     yield { options: { id: 'llm-codearts', name: 'dsh-codearts' }, fiber: { uid: 7, async restart() { restartCalls += 1 } } }
     yield { options: { id: 'other', name: 'some-other-plugin' }, fiber: { uid: 8, async restart() { throw new Error('不该重启这个') } } }
   },
@@ -2107,9 +2109,10 @@ ok('㉞ GET /free-channels 回六个推荐渠道：装没装读 profile 依赖�
   && chOf('workbuddy').installed === true && chOf('workbuddy').version === '5.16.0'
   && chOf('codearts').installed === false && chOf('codearts').version === null
   && chOf('trae').installed === false && chOf('qoder').installed === false
-  // 第二个聚合渠道仍用旧包名 dsh-codearts-auth（改名后的 dsh-providers-hub 同发同版本）
-  && chOf('codearts-auth').pkg === 'dsh-codearts-auth' && chOf('codearts-auth').spec === 'dsh-codearts-auth'
+  // 第二个聚合渠道跟随插件市场用新包名 dsh-providers-hub；旧名 dsh-codearts-auth 只用于已装检测
+  && chOf('codearts-auth').pkg === 'dsh-providers-hub' && chOf('codearts-auth').spec === 'dsh-providers-hub'
   && chOf('codearts-auth').installed === false && chOf('codearts-auth').version === null
+  && chOf('codearts-auth').installedAs === null
   && JSON.stringify(chOf('codearts').providers) === '["codearts"]'
   // trae / qoder 的专用连接器没装，同名 provider 归聚合渠道（否则聚合卡片会显示「无在线渠道」）
   && JSON.stringify(chOf('trae').providers) === '[]'
@@ -2164,10 +2167,34 @@ ok('㉞ trae / qoder 装了就归专用连接器，聚合渠道只列剩下的�
   && JSON.stringify(ownOf('trae').providers) === '["trae","trae-global"]'
   && JSON.stringify(ownOf('qoder').providers) === '["qoder","qoder-global"]'
   && JSON.stringify(ownOf('our-free-model').providers) === '["qodercn"]'
-  // 两个聚合渠道都装了：Our Free Model 排在推荐表前面，先认领；Providers Hub 只拿它剩下的
+  // 两个聚合渠道都装了：Our Free Model 排在推荐表前面，先认领；Providers Hub 只拿它剩下的。
+  // 这里装的是旧包名 dsh-codearts-auth：installedAs 要报它，版本照旧读出真实值。
   && ownOf('codearts-auth').installed === true && ownOf('codearts-auth').version === '2.12.261101'
+  && ownOf('codearts-auth').installedAs === 'dsh-codearts-auth'
   && JSON.stringify(ownOf('codearts-auth').providers) === '["buddy","magicrew"]',
   JSON.stringify(fcOwned))
+
+// 已经装了旧包名时点安装：不再装新包名（同一个插件、同一个 codearts-auth 条目，两份同时加载会双注册）
+const dupInstallCalls = []
+managerStub.installBundle = async (spec) => { dupInstallCalls.push(spec); return { applied: true } }
+const dupInstall = await api('POST', '/free-channels/install', { id: 'codearts-auth' })
+ok('㉞ 已装旧包名时安装新包名被拦下（同一插件的新旧包名不重复装）',
+  dupInstall.status === 200 && dupInstall.body.ok === true
+  && /已安装/.test(dupInstall.body.message)
+  && dupInstallCalls.length === 0,
+  JSON.stringify(dupInstall.body))
+
+// 反向：新包名装的 profile 也要认（installedAs 报实际装着的那个名字）
+managerStub.bundles = [
+  { name: 'dsh-connect-trae', version: '4.6.12' },
+  { name: 'dsh-providers-hub', version: '2.13.261102' },
+]
+const fcNewName = (await api('GET', '/free-channels')).body
+const newNameCh = fcNewName.channels.find(c => c.id === 'codearts-auth') || {}
+ok('㉞ 新包名装的 profile 同样报已安装，installedAs 报新包名与真实版本',
+  newNameCh.installed === true && newNameCh.installedAs === 'dsh-providers-hub'
+  && newNameCh.version === '2.13.261102',
+  JSON.stringify(newNameCh))
 
 managerStub = undefined
 llmStub = undefined
@@ -2188,7 +2215,8 @@ const PREFIX_CHANNELS = [
   { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', prefix: 'cw-', providers: /^workbuddy/i },
   { id: 'trae', pkg: 'dsh-connect-trae', prefix: 'ct-', providers: /^(trae|trae-enterprise|trae-global)$/i },
   { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', prefix: 'cq-', providers: /^(qoder|qoder-global)$/i },
-  { id: 'codearts-auth', pkg: 'dsh-codearts-auth', prefix: 'caa-', aggregator: true, providers: /^(buddy|opencode|officeace|accio|astudio|autoclaw|autoclawintl|modelscope|qiniu|codely|magicrew)$/i },
+  // 第二个聚合渠道：市场名 dsh-providers-hub（旧名 dsh-codearts-auth 同发同版本，只是已装检测用）
+  { id: 'codearts-auth', pkg: 'dsh-providers-hub', legacyPkg: 'dsh-codearts-auth', prefix: 'caa-', aggregator: true, providers: /^(buddy|opencode|officeace|accio|astudio|autoclaw|autoclawintl|modelscope|qiniu|codely|magicrew)$/i },
 ]
 /** 跑一遍认领，返回 { channelId: providers[] } 的 JSON（断言里直接比字符串） */
 const claims = (ids, isInstalled = () => false) => JSON.stringify(
@@ -2375,7 +2403,7 @@ ok('㊴ 自检用的临时分组与失败记账已清掉',
 // 263 项仍全绿）。断言放在导出的纯函数 collectShimRegistrations 上。
 //
 // 多前缀之后**同一个裸名会有多个活 adapter**（ofm-qoder 走 dsh-our-free-model 内联的
-// encryptor，caa-qoder 走 dsh-codearts-auth 自己那份 qoder-wasm.js —— 两份是不同的类），
+// encryptor，caa-qoder 走 dsh-providers-hub（旧名 dsh-codearts-auth）自己那份 qoder-wasm.js —— 两份是不同的类），
 // 所以这里必须**逐个全收**：只挑一条会漏掉另一条，而 /status 仍显示已接管。
 const shimMap = (ids) => new Map(ids.map((id) => [id, { adapter: { tag: id } }]))
 const shimIds = (ids) => collectShimRegistrations(shimMap(ids)).adapters.map(a => a.id)
@@ -2428,7 +2456,7 @@ ok('㉞ 每个渠道给出 GitHub 仓库地址，并提供一键复制',
   && clientText.includes("repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-trae'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-qoder'")
-  // 第二个聚合渠道的仓库是改名后的 dsh-providers-hub 上游（zhuweiyou/… 是 fork；安装 spec 仍是旧名 dsh-codearts-auth）
+  // 第二个聚合渠道的仓库是 dsh-providers-hub 上游（zhuweiyou/… 是 fork；安装 spec 跟随市场写新名）
   && clientText.includes("repo: 'https://github.com/iJetLi/dsh-providers-hub'")
   && clientText.includes('function copyText(')
   && clientText.includes("navigator.clipboard.writeText")

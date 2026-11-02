@@ -15,7 +15,7 @@
  *   dsh-connect-workbuddy  cw-    cw-workbuddy / …
  *   dsh-connect-trae       ct-    ct-trae / …
  *   dsh-connect-qoder      cq-    cq-qoder / …
- *   dsh-codearts-auth      caa-   caa-codearts / caa-buddy / …
+ *   dsh-providers-hub      caa-   caa-codearts / caa-buddy / …（旧名 dsh-codearts-auth）
  *
  * 于是同一个裸名（qoder）可以同时以 ofm-qoder、caa-qoder、cq-qoder 三条路由在线。
  *
@@ -97,7 +97,7 @@ export function canonicalProvider(id) {
  *  · providerEquals('codearts', 'ca-codearts') 为 true —— 裸配置兼容：groups.json 里
  *    写的裸 id 必须能对上注册表里的 ca-codearts。
  *  · providerEquals('ca-codearts', 'caa-codearts') 为 false —— 不同插件注册的两条
- *    路由（dsh-codearts 与 dsh-codearts-auth），不能混为一谈。
+ *    路由（dsh-codearts 与 dsh-providers-hub），不能混为一谈。
  *  · providerEquals('ofm-qoder', 'caa-qoder') 为 false —— 同上。
  *
  * @param {unknown} a 一侧的 provider id。
@@ -115,7 +115,7 @@ export function providerEquals(a, b) {
  * 认领用的裸化：这个注册表 id 归不归「prefix 这个渠道」看。
  *
  * 与 bareProvider 的区别是「别的插件前缀下的 id 一律不算我的」：
- *  · channelBare('ca-', 'caa-codearts') 为 null —— caa- 是 dsh-codearts-auth 的，
+ *  · channelBare('ca-', 'caa-codearts') 为 null —— caa- 是 dsh-providers-hub 的，
  *    不能因为裸名也叫 codearts 就算到 dsh-codearts 头上；
  *  · channelBare('ofm-', 'qoder') 为 'qoder' —— 未打门面的裸 id 照旧参与认领；
  *  · channelBare('cq-', 'qoder') 为 'qoder' —— 同一个裸名各渠道都要能看见，
@@ -149,7 +149,7 @@ export function channelBare(prefix, id) {
  *       前缀（前缀本身就是归属声明，用于 codearts-auth 那种正则刻意不含 codearts 的卡）。
  *     · 别的插件前缀下的 id（channelBare 返回 null）→ 只有聚合渠道、且裸名命中它的
  *       正则时才认领：caa-qoder 归 Our Free Model 的正则，而 caa-codearts 不是
- *       dsh-codearts 的（那是 dsh-codearts-auth 注册的另一条路由）。
+ *       dsh-codearts 的（那是 dsh-providers-hub 注册的另一条路由）。
  *  4. claimed 以**注册表原始 id** 为粒度：ofm-qoder 与 caa-qoder 是两条不同的路由，
  *     按裸名去重会把其中一条吞掉。
  *

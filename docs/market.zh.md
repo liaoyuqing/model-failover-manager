@@ -55,7 +55,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 - **WorkBuddy**（`dsh-connect-workbuddy`）：本机已登录的 WorkBuddy 账号（国内版 / 国际版），按上游目录读积分倍率，支持换号与每日签到。
 - **Trae**（`dsh-connect-trae`）：本机已登录的 Trae 桌面端账号，国内版 / 企业版 / 国际版各注册一个 provider，附每日签到与积分读数。
 - **Qoder**（`@dmh2002/dsh-connect-qoder`）：Qoder（通义灵码）账号额度，只需一个 PAT（`pt-` 开头），支持多账号池与自动换号，国内版与国际版可同时启用。
-- **Providers Hub**（`dsh-codearts-auth`）：一个插件接入二十多家免费渠道的账号（华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关。
+- **Providers Hub**（`dsh-providers-hub`，旧名 `dsh-codearts-auth`）：一个插件接入二十多家免费渠道的账号（华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关。
 
 卡片上三件事分开写清楚：**装没装**（读 profile 依赖）、**在线渠道**（读当前 llm 注册表）、**GitHub 地址**（一键复制）。所以「装了但没登录」不会显示成「没装」。
 
@@ -65,7 +65,7 @@ Providers Hub 是第二个聚合渠道，认领顺序是专用连接器（`codea
 
 安装按钮调的是宿主的 `pluginManager.installBundle` —— 与插件市场、`dsh plugin add` 同一条路径。需要批准构建脚本时只回报待批准项，**不代批**。装好之后它们的模型会出现在「模型」页签里，排进路由分组即可参与失败切换。
 
-Providers Hub 的安装 spec 仍是 `dsh-codearts-auth`：这个包 0.2.0-rc.11 起在 npm 上改名为 `dsh-providers-hub`，旧名仍可安装，页签给的也是旧名（GitHub 地址指向上游 `iJetLi/dsh-providers-hub` 仓库），别按新名装。
+Providers Hub 的安装 spec 用插件市场里这条的包名 `dsh-providers-hub`（GitHub 地址指向上游 `iJetLi/dsh-providers-hub` 仓库；市场页给的是 GitHub 源命令，这里走 npm 同名包）。这个包 0.2.0-rc.11 起从 `dsh-codearts-auth` 改名，npm 上两个包名同发同版本；之前装过旧名的 profile 照样显示「已安装」，不用重装。
 
 安装 spec 一律用 npm 包名：`github:` 源要拉整个仓库的 tarball（Our Free Model 那份 83MB），pnpm 每次安装 profile 都会重拉一遍，GitHub 一慢就把插件市场的更新拖过 15 分钟上限。
 

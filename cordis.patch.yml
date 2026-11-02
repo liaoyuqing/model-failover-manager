@@ -61,14 +61,14 @@
 #
 # The fix is a per-plugin provider prefix — ofm- (dsh-our-free-model), ca-
 # (dsh-codearts), cw- (dsh-connect-workbuddy), ct- (dsh-connect-trae), cq-
-# (@dmh2002/dsh-connect-qoder), caa- (dsh-codearts-auth) — applied on the real
+# (@dmh2002/dsh-connect-qoder), caa- (dsh-providers-hub) — applied on the real
 # registry side by an llm facade inside a cordis isolate realm. It must be
 # deployed in $DSH_HOME's own cordis.patch.yml (the home layer applies last, so
 # it can isolate an entry this bundle does not own): one facade row plus one
 # isolate row per channel (22 rows in all — codearts-auth needs a wider isolate,
 # see below). See "门面部署" in README.md.
 #
-# The prefix alone does not make dsh-codearts-auth coexist with dsh-our-free-model:
+# The prefix alone does not make dsh-providers-hub coexist with dsh-our-free-model:
 # both also register the SAME cordis services (lobsteraiAuth, qoderAuth,
 # qodercnAuth, traeAuth, clineAuth, loomyAuth, raccoonAuth, minimaxAuth,
 # zcodeAuth, geminiAuth, accountPool) via super(ctx, `${product.id}Auth`), and
