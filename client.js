@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v27'
+    var VERSION = 'v28'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -1252,8 +1252,9 @@ window.__ModuleLoader__.load({
           ],
         },
         'codearts-auth': {
-          // 仓库是改名后的 dsh-providers-hub；安装 spec 仍走旧名 dsh-codearts-auth（宿主 FREE_CHANNELS）。
-          repo: 'https://github.com/zhuweiyou/dsh-providers-hub',
+          // 上游仓库是改名后的 dsh-providers-hub（zhuweiyou/dsh-providers-hub 是它的 fork）；
+          // 安装 spec 仍走旧名 dsh-codearts-auth（宿主 FREE_CHANNELS）。
+          repo: 'https://github.com/iJetLi/dsh-providers-hub',
           title: 'Providers Hub',
           tagline: '一个插件接入二十多家免费渠道的账号',
           facts: [

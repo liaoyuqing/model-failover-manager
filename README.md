@@ -243,7 +243,7 @@ Trae 与 Qoder 这两条是**专用连接器**，与 Our Free Model 内置的同
 
 Providers Hub 是**第二个聚合渠道**，认领顺序是专用连接器（`codearts` / `workbuddy` / `trae` / `qoder`）在前，然后聚合渠道按推荐表顺序认领——Our Free Model 先、Providers Hub 后，所以 Our Free Model 仍拿大头，Providers Hub 只拿没人认领的那些。它自己的 provider 正则不含 `codearts` 与 `workbuddy`，这两个裸名因此仍只算在各自的专用卡片上：装没装 Providers Hub 都不影响那两张卡上的「在线渠道」。而**它自己前缀下的 id（`caa-codearts`、`caa-buddy`…）无论正则怎么写都归它**——前缀本身就是归属声明，不需要靠在正则里再列一遍。
 
-Providers Hub 的安装 spec 仍是 `dsh-codearts-auth`：该包 0.2.0-rc.11 起在 npm 上改名为 `dsh-providers-hub`，旧名仍可安装，页签给的也是旧名（GitHub 地址指向改名后的 `dsh-providers-hub` 仓库）。别按新名装，页签里没有这条 spec。
+Providers Hub 的安装 spec 仍是 `dsh-codearts-auth`：该包 0.2.0-rc.11 起在 npm 上改名为 `dsh-providers-hub`，旧名仍可安装，页签给的也是旧名（GitHub 地址指向上游 `iJetLi/dsh-providers-hub` 仓库）。别按新名装，页签里没有这条 spec。
 
 已知不足：这一页只负责「装上」，登录、扫码、账号池这些各自的引导在它们自己的界面上。`Our Free Model` 的安装 spec 走 npm 包名——npm 上的版本比 GitHub 主干旧一些，但 GitHub 源要拉 83MB 的仓库 tarball，而且 pnpm 每次安装 profile 都会重拉一遍，GitHub 慢的时候整个插件市场的更新都会被拖过上限，所以这里不用它。想装最新 GitHub 版本就手动 `dsh plugin add github:Ebony-Vinyl/dsh-our-free-model`，但要清楚这个代价。
 

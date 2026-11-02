@@ -63,7 +63,7 @@ Trae and Qoder are dedicated connectors whose provider ids overlap with the ones
 
 The install button calls the host's `pluginManager.installBundle` — the same path as the plugin market and `dsh plugin add`. When a package needs its install scripts approved the tab reports the pending builds and never approves on your behalf. Installed channels show up in the Models tab and can join a routing group like any other model.
 
-Providers Hub installs under the spec `dsh-codearts-auth`: the package was renamed to `dsh-providers-hub` on npm from 0.2.0-rc.11 on, the old name still installs, and that is the spec the tab offers (its GitHub address points at the renamed `dsh-providers-hub` repository) — do not install it by the new name.
+Providers Hub installs under the spec `dsh-codearts-auth`: the package was renamed to `dsh-providers-hub` on npm from 0.2.0-rc.11 on, the old name still installs, and that is the spec the tab offers (its GitHub address points at the upstream `iJetLi/dsh-providers-hub` repository) — do not install it by the new name.
 
 Install specs are registry package names on purpose: a `github:` source pulls a whole-repository tarball (83 MB for Our Free Model) that pnpm re-fetches on every profile install, which is what drags the market's own updates past their timeout on a slow GitHub day.
 

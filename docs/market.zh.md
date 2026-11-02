@@ -65,7 +65,7 @@ Providers Hub 是第二个聚合渠道，认领顺序是专用连接器（`codea
 
 安装按钮调的是宿主的 `pluginManager.installBundle` —— 与插件市场、`dsh plugin add` 同一条路径。需要批准构建脚本时只回报待批准项，**不代批**。装好之后它们的模型会出现在「模型」页签里，排进路由分组即可参与失败切换。
 
-Providers Hub 的安装 spec 仍是 `dsh-codearts-auth`：这个包 0.2.0-rc.11 起在 npm 上改名为 `dsh-providers-hub`，旧名仍可安装，页签给的也是旧名（GitHub 地址指向改名后的 `dsh-providers-hub` 仓库），别按新名装。
+Providers Hub 的安装 spec 仍是 `dsh-codearts-auth`：这个包 0.2.0-rc.11 起在 npm 上改名为 `dsh-providers-hub`，旧名仍可安装，页签给的也是旧名（GitHub 地址指向上游 `iJetLi/dsh-providers-hub` 仓库），别按新名装。
 
 安装 spec 一律用 npm 包名：`github:` 源要拉整个仓库的 tarball（Our Free Model 那份 83MB），pnpm 每次安装 profile 都会重拉一遍，GitHub 一慢就把插件市场的更新拖过 15 分钟上限。
 

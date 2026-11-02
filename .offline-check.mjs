@@ -2428,8 +2428,8 @@ ok('㉞ 每个渠道给出 GitHub 仓库地址，并提供一键复制',
   && clientText.includes("repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-trae'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-qoder'")
-  // 第二个聚合渠道的仓库是改名后的 dsh-providers-hub（安装 spec 仍是旧名 dsh-codearts-auth）
-  && clientText.includes("repo: 'https://github.com/zhuweiyou/dsh-providers-hub'")
+  // 第二个聚合渠道的仓库是改名后的 dsh-providers-hub 上游（zhuweiyou/… 是 fork；安装 spec 仍是旧名 dsh-codearts-auth）
+  && clientText.includes("repo: 'https://github.com/iJetLi/dsh-providers-hub'")
   && clientText.includes('function copyText(')
   && clientText.includes("navigator.clipboard.writeText")
   && clientText.includes("'复制链接'"))
