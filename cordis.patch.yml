@@ -52,6 +52,42 @@
 # entries are kept by id, so a profile that also selected that bundle composes
 # two rows with this id and the loader mounts one entry from the later row —
 # never two retry instances that would each retry the same request.
+
+# Optional, and deliberately NOT enabled here: the six free-channel plugins all
+# register providers whose ids collide (qoder, qodercn, trae, cline, loomy,
+# raccoon, minimax, zcode, gemini, codearts, workbuddy, ...) and the host keeps
+# one adapter per provider, so whichever side registers last is either rejected
+# with DUPLICATE_ADAPTER or silently swallowed.
+#
+# The fix is a per-plugin provider prefix — ofm- (dsh-our-free-model), ca-
+# (dsh-codearts), cw- (dsh-connect-workbuddy), ct- (dsh-connect-trae), cq-
+# (@dmh2002/dsh-connect-qoder), caa- (dsh-codearts-auth) — applied on the real
+# registry side by an llm facade inside a cordis isolate realm. It must be
+# deployed in $DSH_HOME's own cordis.patch.yml (the home layer applies last, so
+# it can isolate an entry this bundle does not own): one facade row plus one
+# isolate row per channel (22 rows in all — codearts-auth needs a wider isolate,
+# see below). See "门面部署" in README.md.
+#
+# The prefix alone does not make dsh-codearts-auth coexist with dsh-our-free-model:
+# both also register the SAME cordis services (lobsteraiAuth, qoderAuth,
+# qodercnAuth, traeAuth, clineAuth, loomyAuth, raccoonAuth, minimaxAuth,
+# zcodeAuth, geminiAuth, accountPool) via super(ctx, `${product.id}Auth`), and
+# cordis provide throws on a duplicate service name, aborting the later plugin's
+# whole apply — its channel adapters never register and it vanishes from the
+# model tabs. codearts-auth's isolate therefore also lists those 11 names under
+# the same label. Recheck them after either side upgrades.
+#
+# Two rows must always share a label, and a facade entry must live in a package
+# directory with NO dsh.client declaration: client-modules merges bundles by
+# package name, so a second client bundle under the same name makes the host
+# fail to boot (that is what broke DSH last time). Adding the rows here would
+# point the facade at every profile — including ones without those channels —
+# and would collide with a home patch that already inserts the same entry ids.
+#
+# This plugin needs none of that to work: it converts between bare ids and
+# prefixed registry ids itself (provider-prefix.mjs), so a plugin without the
+# facade keeps registering bare ids and both views may coexist.
+
 - insert:
     - id: model-failover-manager
       name: 'model-failover-manager'

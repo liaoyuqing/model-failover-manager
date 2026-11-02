@@ -22,6 +22,17 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from './host.mjs'
+import { collectShimRegistrations } from './qoder-compress-shim.mjs'
+// provider 前缀换算（六个插件各一个前缀 + 裸 id 共存），见 provider-prefix.mjs 顶部
+import {
+  PROVIDER_PREFIXES,
+  providerIdentity,
+  bareProvider,
+  canonicalProvider,
+  providerEquals,
+  channelBare,
+  claimFreeChannels,
+} from './provider-prefix.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'mfm-offline-'))
 // 与宿主同一套判据：北京时间当前小时，造一个「此刻必然不在窗内」的时段
@@ -133,22 +144,22 @@ let selectModelCalls = 0
 /**
  * 假的 Our Free Model 账号池。
  *
- * 只对 'ofm-p' 报出两个可用账号——正是「池里有这个 provider 的账号」这一事实，
+ * 只对 'pool-p' 报出两个可用账号——正是「池里有这个 provider 的账号」这一事实，
  * 而 'codearts' 明明也有历史账号：插件必须靠 config.ofmHandoffExcludeProviders
  * 而不是账号存在性来判断是否换号。
  */
 const poolCalls = []
 const accountPool = {
   listAccountsByProvider(provider) {
-    if (provider !== 'ofm-p') return []
+    if (provider !== 'pool-p') return []
     return [
-      { id: 'ofm-p-1', provider, enabled: true },
-      { id: 'ofm-p-2', provider, enabled: true },
+      { id: 'pool-p-1', provider, enabled: true },
+      { id: 'pool-p-2', provider, enabled: true },
     ]
   },
   async getAvailableAccount(provider, model) {
     poolCalls.push(['getAvailableAccount', provider, model])
-    return { entry: { id: 'ofm-p-1' } }
+    return { entry: { id: 'pool-p-1' } }
   },
   async updateModelRateLimit(accountId, model, resetAt) {
     poolCalls.push(['updateModelRateLimit', accountId, model, resetAt])
@@ -507,12 +518,12 @@ agents.push(ofmAgent)
 await api('POST', '/session-group', { sessionId: 'ofm-1', groupId: 'g2', mode: 'route' })
 ofmAgent.status = 'running'
 const ofmAction = await errHandler(
-  { agent: ofmAgent, turn: 1, provider: 'ofm-p', failure: { code: 'QUOTA_EXCEEDED', message: '额度用尽', status: 403 } },
+  { agent: ofmAgent, turn: 1, provider: 'pool-p', failure: { code: 'QUOTA_EXCEEDED', message: '额度用尽', status: 403 } },
   () => Promise.resolve(undefined),
 )
 ofmAgent.status = 'idle'
 ok('⑩ 名单外的 provider 仍先换账号重试（非限流失败也写冷却标记）',
-  ofmAction?.kind === 'retry' && poolCalls.some(c => c[0] === 'updateModelRateLimit' && c[1] === 'ofm-p-1'),
+  ofmAction?.kind === 'retry' && poolCalls.some(c => c[0] === 'updateModelRateLimit' && c[1] === 'pool-p-1'),
   JSON.stringify({ action: ofmAction, calls: poolCalls }))
 ok('⑩ /status 回传生效的排除名单',
   JSON.stringify((await api('GET', '/status')).body.ofmHandoffExcludeProviders) === JSON.stringify(['codearts']))
@@ -522,8 +533,13 @@ let restartCalls = 0
 let codeartsRegistered = true
 /** 假的 /api/codearts/status 应答；每个用例改写它 */
 let codeartsStatus = { usage: { slots: [] } }
+let providersHubRestarts = 0
 const fakeLoader = {
   *entries() {
+    // Providers Hub 的名字以 dsh-codearts 开头，且排在前面：旧实现用
+    // includes('dsh-codearts') 匹配会先命中它，把「重建账号池」打在错误的实例上
+    // （真正的 codearts 池仍是死的）。现在按包名精确匹配，命中的是 llm-codearts。
+    yield { options: { id: 'codearts-auth', name: 'dsh-codearts-auth' }, fiber: { uid: 6, async restart() { providersHubRestarts += 1 } } }
     yield { options: { id: 'llm-codearts', name: 'dsh-codearts' }, fiber: { uid: 7, async restart() { restartCalls += 1 } } }
     yield { options: { id: 'other', name: 'some-other-plugin' }, fiber: { uid: 8, async restart() { throw new Error('不该重启这个') } } }
   },
@@ -548,12 +564,12 @@ const poolEmptyMsg = 'codearts 当前没有可用账号（全部被禁用或冷�
 await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
 
 /** 跑一次 codearts 失败，返回插件给宿主的动作 */
-async function failOnCodearts(sessionId, failure) {
+async function failOnCodearts(sessionId, failure, provider = 'codearts') {
   const a = makeAgent(sessionId, {}, 'm1')
   agents.push(a)
   await api('POST', '/session-group', { sessionId, groupId: 'g2', mode: 'route' })
   a.status = 'running'
-  const act = await errHandler({ agent: a, turn: 1, provider: 'codearts', failure }, () => Promise.resolve(undefined))
+  const act = await errHandler({ agent: a, turn: 1, provider, failure }, () => Promise.resolve(undefined))
   a.status = 'idle'
   return act
 }
@@ -691,6 +707,55 @@ await api('POST', '/failed/reset', {})
 ok('⑫b 手动解除并发冷却后回到候选',
   (await api('GET', '/status')).body.capacityCooldowns.every(c => c.key !== 'codearts/m1'))
 await api('POST', '/failed/reset', { provider: 'p', model: 'm1' })
+
+// ── ㊶ 归属看前缀、记账看裸名：同名的两条路由不能被认成同一个插件 ──────────
+// 六前缀之后，同一个裸名会有多个插件的路由（ofm-qoder 与 caa-qoder）。失败处置里
+// 有两处按「归属」分流，必须看前缀：
+//   · codearts 账号池自愈（重启 dsh-codearts 条目）只属于 ca- 与裸 codearts；
+//     caa-codearts 是 Providers Hub 的路由，重启 dsh-codearts 救不了它。
+//   · Our Free Model 的换号只属于 ofm- 与裸 id；ca-/caa- 的账号由各自的插件管。
+// 之前这里把 provider 先剥成裸名再判归属，前缀信息全丢，两条判据都退化成「按裸名
+// 猜」——caa-codearts 会被当成 dsh-codearts 的池故障，去重启一个无关的实例。
+await api('POST', '/failed/reset', {})
+await api('POST', '/capacity/reset', {})
+restartCalls = 0
+providersHubRestarts = 0
+// 池子读得到「账号被停用」，所以 codearts 分支会真的走重建分支
+codeartsStatus = { usage: { slots: [
+  { id: 'a1', state: 'disabled', detail: 'upstream 401' },
+] } }
+// Providers Hub 的路由（caa-codearts）失败：不该去重启 dsh-codearts 的条目
+const caaAction = await failOnCodearts('caa-pool-1', { code: 'RATE_LIMIT', status: 429, message: poolEmptyMsg }, 'caa-codearts')
+const caaOutcome = (await lastLogFor('caa-pool-1'))?.outcome
+ok('㊶ caa-codearts 的失败不进 dsh-codearts 的自愈分支（那是别人的账号池）',
+  !String(caaOutcome ?? '').startsWith('codearts-'),
+  `outcome=${caaOutcome}`)
+ok('㊶ caa-codearts 的失败不重启任何条目（既不 dsh-codearts 也不 Providers Hub）',
+  restartCalls === 0 && providersHubRestarts === 0,
+  `restartCalls=${restartCalls} providersHubRestarts=${providersHubRestarts}`)
+ok('㊶ caa-codearts 的失败落进分组路由，不返回 retry（重试对 Providers Hub 无意义）',
+  caaAction?.kind !== 'retry', JSON.stringify(caaAction))
+
+// 同一个名字、同一句话，但属于 dsh-codearts 自己（ca-codearts）：照旧走自愈分支
+// （自愈本身有没有重启条目取决于 30s 冷却，这里只守「进了哪条分支」）
+const caPrefixedAction = await failOnCodearts('ca-pool-1', { code: 'RATE_LIMIT', status: 429, message: poolEmptyMsg }, 'ca-codearts')
+const caOutcome = (await lastLogFor('ca-pool-1'))?.outcome
+ok('㊶ ca-codearts 的失败照旧进 dsh-codearts 的自愈分支（与裸 codearts 同一条路径）',
+  String(caOutcome ?? '').startsWith('codearts-'),
+  `outcome=${caOutcome}`)
+ok('㊶ 自愈只重启 dsh-codearts，绝不重启 Providers Hub（按包名精确匹配）',
+  providersHubRestarts === 0, `providersHubRestarts=${providersHubRestarts}`)
+
+// 换号只属于 Our Free Model：caa- 前缀的路由不走 OFM 的账号池。
+// 用 'caa-pool-p'（裸名 pool-p，池里真有两个可用账号）做这个用例：裸名不在排除名单里，
+// 所以只要前缀被提前剥掉，它就会真的换号——这条断言因此能抓住「剥前缀后判归属」。
+const poolCallsBefore = poolCalls.length
+const caaHandoffAction = await failOnCodearts('caa-handoff-1', { code: 'QUOTA_EXCEEDED', message: '额度用尽', status: 403 }, 'caa-pool-p')
+ok('㊶ caa- 路由的失败不触发 Our Free Model 的换号（账号不归它管）',
+  poolCalls.length === poolCallsBefore && caaHandoffAction?.kind !== 'retry',
+  JSON.stringify({ action: caaHandoffAction, calls: poolCalls.slice(poolCallsBefore) }))
+await api('POST', '/failed/reset', {})
+await api('POST', '/capacity/reset', {})
 
 // ⑬ 模型并发上限：按模型（全局）配置生效，且 llm/stream 闸门按它判满并当场交给路由换模型。
 await api('POST', '/failed/reset', { provider: 'codearts', model: 'm1' })
@@ -1425,6 +1490,179 @@ ok('㉗ 单模型结果与整组同一份字段（首字/速度/token 都在）�
     legacyRow !== undefined && legacyRow.cacheReadTokens === 0 && legacyRow.cacheWriteTokens === 0,
     JSON.stringify(legacyRow && { r: legacyRow.cacheReadTokens, w: legacyRow.cacheWriteTokens }))
 
+// ── ㊾ 记账键统一：看板行、采样桶、并发闸门按同一个「渠道裸 id + 模型」 ─────────
+//     闸门与采样一直按裸 id 记（ofm-qoder → qoder），而 /metrics 旧版按分组条目原文
+//     取键。装了前缀门面之后条目是 ofm-trae 这种，于是看板对这些行永远显示 0 次采样、
+//     无首字/速度、inflight 恒为 0，并发上限也形同虚设。这一段把两个方向都钉住。
+{
+  // 让假 llm 的 stream 走真实链路（宿主里 llm.stream 就是 llm/stream 瀑布）：
+  // 只有这样测速的那次往返才会经过闸门与采样，否则测的是一条不记账的旁路。
+  const getBeforeProbeBlock = ctx.get
+  const llmThroughGate = (name) => {
+    const svc = getBeforeProbeBlock(name)
+    if (name === 'llm') return Object.assign({}, svc, { stream: (options) => streamHandler(options, () => probeStream()) })
+    return svc
+  }
+
+  // (a) 条目带前缀、调用也带前缀 → 落在同一行（旧版这里会是 0）
+  // 用独立分组 id：⑫b 的 gk 还留在 groups 里，重名会让 POST /groups 多推一条同名分组，
+  // 后面按 id 取那条时读到的是先加入的那条（分组条目完全不同）。
+  await api('POST', '/groups', { id: 'gmf1', name: 'GMF1', models: [
+    { provider: 'ofm-pk', model: 'mk1', priority: 1 },
+  ] })
+  await api('POST', '/model-concurrency', { provider: 'ofm-pk', model: 'mk1', concurrency: 1 })
+  {
+    const s = await streamHandler({ provider: 'ofm-pk', model: 'mk1', messages: [] }, () => fakeStream())
+    for await (const _c of s) { /* 消费完整个流，触发采样 */ }
+  }
+  const prefixedRow = (await api('GET', '/metrics')).body.rows.find(r => r.model === 'mk1')
+  ok('㊾ 条目与调用都是注册表 id（ofm-pk）：采样落在这一行上',
+    prefixedRow !== undefined && prefixedRow.samples === 1 && prefixedRow.okSamples === 1
+    && typeof prefixedRow.ttftP50 === 'number',
+    JSON.stringify(prefixedRow && { s: prefixedRow.samples, t: prefixedRow.ttftP50 }))
+  ok('㊾ 并发上限按裸名记进表里（ofm-pk 写进去，键是 pk/mk1）',
+    (await api('GET', '/status')).body.modelConcurrency['pk/mk1'] === 1
+    && (await api('GET', '/status')).body.groups.find(g => g.id === 'gmf1').models[0].concurrency === 1,
+    JSON.stringify((await api('GET', '/status')).body.modelConcurrency))
+
+  // (b) 条目写裸名、调用用带前缀的 id → 仍是同一行（反向方向）
+  await api('POST', '/groups', { id: 'gmf2', name: 'GMF2', models: [
+    { provider: 'pk', model: 'mk2', priority: 1 },
+  ] })
+  {
+    const s = await streamHandler({ provider: 'ofm-pk', model: 'mk2', messages: [] }, () => fakeStream())
+    for await (const _c of s) { /* 同上 */ }
+  }
+  const bareRow = (await api('GET', '/metrics')).body.rows.find(r => r.model === 'mk2')
+  ok('㊾ 条目写裸 pk、调用用 ofm-pk：采样照样落在裸名那一行（记账键按裸 id）',
+    bareRow !== undefined && bareRow.samples === 1 && bareRow.provider === 'pk',
+    JSON.stringify(bareRow && { s: bareRow.samples, p: bareRow.provider }))
+
+  // (c) 一行 = 一个渠道 + 一个模型：两个分组各挂同一条也只出一行，并列出两个分组
+  await api('POST', '/groups', { id: 'gdup1', name: 'GDUP1', models: [
+    { provider: 'ofm-pd', model: 'md1', priority: 1 },
+  ] })
+  await api('POST', '/groups', { id: 'gdup2', name: 'GDUP2', models: [
+    { provider: 'pd', model: 'md1', priority: 1 },
+  ] })
+  const dupRows = (await api('GET', '/metrics')).body.rows.filter(r => r.model === 'md1')
+  ok('㊾ 同渠道同模型挂在两个分组（一个带前缀一个裸名）只出一行',
+    dupRows.length === 1, 'rows=' + JSON.stringify(dupRows.map(r => r.provider)))
+  ok('㊾ 这一行带 groupNames / groups：界面据此显示「它属于哪几个分组」',
+    Array.isArray(dupRows[0]?.groupNames) && dupRows[0].groupNames.length === 2
+    && dupRows[0].groupNames.includes('GDUP1') && dupRows[0].groupNames.includes('GDUP2')
+    && Array.isArray(dupRows[0]?.groups) && dupRows[0].groups.length === 2,
+    JSON.stringify(dupRows[0] && { names: dupRows[0].groupNames, groups: dupRows[0].groups }))
+
+  // (d) 测速也进采样，且带 probe 标记（界面据此说明「历史列里有 N 次是测速打出来的」）
+  ctx.get = llmThroughGate
+  const beforeProbeRow = (await api('GET', '/metrics')).body.rows.find(r => r.model === 'mk1')
+  const probeStarted = await api('POST', '/speedtest', { models: [{ provider: 'ofm-pk', model: 'mk1' }] })
+  const probeFinished = await waitNotRunning()
+  ctx.get = getBeforeProbeBlock
+  ok('㊾ 测速结果带实际命中的路由 route（界面据此显示「测的是哪条路由」）',
+    probeStarted.status === 200 && probeFinished.results?.[0]?.route === 'ofm-pk',
+    JSON.stringify(probeFinished.results?.[0] && { route: probeFinished.results[0].route, ok: probeFinished.results[0].ok }))
+  const afterProbeRow = (await api('GET', '/metrics')).body.rows.find(r => r.model === 'mk1')
+  ok('㊾ 测速的一次往返计入首字/速度统计（samples 比之前多 1）',
+    afterProbeRow?.samples === (beforeProbeRow?.samples ?? 0) + 1,
+    `before=${beforeProbeRow?.samples} after=${afterProbeRow?.samples}`)
+  ok('㊾ /metrics 行带 probeSamples：界面能说清「其中几样本是测速」',
+    afterProbeRow?.probeSamples === (beforeProbeRow?.probeSamples ?? 0) + 1,
+    JSON.stringify({ p: afterProbeRow?.probeSamples }))
+  await new Promise(r => setTimeout(r, 1800))
+  ok('㊾ 测速样本落盘时带 probe 标记（老样本没有该字段 = 不是测速）', (() => {
+    const saved = JSON.parse(readFileSync(metricsPath, 'utf8'))
+    const list = saved['pk/mk1'] ?? []
+    return list.filter(s => s.probe === true).length === 1
+  })(), 'ok')
+
+  // (e) 测速不被并发闸门拦截：并发 1 且已被占满时，测速仍要成功
+  //     （一个正被会话打满的模型恰恰是用户最想确认的那一个）
+  const holdGate = Promise.withResolvers()
+  const holdIter = await streamHandler({ provider: 'ofm-pk', model: 'mk1', messages: [] }, () => fakeStream(holdGate.promise))
+  const holdTask = (async () => { for await (const _c of holdIter) { /* 占着槽位不结束 */ } })()
+  await new Promise(r => setTimeout(r, 30))
+  ok('㊾ 先占满并发槽位（模拟会话把这个模型打满）',
+    (await api('GET', '/status')).body.groups.find(g => g.id === 'gmf1').models[0].inflight === 1,
+    JSON.stringify((await api('GET', '/status')).body.groups.find(g => g.id === 'gmf1').models[0]))
+  ctx.get = llmThroughGate
+  const probeUnderFull = await api('POST', '/speedtest', { models: [{ provider: 'ofm-pk', model: 'mk1' }] })
+  const probeUnderFullDone = await waitNotRunning()
+  ctx.get = getBeforeProbeBlock
+  ok('㊾ 并发已满时测速仍然成功（闸门对测速放行，不判 CAPACITY_TIMEOUT）',
+    probeUnderFull.status === 200 && probeUnderFullDone.results?.[0]?.ok === true,
+    JSON.stringify(probeUnderFullDone.results?.[0] && {
+      ok: probeUnderFullDone.results[0].ok, code: probeUnderFullDone.results[0].errorCode,
+    }))
+  holdGate.resolve()
+  await holdTask
+  await api('POST', '/model-concurrency', { provider: 'ofm-pk', model: 'mk1', concurrency: null })
+
+  // (f) 旧 metrics.json 的带前缀桶在启动时并进裸名桶（只迁一次，按 at 升序）
+  const savedNow = JSON.parse(readFileSync(metricsPath, 'utf8'))
+  savedNow['ofm-pmig/mig1'] = [
+    { ttftMs: 100, inTokens: 1, outTokens: 1, speedTps: 10, waitMs: 0, ok: true, errorCode: null, errorMessage: null, at: 1 },
+    { ttftMs: 200, inTokens: 2, outTokens: 2, speedTps: 20, waitMs: 0, ok: true, errorCode: null, errorMessage: null, at: 2 },
+  ]
+  savedNow['pmig/mig1'] = [
+    { ttftMs: 300, inTokens: 3, outTokens: 3, speedTps: 30, waitMs: 0, ok: true, errorCode: null, errorMessage: null, at: 3 },
+  ]
+  writeFileSync(metricsPath, JSON.stringify(savedNow), 'utf8')
+  // 迁移用例的分组必须真的在 groups 里，否则 /metrics 根本不会列出这一行
+  // （它只列分组里出现过的模型）。先建好，用完一起删。
+  await api('POST', '/groups', { id: 'gmig', name: 'GMIG', models: [
+    { provider: 'pmig', model: 'mig1', priority: 1 },
+  ] })
+  const mountAgain = () => {
+    const c = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
+    let handler = null
+    c.get = getBeforeProbeBlock
+    c.on = ctx.on
+    c.inject = (_n, cb) => cb({
+      webServer: { register(spec) { handler = spec.handler; return () => {} } },
+      effect() {}, interval() { return () => {} },
+    })
+    applyTwice(c, { dataDir: dir })
+    return handler
+  }
+  const readMetricsWith = async (handler) => {
+    const res = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
+    const req = new EventEmitter()
+    req.method = 'GET'; req.url = '/api/model-failover/metrics'
+    handler(req, res)
+    req.emit('end')
+    await new Promise(r => setTimeout(r, 30))
+    return JSON.parse(res.body || '{}').rows ?? []
+  }
+  const migratedRows = await readMetricsWith(mountAgain())
+  const migratedRow = migratedRows.find(r => r.model === 'mig1')
+  ok('㊾ 旧前缀桶 ofm-pmig/mig1 启动时并进裸名桶（样本数 = 两个桶之和）',
+    migratedRow?.samples === 3, JSON.stringify({ row: migratedRow && { s: migratedRow.samples }, rows: migratedRows.filter(r => r.model === 'mig1').map(r => r.provider + '/' + r.model + '=' + r.samples) }))
+  // 等落盘（防抖 1.5s）后再看文件：迁移结果必须写回去，否则下次启动又要重做
+  await new Promise(r => setTimeout(r, 1800))
+  ok('㊾ 合并后按 at 升序（最近一次失败与分位数都按顺序取，顺序错了会读到更早的样本）', (() => {
+    const list = JSON.parse(readFileSync(metricsPath, 'utf8'))['pmig/mig1'] ?? []
+    return list.length >= 3 && list.every((s, i) => i === 0 || s.at >= list[i - 1].at)
+  })(), 'ok')
+  ok('㊾ 迁移后文件里不再留带前缀的旧键（否则同一模型会被记两遍）', (() => {
+    const saved = JSON.parse(readFileSync(metricsPath, 'utf8'))
+    return !Object.keys(saved).some(k => k.startsWith('ofm-') && k.endsWith('/mig1'))
+  })(), 'ok')
+  // 再挂一次：合并幂等，同一份历史不会越迁越多
+  const migratedAgain = (await readMetricsWith(mountAgain())).find(r => r.model === 'mig1')
+  ok('㊾ 再次启动不重复合并（同一份历史不会越迁越多）',
+    migratedAgain?.samples === 3, JSON.stringify(migratedAgain && { s: migratedAgain.samples }))
+
+  await api('DELETE', '/groups/gmf1')
+  await api('DELETE', '/groups/gmf2')
+  await api('DELETE', '/groups/gdup1')
+  await api('DELETE', '/groups/gdup2')
+  await api('DELETE', '/groups/gmig')
+  await api('POST', '/failed/reset', {})
+  await api('POST', '/capacity/reset', {})
+}
+
 ctx.get = baseGet
 globalThis.fetch = baseFetch
 
@@ -1855,11 +2093,11 @@ llmStub = { listProviders: () => [{ id: 'codearts' }, { id: 'qoder' }, { id: 'un
 
 const fc = (await api('GET', '/free-channels')).body
 const chOf = (id) => fc.channels.find(c => c.id === id) || {}
-ok('㉞ GET /free-channels 回五个推荐渠道：装没装读 profile 依赖，在线渠道读 llm 注册表',
+ok('㉞ GET /free-channels 回六个推荐渠道：装没装读 profile 依赖，在线渠道读 llm 注册表',
   fc.managerAvailable === true
-  && fc.channels.length === 5
-  // 卡片顺序 = FREE_CHANNELS 顺序，Our Free Model 排第一；认领顺序另算（它仍最后认领）
-  && fc.channels.map(c => c.id).join(',') === 'our-free-model,codearts,workbuddy,trae,qoder'
+  && fc.channels.length === 6
+  // 卡片顺序 = FREE_CHANNELS 顺序，Our Free Model 排第一；认领顺序另算（聚合渠道最后认领）
+  && fc.channels.map(c => c.id).join(',') === 'our-free-model,codearts,workbuddy,trae,qoder,codearts-auth'
   && fc.channels.every(c => typeof c.pkg === 'string' && typeof c.spec === 'string')
   // 安装 spec 必须是 npm 包名：github: / git+ 源会拉 codeload tarball，pnpm 每次安装
   // profile 都重拉一遍（不支持 Range），GitHub 慢时会把插件市场的更新拖过超时。
@@ -1869,11 +2107,17 @@ ok('㉞ GET /free-channels 回五个推荐渠道：装没装读 profile 依赖�
   && chOf('workbuddy').installed === true && chOf('workbuddy').version === '5.16.0'
   && chOf('codearts').installed === false && chOf('codearts').version === null
   && chOf('trae').installed === false && chOf('qoder').installed === false
+  // 第二个聚合渠道仍用旧包名 dsh-codearts-auth（改名后的 dsh-providers-hub 同发同版本）
+  && chOf('codearts-auth').pkg === 'dsh-codearts-auth' && chOf('codearts-auth').spec === 'dsh-codearts-auth'
+  && chOf('codearts-auth').installed === false && chOf('codearts-auth').version === null
   && JSON.stringify(chOf('codearts').providers) === '["codearts"]'
   // trae / qoder 的专用连接器没装，同名 provider 归聚合渠道（否则聚合卡片会显示「无在线渠道」）
   && JSON.stringify(chOf('trae').providers) === '[]'
   && JSON.stringify(chOf('qoder').providers) === '[]'
-  && JSON.stringify(chOf('our-free-model').providers) === '["qoder"]',
+  && JSON.stringify(chOf('our-free-model').providers) === '["qoder"]'
+  // 它的正则刻意不含 codearts / workbuddy：那两个 id 由各自的专用卡片认领，重复计数会让
+  // 同一路由在两张卡片上各算一次。此刻注册表里也没有它的渠道 id，所以是空数组。
+  && JSON.stringify(chOf('codearts-auth').providers) === '[]',
   JSON.stringify(fc))
 
 const inst = await api('POST', '/free-channels/install', { id: 'codearts' })
@@ -1899,12 +2143,17 @@ managerStub = {
     { name: 'dsh-connect-trae', version: '4.6.12' },
     { name: '@dmh2002/dsh-connect-qoder', version: '1.16.4' },
     { name: 'dsh-our-free-model', version: '2.0.0' },
+    { name: 'dsh-codearts-auth', version: '2.12.261101' },
   ],
   async listBundles() { return this.bundles },
   async installBundle() { return { applied: true } },
 }
 llmStub = {
-  listProviders: () => [{ id: 'trae' }, { id: 'trae-global' }, { id: 'qoder' }, { id: 'qoder-global' }, { id: 'qodercn' }],
+  listProviders: () => [
+    { id: 'trae' }, { id: 'trae-global' }, { id: 'qoder' }, { id: 'qoder-global' }, { id: 'qodercn' },
+    // 第二个聚合渠道独有的渠道 id（专用连接器与 Our Free Model 都不认领这些）
+    { id: 'buddy' }, { id: 'magicrew' },
+  ],
 }
 const fcOwned = (await api('GET', '/free-channels')).body
 const ownOf = (id) => fcOwned.channels.find(c => c.id === id) || {}
@@ -1914,7 +2163,10 @@ ok('㉞ trae / qoder 装了就归专用连接器，聚合渠道只列剩下的�
   && ownOf('our-free-model').installed === true
   && JSON.stringify(ownOf('trae').providers) === '["trae","trae-global"]'
   && JSON.stringify(ownOf('qoder').providers) === '["qoder","qoder-global"]'
-  && JSON.stringify(ownOf('our-free-model').providers) === '["qodercn"]',
+  && JSON.stringify(ownOf('our-free-model').providers) === '["qodercn"]'
+  // 两个聚合渠道都装了：Our Free Model 排在推荐表前面，先认领；Providers Hub 只拿它剩下的
+  && ownOf('codearts-auth').installed === true && ownOf('codearts-auth').version === '2.12.261101'
+  && JSON.stringify(ownOf('codearts-auth').providers) === '["buddy","magicrew"]',
   JSON.stringify(fcOwned))
 
 managerStub = undefined
@@ -1923,6 +2175,237 @@ const fcNoManager = (await api('GET', '/free-channels')).body
 ok('㉞ 取不到插件管理服务时 installed 回 null（界面显示「状态未检测」，不谎报未安装）',
   fcNoManager.managerAvailable === false && fcNoManager.channels.every(c => c.installed === null),
   JSON.stringify(fcNoManager))
+
+// ── ㊴ provider 前缀：六插件各一前缀 + 裸 id 共存 ───────────────────────────
+// 六个免费渠道插件用同名 provider（qoder、trae、codearts…），宿主每个 id 只允许一个
+// adapter。方案是每个插件一个前缀（ofm- / ca- / cw- / ct- / cq- / caa-），由 llm 门面
+// 加在**真实注册表**侧，插件自身代码不改。本段把 provider-prefix.mjs 的纯函数逐条钉住：
+// 身份拆分、等价判断（裸配置兼容 / 不同插件不等价）、认领用的 channelBare、认领算法。
+// 第 ⑯ 条起是「接入宿主后」的行为：前缀解析顺序、失败键按裸名、分组条目按 providerEquals。
+const PREFIX_CHANNELS = [
+  { id: 'our-free-model', pkg: 'dsh-our-free-model', prefix: 'ofm-', aggregator: true, providers: /^(qoder|qodercn|trae|cline|lobster|loomy|raccoon|minimax|zcode|gemini|eac|our-free)/i },
+  { id: 'codearts', pkg: 'dsh-codearts', prefix: 'ca-', providers: /^codearts/i },
+  { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', prefix: 'cw-', providers: /^workbuddy/i },
+  { id: 'trae', pkg: 'dsh-connect-trae', prefix: 'ct-', providers: /^(trae|trae-enterprise|trae-global)$/i },
+  { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', prefix: 'cq-', providers: /^(qoder|qoder-global)$/i },
+  { id: 'codearts-auth', pkg: 'dsh-codearts-auth', prefix: 'caa-', aggregator: true, providers: /^(buddy|opencode|officeace|accio|astudio|autoclaw|autoclawintl|modelscope|qiniu|codely|magicrew)$/i },
+]
+/** 跑一遍认领，返回 { channelId: providers[] } 的 JSON（断言里直接比字符串） */
+const claims = (ids, isInstalled = () => false) => JSON.stringify(
+  Object.fromEntries(claimFreeChannels({ channels: PREFIX_CHANNELS, providerIds: ids, isInstalled })))
+
+ok('㊴ PROVIDER_PREFIXES 是六个插件前缀，顺序 = 免费渠道卡片顺序（ofm- 在 ca- 之前）',
+  Object.isFrozen(PROVIDER_PREFIXES)
+  && JSON.stringify(PROVIDER_PREFIXES) === '["ofm-","ca-","cw-","ct-","cq-","caa-"]',
+  JSON.stringify(PROVIDER_PREFIXES))
+
+// host.mjs 的 FREE_CHANNELS 必须与它同序同值：两边各改一半会让认领与解析走岔
+const hostSourceForPrefixes = readFileSync(new URL('./host.mjs', import.meta.url), 'utf8')
+const declaredPrefixes = [...hostSourceForPrefixes.matchAll(/prefix: '(ofm-|ca-|cw-|ct-|cq-|caa-)'/g)].map(m => m[1])
+ok('㊴ host.mjs 的 FREE_CHANNELS 六条各带 prefix，顺序与 PROVIDER_PREFIXES 一致',
+  JSON.stringify(declaredPrefixes) === JSON.stringify([...PROVIDER_PREFIXES]),
+  JSON.stringify(declaredPrefixes))
+
+ok('㊴ providerIdentity 拆出前缀与裸名（ofm-qoder / caa-codearts / ca-codearts）',
+  JSON.stringify(providerIdentity('ofm-qoder')) === '{"prefix":"ofm-","bare":"qoder"}'
+  && JSON.stringify(providerIdentity('caa-codearts')) === '{"prefix":"caa-","bare":"codearts"}'
+  // ca- 不是 caa- 的前缀：caa-codearts 必须落在 caa- 上，不能落成 ca- + 'a-codearts'
+  && JSON.stringify(providerIdentity('ca-codearts')) === '{"prefix":"ca-","bare":"codearts"}',
+  JSON.stringify([providerIdentity('ofm-qoder'), providerIdentity('caa-codearts'), providerIdentity('ca-codearts')]))
+
+ok('㊴ providerIdentity 对未打门面的裸 id、空串、null 都给空前缀',
+  JSON.stringify(providerIdentity('codearts')) === '{"prefix":"","bare":"codearts"}'
+  && JSON.stringify(providerIdentity('qoder')) === '{"prefix":"","bare":"qoder"}'
+  && JSON.stringify(providerIdentity('')) === '{"prefix":"","bare":""}'
+  && JSON.stringify(providerIdentity(null)) === '{"prefix":"","bare":""}',
+  JSON.stringify([providerIdentity('codearts'), providerIdentity('qoder'), providerIdentity(''), providerIdentity(null)]))
+
+ok('㊴ bareProvider 剥一次前缀，未命中前缀的 id 原样返回',
+  bareProvider('ofm-qoder') === 'qoder' && bareProvider('caa-codearts') === 'codearts'
+  && bareProvider('cq-qodercn') === 'qodercn' && bareProvider('qoder') === 'qoder'
+  && bareProvider('') === '',
+  JSON.stringify(['ofm-qoder', 'caa-codearts', 'cq-qodercn', 'qoder'].map(bareProvider)))
+
+ok('㊴ canonicalProvider 保留前缀（同一插件的路由各算一份），裸 id 也原样',
+  canonicalProvider('ofm-qoder') === 'ofm-qoder'
+  && canonicalProvider('caa-codearts') === 'caa-codearts'
+  && canonicalProvider('qoder') === 'qoder',
+  JSON.stringify(['ofm-qoder', 'caa-codearts', 'qoder'].map(canonicalProvider)))
+
+ok('㊴ providerEquals：裸配置能对上自己的前缀（groups.json 写裸 codearts 也能命中 ca-codearts）',
+  providerEquals('codearts', 'ca-codearts') === true
+  && providerEquals('ca-codearts', 'codearts') === true
+  && providerEquals('qoder', 'ofm-qoder') === true,
+  JSON.stringify([providerEquals('codearts', 'ca-codearts'), providerEquals('qoder', 'ofm-qoder')]))
+
+ok('㊴ providerEquals：不同插件的前缀互不等价（ca-codearts ≠ caa-codearts，ofm-qoder ≠ caa-qoder）',
+  providerEquals('ca-codearts', 'caa-codearts') === false
+  && providerEquals('ofm-qoder', 'caa-qoder') === false
+  && providerEquals('qoder', 'qoder-global') === false,
+  JSON.stringify([providerEquals('ca-codearts', 'caa-codearts'), providerEquals('ofm-qoder', 'caa-qoder'), providerEquals('qoder', 'qoder-global')]))
+
+ok('㊴ channelBare：别的插件前缀下的 id 一律不算本渠道（ca- 看到 caa-codearts 返回 null）',
+  channelBare('ca-', 'caa-codearts') === null
+  && channelBare('caa-', 'ca-codearts') === null,
+  JSON.stringify([channelBare('ca-', 'caa-codearts'), channelBare('caa-', 'ca-codearts')]))
+
+ok('㊴ channelBare：裸 id 对任何渠道都可见，本渠道前缀下的 id 剥成裸名',
+  channelBare('ofm-', 'qoder') === 'qoder'
+  && channelBare('cq-', 'qoder') === 'qoder'
+  && channelBare('caa-', 'caa-codearts') === 'codearts',
+  JSON.stringify([channelBare('ofm-', 'qoder'), channelBare('cq-', 'qoder'), channelBare('caa-', 'caa-codearts')]))
+
+// (a) 全裸 id 的旧世界：认领结果必须与加前缀之前完全一致
+ok('㊴ claimFreeChannels (a) 全裸 id：Our Free Model 吃九个渠道、codearts / workbuddy 各归各卡',
+  claims(['qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'codearts', 'workbuddy', 'workbuddy-global'])
+  === JSON.stringify({
+    'our-free-model': ['qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini'],
+    codearts: ['codearts'], workbuddy: ['workbuddy', 'workbuddy-global'],
+    trae: [], qoder: [], 'codearts-auth': [],
+  }),
+  claims(['qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'codearts', 'workbuddy', 'workbuddy-global']))
+
+// (b) 全前缀视图：归属由前缀决定，caa-codearts 归 Providers Hub 而不是 dsh-codearts
+ok('㊴ claimFreeChannels (b) 全前缀视图：ca-codearts 归 codearts 卡，caa-* 归 codearts-auth 卡',
+  claims(['ofm-qoder', 'ofm-trae', 'ca-codearts', 'cw-workbuddy', 'caa-codearts', 'caa-buddy', 'caa-opencode'])
+  === JSON.stringify({
+    'our-free-model': ['ofm-qoder', 'ofm-trae'], codearts: ['ca-codearts'], workbuddy: ['cw-workbuddy'],
+    trae: [], qoder: [], 'codearts-auth': ['caa-codearts', 'caa-buddy', 'caa-opencode'],
+  }),
+  claims(['ofm-qoder', 'ofm-trae', 'ca-codearts', 'cw-workbuddy', 'caa-codearts', 'caa-buddy', 'caa-opencode']))
+
+// (c) 混合视图：门面只覆盖了 Our Free Model，trae 还是裸 id
+ok('㊴ claimFreeChannels (c) 混合视图（ofm-qoder + 裸 trae）两条都归 Our Free Model',
+  claims(['ofm-qoder', 'trae']) === JSON.stringify({
+    'our-free-model': ['ofm-qoder', 'trae'], codearts: [], workbuddy: [], trae: [], qoder: [], 'codearts-auth': [],
+  }),
+  claims(['ofm-qoder', 'trae']))
+
+// (d) 撞号：专用连接器装了就自己认领 ct-trae，没装就让给 Our Free Model
+ok('㊴ claimFreeChannels (d) 专用连接器装了：ct-trae 归 trae 卡，Our Free Model 不重复计数',
+  claims(['ct-trae'], pkg => pkg === 'dsh-connect-trae') === JSON.stringify({
+    'our-free-model': [], codearts: [], workbuddy: [], trae: ['ct-trae'], qoder: [], 'codearts-auth': [],
+  }),
+  claims(['ct-trae'], pkg => pkg === 'dsh-connect-trae'))
+ok('㊴ claimFreeChannels (d) 专用连接器没装：同一条 ct-trae 让给 Our Free Model（否则两张卡都没有它）',
+  claims(['ct-trae'], () => false) === JSON.stringify({
+    'our-free-model': ['ct-trae'], codearts: [], workbuddy: [], trae: [], qoder: [], 'codearts-auth': [],
+  }),
+  claims(['ct-trae'], () => false))
+
+// (e) 装没装未知（pluginManager 不可用）→ 按静态顺序认领，专用连接器优先
+ok('㊴ claimFreeChannels (e) isInstalled 为 null 时按静态顺序认领（专用连接器先拿）',
+  claims(['ct-trae'], () => null) === JSON.stringify({
+    'our-free-model': [], codearts: [], workbuddy: [], trae: ['ct-trae'], qoder: [], 'codearts-auth': [],
+  }),
+  claims(['ct-trae'], () => null))
+
+// 同一插件的裸 id 与它自己的前缀 id 同时在线（门面正在生效 / 还没生效的交界）：
+// 两条都要认出、都要归同一张卡，且不能让 Providers Hub 抢走 qoder。
+ok('㊴ claimFreeChannels 混合视图：裸 qoder 与 ofm-qodercn / caa-qoder 同时在线都归 Our Free Model',
+  claims(['qoder', 'ofm-qodercn', 'caa-qoder', 'codearts']) === JSON.stringify({
+    'our-free-model': ['qoder', 'ofm-qodercn', 'caa-qoder'], codearts: ['codearts'],
+    workbuddy: [], trae: [], qoder: [], 'codearts-auth': [],
+  }),
+  claims(['qoder', 'ofm-qodercn', 'caa-qoder', 'codearts']))
+
+// ⑯ 前缀解析顺序：裸 qoder 在 ofm-qoder 与 caa-qoder 同时在线时解析到 ofm-qoder
+// （PROVIDER_PREFIXES 的顺序＝免费渠道卡片顺序，Our Free Model 排第一张）。
+// liveProviderIdOf 在 apply 闭包里，所以从 /session-model 这条路验证它写进 selection 的值。
+llmStub = { listProviders: () => [{ id: 'caa-qoder' }, { id: 'ofm-qoder' }] }
+const pfxOrderAgent = makeAgent('pfx-order-1', {}, 'm1')
+agents.push(pfxOrderAgent)
+await api('POST', '/session-group', { sessionId: 'pfx-order-1', groupId: 'g2', mode: 'route' })
+await api('POST', '/session-model', { sessionId: 'pfx-order-1', provider: 'qoder', model: 'm1' })
+ok('㊴ 裸 qoder 在 ofm-qoder 与 caa-qoder 同时在线时解析到 ofm-qoder（顺序＝卡片顺序）',
+  appended.filter(a => a.id === 'pfx-order-1' && a.type === 'model/selection').at(-1)?.data?.provider === 'ofm-qoder',
+  JSON.stringify(appended.filter(a => a.id === 'pfx-order-1').at(-1)?.data))
+llmStub = undefined
+
+// ⑰ 失败键按裸名合计：ofm-qoder 的失败必须让分组里那条裸 qoder 也显示「当日失败」，
+// 否则路由会立刻再选中它（liveProviderIdOf 又解析回 ofm-qoder），形成失败死循环。
+const pfxGroup = (await api('POST', '/groups', {
+  name: 'zz-prefix-check',
+  models: [
+    { provider: 'qoder', model: 'pfx-m1', priority: 1 },
+    { provider: 'qoder', model: 'pfx-m2', priority: 2 },
+  ],
+})).body.group
+await api('POST', '/failed/mark', { provider: 'ofm-qoder', model: 'pfx-m1' })
+const pfxFailed = (await api('GET', '/status')).body.groups.find(g => g.id === pfxGroup.id)?.models.find(m => m.model === 'pfx-m1')
+ok('㊴ 失败键按裸名：ofm-qoder 的失败让分组里的裸 qoder 条目也变成「当日失败」',
+  pfxFailed?.failed === true, JSON.stringify(pfxFailed))
+
+// ⑱ 解除失败也走 providerEquals：界面传的是裸 qoder，失败表里记的可能是 ofm-qoder，
+// 两边必须能对上（不同插件前缀之间仍不等价，见 ⑧ 那条断言）。
+await api('POST', '/failed/reset', { provider: 'qoder', model: 'pfx-m1' })
+const pfxCleared = (await api('GET', '/status')).body.groups.find(g => g.id === pfxGroup.id)?.models.find(m => m.model === 'pfx-m1')
+ok('㊴ 解除失败按 providerEquals：传裸 qoder 能清掉 ofm-qoder 记下的那条当日失败',
+  pfxCleared?.failed === false, JSON.stringify(pfxCleared))
+
+// ⑲ 分组条目按 providerEquals 匹配注册表 id：当前模型是 ofm-qoder/pfx-m1，分组里是裸
+// 'qoder' 且该条此刻不在生效时段 —— 必须能被认出来并换走。若 groupMember 用 ===，
+// 查不到条目 → routable() 的时段检查被跳过 → 会话原地不动。
+const pfxGmGroup = (await api('POST', '/groups', {
+  name: 'zz-prefix-groupmember',
+  models: [
+    { provider: 'qoder', model: 'pfx-m1', priority: 1, windows: [{ from: badHour, to: badHour }] },
+    { provider: 'qoder', model: 'pfx-m2', priority: 2 },
+  ],
+})).body.group
+const pfxGmAgent = makeAgent('pfx-gm-1', {}, 'pfx-m1')
+agents.push(pfxGmAgent)
+await api('POST', '/session-group', { sessionId: 'pfx-gm-1', groupId: pfxGmGroup.id, mode: 'route' })
+pfxGmAgent.model.select({ provider: 'ofm-qoder', model: 'pfx-m1' })
+const pfxGmAfter = await runPreStep('pfx-gm-1')
+ok('㊴ groupMember 按 providerEquals 对上注册表 id：ofm-qoder 的出窗条目被换到组内下一个',
+  pfxGmAfter === 'pfx-m2', JSON.stringify({ after: pfxGmAfter, sel: pfxGmAgent.model.current() }))
+
+// 收尾：临时分组与失败记账都清掉，后面的段落还要用同一份 ctx / groups
+await api('DELETE', '/groups/' + encodeURIComponent(pfxGroup.id))
+await api('DELETE', '/groups/' + encodeURIComponent(pfxGmGroup.id))
+await api('POST', '/failed/reset', {})
+await api('POST', '/capacity/reset', {})
+ok('㊴ 自检用的临时分组与失败记账已清掉',
+  (await api('GET', '/status')).body.groups.every(g => g.id !== pfxGroup.id && g.id !== pfxGmGroup.id))
+
+// ── ㊵ qoder 压缩 shim 认领注册表里的 adapter：一个裸名可能有多条活路由 ──────
+// 这一段补的是「㊴ 覆盖不到的装配路径」：collectTargets 不经过 host.mjs，改坏它
+// offline-check 原本抓不到（上线时真发生过一次：数组误用 .has()，shim 整个启动失败，
+// 263 项仍全绿）。断言放在导出的纯函数 collectShimRegistrations 上。
+//
+// 多前缀之后**同一个裸名会有多个活 adapter**（ofm-qoder 走 dsh-our-free-model 内联的
+// encryptor，caa-qoder 走 dsh-codearts-auth 自己那份 qoder-wasm.js —— 两份是不同的类），
+// 所以这里必须**逐个全收**：只挑一条会漏掉另一条，而 /status 仍显示已接管。
+const shimMap = (ids) => new Map(ids.map((id) => [id, { adapter: { tag: id } }]))
+const shimIds = (ids) => collectShimRegistrations(shimMap(ids)).adapters.map(a => a.id)
+const shimMissing = (ids) => collectShimRegistrations(shimMap(ids)).missing
+ok('㊵ 无门面：注册表里是裸 qoder/qodercn 时两条都命中，id 原样带出',
+  JSON.stringify(shimIds(['qoder', 'qodercn'])) === '["qoder","qodercn"]'
+  && shimMissing(['qoder', 'qodercn']).length === 0,
+  JSON.stringify(shimIds(['qoder', 'qodercn'])))
+ok('㊵ 门面态：ofm-qoder 与 caa-qoder 同时在线时两条都收（两条各有自己的加密器拷贝）',
+  JSON.stringify(shimIds(['ofm-qoder', 'caa-qoder', 'qodercn'])) === '["ofm-qoder","caa-qoder","qodercn"]'
+  && shimMissing(['ofm-qoder', 'caa-qoder', 'qodercn']).length === 0,
+  JSON.stringify({ ids: shimIds(['ofm-qoder', 'caa-qoder', 'qodercn']), missing: shimMissing(['ofm-qoder', 'caa-qoder', 'qodercn'])}))
+ok('㊵ 同名多条：按 SHIM_PROVIDER_IDS 顺序分组（qoder 在 qodercn 前），组内保持注册表枚举顺序',
+  JSON.stringify(shimIds(['caa-qodercn', 'caa-qoder', 'qoder'])) === '["caa-qoder","qoder","caa-qodercn"]',
+  JSON.stringify(shimIds(['caa-qodercn', 'caa-qoder', 'qoder'])))
+ok('㊵ missing 只报「一条都没命中」的裸名：同名里坏一条不影响另一条',
+  JSON.stringify(shimMissing(['ofm-qoder'])) === '["qodercn"]'
+  && JSON.stringify(shimIds(['ofm-qoder'])) === '["ofm-qoder"]',
+  JSON.stringify({ ids: shimIds(['ofm-qoder']), missing: shimMissing(['ofm-qoder'])}))
+ok('㊵ 注册表里只有别的渠道时两个裸名都算缺失（notes 文案照旧，不静默接管）',
+  JSON.stringify(shimMissing(['ca-codearts', 'trae', 'caa-buddy'])) === '["qoder","qodercn"]',
+  JSON.stringify(shimMissing(['ca-codearts', 'trae', 'caa-buddy'])))
+ok('㊵ 注册表缺失/不可枚举不抛错，只是全部记为缺失',
+  JSON.stringify(collectShimRegistrations(null).missing) === '["qoder","qodercn"]'
+  && JSON.stringify(collectShimRegistrations(new Map()).missing) === '["qoder","qodercn"]',
+  JSON.stringify(collectShimRegistrations(null)))
+ok('㊵ 注册表的值就是 adapter 本身（不带 .adapter 包装）时同样命中',
+  JSON.stringify(collectShimRegistrations(new Map([['caa-qoder', { prepareInfer() {} }]])).adapters.map(a => a.id)) === '["caa-qoder"]',
+  JSON.stringify(collectShimRegistrations(new Map([['caa-qoder', { prepareInfer() {} }]])).adapters.map(a => a.id)))
+
 
 // 插件市场详情页渲染 locale meta.detail 指到的文档，图片按文档所在目录解析
 // （packages/util/plugin-detail/src/document.ts 的 detailImage）：所以详情文档写在
@@ -1945,6 +2428,8 @@ ok('㉞ 每个渠道给出 GitHub 仓库地址，并提供一键复制',
   && clientText.includes("repo: 'https://github.com/Ebony-Vinyl/dsh-our-free-model'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-trae'")
   && clientText.includes("repo: 'https://github.com/dingminhua/dsh-connect-qoder'")
+  // 第二个聚合渠道的仓库是改名后的 dsh-providers-hub（安装 spec 仍是旧名 dsh-codearts-auth）
+  && clientText.includes("repo: 'https://github.com/zhuweiyou/dsh-providers-hub'")
   && clientText.includes('function copyText(')
   && clientText.includes("navigator.clipboard.writeText")
   && clientText.includes("'复制链接'"))
@@ -2116,6 +2601,50 @@ const off = bridgeHandle.reconfigure({ enabled: false })
 ok('㊲ 关掉后状态里说清「已关闭」，同步不再写任何东西',
   off.enabled === false && off.skipReason === '已关闭')
 bridgeHandle.stop()
+
+// 闸门现场：bili 的候选 ref 完全由 jet-hub 的 enabled/providerClosed 决定，
+// 而 fallbackRefs 会让镜像「看起来永远成功」——闸门必须被单独读出来并报出来。
+const gateBefore = await bridgeHandle.inspectGate?.() ?? null
+// 上面已经 stop()，单独再开一个句柄读闸门（setup 阶段 REF_B 是停用的）
+const gateProbe = bridgeModule.startCodeartsResignBridge({
+  ctx: { get: (n) => (n === 'credentials' ? { set: () => {} } : undefined) },
+  logger: bridgeLogger,
+  settings: { enabled: true, intervalSeconds: 10 },
+  fallbackRefs: ['REF_FALLBACK'],
+  accountsFile: accountsPath,
+  jetHubStateFile: jetHubPath,
+})
+const gateOpen = await gateProbe.inspectGate()
+ok('㊳ 闸门现场：bili 能枚举到的 ref 数单独可见（不是靠镜像成功来推断）',
+  gateOpen.seedless === undefined
+  && gateOpen.accountsTotal === 2
+  && gateOpen.accountsDisabled === 1
+  && gateOpen.seeableRefs === 1
+  && gateOpen.staleRefs === 1
+  && gateOpen.closed === false,
+  JSON.stringify(gateOpen))
+
+// 用户关掉整个供应商：这次一个 ref 都枚举不到 —— 正是 bili 在转发前拒收的形态
+writeFileSync(jetHubPath, JSON.stringify({
+  providerClosed: { codearts: true },
+  accounts: [
+    { provider: 'codearts', credentialRef: 'REF_A', enabled: false },
+    { provider: 'codearts', credentialRef: 'REF_B', enabled: false },
+  ],
+}))
+const gateBlind = await gateProbe.inspectGate()
+ok('㊳ 关掉供应商后 seeableRefs 归零且 closed=true —— 凭据镜像却照样成功',
+  gateBlind.closed === true && gateBlind.seeableRefs === 0 && gateBlind.staleRefs === 2,
+  JSON.stringify(gateBlind))
+const blindSync = await gateProbe.syncNow()
+// 三个事实一起构成那个盲区：①镜像没报错 ②还写进了 fallback（所以
+// mirroredRefs 非空、/status 看起来「有落点」）③而 bili 能枚举到的真实 ref 是 0。
+ok('㊳ 闸门关闭时镜像仍然「成功」并写进 fallback —— 这正是必须单独报闸门的原因',
+  blindSync.lastError === null
+  && blindSync.mirroredRefs.includes('REF_FALLBACK')
+  && blindSync.gate.closed === true && blindSync.gate.seeableRefs === 0,
+  JSON.stringify({ mirrored: blindSync.mirroredRefs, gate: blindSync.gate }))
+gateProbe.stop()
 
 const noCredHandle = bridgeModule.startCodeartsResignBridge({
   ctx: { get: () => undefined }, logger: bridgeLogger,

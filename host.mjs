@@ -68,7 +68,7 @@
  *   （不至于让只配了 qoder 的分组变成无模型可用）；
  * - 失败时把结论写进 /status.compressionGuard，并给一行可执行的「修法」。
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -76,12 +76,23 @@ import { pathToFileURL } from 'node:url'
 // CodeArts 凭据镜像：把 dsh-codearts 轮换中的 AK/SK 持续写进 billion-context 重签用的 ref
 // （见 codearts-resign-bridge.mjs 顶部）。原先是一个独立插件，并入本插件后由这里挂载。
 import { startCodeartsResignBridge, normalizeIntervalSeconds } from './codearts-resign-bridge.mjs'
+// provider id 的六前缀换算（ofm- / ca- / cw- / ct- / cq- / caa-，见 provider-prefix.mjs 顶部）。
+// 前缀由 llm 门面加在**真实注册表**侧，本插件只做「裸 id ↔ 注册表 id」的换算。
+// canonicalProvider / channelBare 也在这个模块里（前者是带前缀的诊断标签，后者给认领算法
+// 内部用），宿主半的记账一律走裸名，因此这里不引入那两个——记账键必须与分组条目同形。
+import {
+  PROVIDER_PREFIXES,
+  providerIdentity,
+  bareProvider,
+  providerEquals,
+  claimFreeChannels,
+} from './provider-prefix.mjs'
 // 明文进 bili、密文出上游的 shim（见 qoder-compress-shim.mjs 顶部）。
 // 用带构建号的动态 import：改 shim 后重载插件即可换上新代码（ESM 按 URL 缓存），
 // 而监听端口与 prototype 补丁由 shim 的 globalThis 槽跨重载保持。
 const QODER_SHIM_MODULE = './qoder-compress-shim.mjs'
 /** shim 构建号：每次改动 qoder-compress-shim.mjs 就把它 +1，否则 ESM 仍用缓存的旧模块。 */
-const QODER_SHIM_BUILD = '63'
+const QODER_SHIM_BUILD = '67'
 /** shim 只换得掉这两家的加密端点（QoderEncryptedInfer#prepareInfer 的使用者）。 */
 const QODER_SHIM_PROVIDERS = new Set(['qoder', 'qodercn'])
 
@@ -107,7 +118,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v90'
+const HOST_VERSION = 'v95'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -137,8 +148,9 @@ const BILI_COMPACTION_VERDICT_KEY = '__BILI_DSH_COMPACTION_VERDICT__'
  * GitHub 地址在 client.js 的 FREE_CHANNEL_COPY（加渠道要两边一起改）；provider 是否在线
  * 由 llm 注册表现场查询，「装没装」由 pluginManager.listBundles() 现场查询——这两件都不写死。
  *
- * 数组顺序就是页签里的卡片顺序（聚合渠道 Our Free Model 排第一）。认领顺序不由它决定：
- * describeFreeChannels 里聚合渠道永远最后认领，只拿专用连接器没装时剩下的 id。
+ * 数组顺序就是页签里的卡片顺序（聚合渠道 Our Free Model 排第一，第二个聚合渠道 Providers Hub 排最后）。
+ * 认领顺序不由它决定：describeFreeChannels 里聚合渠道永远最后认领，且彼此按本数组顺序先后认领，
+ * 所以 Our Free Model 先拿，Providers Hub 只拿剩下的。
  */
 const FREE_CHANNELS = [
   {
@@ -148,21 +160,65 @@ const FREE_CHANNELS = [
     // 每次安装 profile 都会重新拉一遍（codeload 不支持 Range），GitHub 慢的时候
     // 整个插件市场的更新都会被拖过 15 分钟上限。npm 版 peer 范围与 provider id 一致。
     spec: 'dsh-our-free-model',
-    // 聚合渠道：按渠道各注册一个 provider（qoder、trae、cline…），没有统一前缀，所以逐个
-    // 点名；新增渠道时这里要一起加，否则界面只显示一部分已接入渠道。被专用连接器认领走的
-    // 同名 id 不再重复列出。
+    // 该插件的 provider 前缀：门面在真实注册表侧把它的裸 id 拼成 ofm-qoder 这种。
+    // 未打门面的部署里它仍是裸 id，两种视图都要认领（见 provider-prefix.mjs）。
+    prefix: 'ofm-',
+    // 聚合渠道：按渠道各注册一个 provider（qoder、trae、cline…），裸名逐个点名；新增渠道时
+    // 这里要一起加，否则界面只显示一部分已接入渠道。被专用连接器认领走的同名 id 不再重复列出。
     aggregator: true,
     providers: /^(qoder|qodercn|trae|cline|lobster|loomy|raccoon|minimax|zcode|gemini|eac|our-free)/i,
   },
-  { id: 'codearts', pkg: 'dsh-codearts', spec: 'dsh-codearts', providers: /^codearts/i },
-  { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', spec: 'dsh-connect-workbuddy', providers: /^workbuddy/i },
+  { id: 'codearts', pkg: 'dsh-codearts', spec: 'dsh-codearts', prefix: 'ca-', providers: /^codearts/i },
+  { id: 'workbuddy', pkg: 'dsh-connect-workbuddy', spec: 'dsh-connect-workbuddy', prefix: 'cw-', providers: /^workbuddy/i },
   // trae / qoder 与 Our Free Model 内置的同名渠道撞号（聚合渠道也接 Trae、Qoder 账号）。
   // 谁认领由 describeFreeChannels 按「专用连接器装没装」现场决定，这里只声明各自的正则。
-  { id: 'trae', pkg: 'dsh-connect-trae', spec: 'dsh-connect-trae', providers: /^(trae|trae-enterprise|trae-global)$/i },
-  { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', spec: '@dmh2002/dsh-connect-qoder', providers: /^(qoder|qoder-global)$/i },
+  { id: 'trae', pkg: 'dsh-connect-trae', spec: 'dsh-connect-trae', prefix: 'ct-', providers: /^(trae|trae-enterprise|trae-global)$/i },
+  { id: 'qoder', pkg: '@dmh2002/dsh-connect-qoder', spec: '@dmh2002/dsh-connect-qoder', prefix: 'cq-', providers: /^(qoder|qoder-global)$/i },
+  // 第二个聚合渠道（dsh-codearts-auth；0.2.0-rc.11 起改名 dsh-providers-hub，两个包名同发同版本）。
+  // pkg/spec 仍写旧名：旧名包自带的 cordis.patch.yml 里也是 name: 'dsh-codearts-auth'，
+  // 用它装进老 profile 不会触发「两处都写新名」时的 MODULE_NOT_FOUND。
+  // 正则只列不和别人撞号的裸渠道 id —— codearts 与 workbuddy 各有专用卡片（写了会重复计数）；
+  // qoder/trae/cline/minimax/lobster… 已被 Our Free Model 的正则先命中（它排在本卡前面），写了也拿不到；
+  // aggregate 是聚合路由、jet-hub-auto 是自动路由，两者都不是「某个渠道在线」的事实。
+  // 本卡前缀下的 id（caa-codearts 那种）按前缀直接归属，正则不必再列 codearts。
+  {
+    id: 'codearts-auth',
+    pkg: 'dsh-codearts-auth',
+    spec: 'dsh-codearts-auth',
+    prefix: 'caa-',
+    aggregator: true,
+    providers: /^(buddy|opencode|officeace|accio|astudio|autoclaw|autoclawintl|modelscope|qiniu|codely|magicrew)$/i,
+  },
 ]
 
-function failKey(provider, model) { return `${provider}/${model}` }
+/**
+ * 计数/去重键：`provider/model`，provider 一律**取裸 id**。
+ *
+ * groups.json 的一个条目就是一条裸渠道（`{provider:'qoder'}`），并发表、失败表、看板
+ * 都按它记账；装上门面后宿主传给路由的 id 却会变成 ofm-qoder / caa-qoder。若键里带前缀，
+ * ofm-qoder 失败后 isFailed('qoder', …) 仍是 false，分组条目看着健康 → 路由又选中它 →
+ * liveProviderIdOf('qoder') 仍解析回 ofm-qoder → 立刻再失败，形成死循环。
+ * 所以「同名渠道各前缀共用一个失败键」是有意的：分组里只有一条 qoder。
+ */
+function failKey(provider, model) { return `${bareProvider(provider)}/${model}` }
+
+/*
+ * provider id 的两种视图（换算全部在 provider-prefix.mjs，这里只调用不重算）：
+ *
+ *  · 真实注册表 id：六个免费渠道插件各有一个前缀（dsh-our-free-model 的 ofm-、
+ *    dsh-codearts 的 ca-、dsh-connect-workbuddy 的 cw-、dsh-connect-trae 的 ct-、
+ *    @dmh2002/dsh-connect-qoder 的 cq-、dsh-codearts-auth 的 caa-），前缀由 llm 门面
+ *    加在真实注册表侧，所以宿主看到的是 ofm-qoder / caa-codearts 这种。
+ *  · 裸 id：没打门面的插件仍然是裸 id（qoder、trae…），用户配置、groups.json、
+ *    分组条目、界面与失败表也一直是裸 id。
+ *
+ * 选哪个函数的规矩：
+ *  · 记账（失败键、并发、容量冷却、速度采样）→ bareProvider：分组只有一条裸渠道；
+ *  · 「这个 id 是不是某个渠道」的比较 → providerEquals（裸 id 与自己的前缀等价，
+ *    不同插件的前缀互不等价）；
+ *  · 下发给 llm / agent.model.select 的真实 id → liveProviderIdOf；
+ *  · 展示给用户的渠道名 → bareProvider。
+ */
 /**
  * 北京时间（Asia/Shanghai，UTC+8）的日期部件；可传偏移后的时刻。
  *
@@ -230,6 +286,13 @@ const DEFAULT_FAIL_RESET_HOUR = 8
  * 即可；空数组表示不排除任何 provider。
  */
 const DEFAULT_OFM_HANDOFF_EXCLUDE_PROVIDERS = ['codearts']
+/**
+ * dsh-our-free-model 的 provider 前缀（与 FREE_CHANNELS 里那条一致）。
+ *
+ * 换号是它自己的能力，只对它自己的命名空间成立：裸 id（未打门面）或 ofm- 前缀。
+ * ca-codearts / caa-codearts 这类别的插件注册的路由即使裸名同名，也不能进它的池。
+ */
+const OFM_PROVIDER_PREFIX = 'ofm-'
 
 /**
  * 「当日」= 北京时间以 failResetHour 为日界线的日期。
@@ -281,6 +344,50 @@ export function apply(ctx, config = {}) {
     ctx.logger.warn(`[model-failover] config.uncompressedProviders=${JSON.stringify(uncompressedRaw)} 非法（需字符串数组），回退 ${JSON.stringify(DEFAULT_UNCOMPRESSED_PROVIDERS)}`)
   }
   const uncompressedProviders = new Set(uncompressedList)
+
+  /**
+   * 把裸 provider id 解析成「llm 注册表此刻真正在用的 id」。
+   *
+   * 为什么需要它：六个免费渠道插件各有一个前缀（ofm- / ca- / cw- / ct- / cq- / caa-），
+   * 由 llm 门面加在真实注册表侧，所以宿主 llm 上叫 ofm-qoder / caa-codearts 这种；
+   * 而用户配置、groups.json、界面上一直是裸 id。写进 agent.model.select() 的必须是
+   * 注册表认识的那个 id，否则宿主在 prepareCall 阶段报 NO_ADAPTER。
+   *
+   * 解析顺序：
+   *  1. 入参本身就在注册表里 → 原样用（已经是真实 id，或这个插件没打门面）；
+   *  2. 它的裸名在注册表里 → 用裸 id（该渠道不是经门面注册的，本来就该用裸 id）；
+   *  3. 按 PROVIDER_PREFIXES 顺序试 `前缀 + 裸名`，第一个命中的即真实 id。顺序就是
+   *     免费渠道卡片顺序，所以 ofm-qoder 与 caa-qoder 同时在线时裸 'qoder' 解析到
+   *     ofm-qoder（Our Free Model 排第一张卡）；
+   *  4. 都不命中 → 原样返回，让宿主自己报「没有 adapter」。
+   *
+   * 取不到 llm 服务或它没有 listProviders 时同样原样返回入参：那条路径本来就会自己
+   * 报「llm 不可用」，不该在这里制造第二种失败。
+   *
+   * @param {unknown} provider 裸 id 或已经是真实 id 的 provider。
+   * @returns {string} 注册表里此刻在用的 provider id。
+   */
+  function liveProviderIdOf(provider) {
+    const raw = String(provider ?? '')
+    if (!raw) return raw
+    const bare = bareProvider(raw)
+    let ids
+    try {
+      const llm = ctx.get('llm')
+      if (!llm || typeof llm.listProviders !== 'function') return raw
+      ids = new Set((llm.listProviders() ?? []).map(p => String(p?.id ?? '')).filter(Boolean))
+    } catch {
+      return raw
+    }
+    if (ids.has(raw)) return raw
+    if (ids.has(bare)) return bare
+    for (const prefix of PROVIDER_PREFIXES) {
+      const candidate = prefix + bare
+      if (ids.has(candidate)) return candidate
+    }
+    return raw
+  }
+
   /** 压缩旁路守卫：关掉后这些 provider 仍按原优先级参与路由 */
   const compactionGuardRaw = config.compactionGuard
   const compactionGuard = typeof compactionGuardRaw === 'boolean' ? compactionGuardRaw : true
@@ -390,20 +497,52 @@ export function apply(ctx, config = {}) {
    */
   let modelConcurrency = new Map()
 
-  function modelConcKey(provider, model) { return `${provider}/${model}` }
+  /**
+   * 并发表的键：**渠道裸 id + 模型**，与失败表、速度采样、并发闸门完全同一口径。
+   *
+   * 为什么必须统一：分组条目写的是裸 id（`qoder`），宿主 llm 注册表里却是带前缀的
+   * id（`ofm-qoder`）。闸门按注册表 id 记账、看板按分组条目取键，两边各建一张表，
+   * 于是看板永远显示 inflight=0、并发上限形同虚设，采样也落在一个永不展示的桶里。
+   */
+  function modelConcKey(provider, model) { return failKey(provider, model) }
 
-  try {
-    const saved = readJson(modelConcurrencyFile, {})
-    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
-      for (const [k, v] of Object.entries(saved)) {
-        if (typeof v === 'number' && Number.isInteger(v) && v > 0) modelConcurrency.set(k, v)
-      }
-    }
-  } catch (e) { ctx.logger.warn(`[model-failover] 读取按模型并发配置失败：${e?.message || e}`) }
+  /**
+   * 把旧格式（带前缀）的表键并到裸名键上。
+   *
+   * 早期版本用注册表 id 当键（`ofm-qoder/qfmodel`、`ca-codearts/…`）。这些键再也
+   * 匹配不到任何一行，留着只会让「同一个模型」在表里出现两次——按裸名合并，前缀版本
+   * 的值优先（它才是真正对上线的那条路由），没有裸名版本时原样搬过来。
+   *
+   * @param {string} rawKey - 表里的原始键。
+   * @returns {string} 裸名键。
+   */
+  const concKeyOf = (rawKey) => {
+    const text = String(rawKey ?? '')
+    const cut = text.indexOf('/')
+    if (cut <= 0) return text
+    return modelConcKey(text.slice(0, cut), text.slice(cut + 1))
+  }
 
   function saveModelConcurrency() {
     writeJson(modelConcurrencyFile, Object.fromEntries(modelConcurrency))
   }
+
+  try {
+    const saved = readJson(modelConcurrencyFile, {})
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      /** 旧键被并掉即需要回写，避免同一模型每次启动都合并一遍 */
+      let migrated = false
+      for (const [rawKey, v] of Object.entries(saved)) {
+        if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) continue
+        const key = concKeyOf(rawKey)
+        if (key !== rawKey) migrated = true
+        // 裸名键与带前缀键指向同一个模型：前者是用户在看板上改过的值，优先。
+        if (key !== rawKey && modelConcurrency.has(key)) continue
+        modelConcurrency.set(key, v)
+      }
+      if (migrated) saveModelConcurrency()
+    }
+  } catch (e) { ctx.logger.warn(`[model-failover] 读取按模型并发配置失败：${e?.message || e}`) }
 
   /**
    * 会话级「本插件已接管」的生效模型：sessionId -> { provider, model, effort? }。
@@ -564,6 +703,18 @@ export function apply(ctx, config = {}) {
   //  · 输出速度 = 输出 token 数 /（流结束 - 首字），单位 token/s
   // 这里只做**可观测量**的统计，不解析模型内容，也不写会话日志（模型不可见）。
 
+  /**
+   * 测速请求的身份：{@link guardedStream} 据此把它们与真实会话调用区分开。
+   *
+   * 为什么需要：测速自己发的是最小请求，但它**也必须进采样**（用户要看的就是
+   * 「这个模型此刻第一字多久、多快」）。可是闸门会对占不到槽的调用一律判
+   * CAPACITY_TIMEOUT——一个正在被会话打满的模型，测速会当场失败，用户看到的
+   * 就是「测速失败 CAPACITY_TIMEOUT」，而这恰恰是他最想确认的那个模型。
+   * 所以测速的调用只在**超出并发上限时**放行（照常计数、照常记样本），
+   * 不改成失败、也不写并发冷却。
+   */
+  const speedTestCallOptions = new WeakSet()
+
   /** provider/model -> 正在占用中的并发数 */
   const inflightByModel = new Map()
   /** 等槽位释放的订阅者（只有「整组都满」那条路会用到），按 provider/model 分组保证 FIFO */
@@ -612,10 +763,12 @@ export function apply(ctx, config = {}) {
    *
    * @param {string} key - `provider/model`。
    * @param {number} limit - 上限，0 = 不限（永远占得到，但仍占槽计数）。
+   * @param {boolean} [force] - 满了也占（只给测速用，见 speedTestCallOptions）；
+   *   这次调用会照常计数，只是不判失败，因此上限可能短暂被超出。
    * @returns {() => void} 释放函数；重复调用安全。
    * @throws 槽位已满时抛 `{ code: CAPACITY_TIMEOUT_CODE }`。
    */
-  function acquireSlot(key, limit) {
+  function acquireSlot(key, limit, force) {
     /**
      * 占一个槽位，返回释放函数。
      *
@@ -648,7 +801,7 @@ export function apply(ctx, config = {}) {
     // 提前返回空释放会让这些行永远显示 0（用户以为链路没在用）。
     if (limit <= 0) return takeSlot()
     const inflight = inflightByModel.get(key) ?? 0
-    if (inflight < limit) return takeSlot()
+    if (inflight < limit || force === true) return takeSlot()
     // 满了：不占槽、不入队，直接把这次调用判成失败，让分组路由换组内其它模型。
     const err = new Error(`${key} 的并发已满（${inflight}/${limit}），立刻换组内其它模型`)
     err.code = CAPACITY_TIMEOUT_CODE
@@ -868,6 +1021,17 @@ export function apply(ctx, config = {}) {
   const speedSamples = new Map()
 
   /**
+   * {@link speedStatsOf} 的结果缓存：缓存键 -> 汇总值。
+   *
+   * 键里带着桶长度，所以新样本一到就必然换 key；桶只追加、不修改，同一长度的结果
+   * 永远相同，缓存因此不会给出过期读数。
+   */
+  const statsCache = new Map()
+
+  /** 缓存的条数上限（见 speedStatsOf 末尾的清空策略） */
+  const STATS_CACHE_MAX = 512
+
+  /**
    * 采样落盘文件。缓冲区是内存态的，重启即清空；看板要跨重启保留，
    * 所以每次记样本后整体覆写一份到 dataDir（不写增量日志，也就不会留下半截文件）。
    */
@@ -917,15 +1081,53 @@ export function apply(ctx, config = {}) {
     if (typeof metricsFlushTimer?.unref === 'function') metricsFlushTimer.unref()
   }
 
+  /**
+   * 采样桶的键一律是**渠道裸 id + 模型**（`failKey`），与分组条目、失败表、并发闸门
+   * 同一口径。旧版本的采样用注册表 id 作键（`ofm-qoder/dfmodel`、`ca-codearts/…`），
+   * 那些桶在分组条目改成裸 id 之后就再也匹配不到任何一行——看板上表现为「这个模型
+   * 一次都没跑过」，而 metrics.json 里明明躺着一堆样本。
+   *
+   * 所以读回时按裸名合并：同一模型的历史并进同一个桶，按 at 升序重建顺序。
+   * 合并是幂等的（裸名键合并后仍是自己），只在真的发生合并时回写一次。
+   *
+   * @param {string} rawKey - 磁盘上的桶键。
+   * @returns {string} 裸名桶键。
+   */
+  const sampleKeyOf = (rawKey) => {
+    const text = String(rawKey ?? '')
+    const cut = text.indexOf('/')
+    if (cut <= 0) return text
+    return failKey(text.slice(0, cut), text.slice(cut + 1))
+  }
+
   // 启动时读回历史样本；样本字段随版本增补（如 inTokens），
   // 老样本缺字段时按 null 处理——不拿 0 冒充，否则看板会把「没记」显示成「用了 0」。
   try {
     const saved = readJson(metricsFile, null)
     if (saved && typeof saved === 'object') {
-      for (const [key, list] of Object.entries(saved)) {
+      /** 有桶键被并掉（或样本被迁移）就要回写，否则每次启动都重做一遍 */
+      let migrated = false
+      for (const [rawKey, list] of Object.entries(saved)) {
         if (!Array.isArray(list)) continue
+        const key = sampleKeyOf(rawKey)
+        if (key !== rawKey) migrated = true
         const clean = list.filter(s => s && typeof s.at === 'number')
-        if (clean.length > 0) speedSamples.set(key, clean)
+        if (clean.length === 0) continue
+        const existing = speedSamples.get(key)
+        // 老样本没有 probe 字段：按 false 处理（缺字段 ≠ 测速），不拿它冒充样本来源。
+        const normalized = clean.map(s => (s.probe === true ? { ...s, probe: true } : s))
+        if (existing === undefined) {
+          speedSamples.set(key, normalized)
+          continue
+        }
+        // 两个桶合成一个：按时间先后重排，看板的「最近一次失败」「首字分位数」
+        // 都按 at 取，顺序错了就会读到更早的样本。
+        const merged = [...existing, ...normalized].sort((a, b) => a.at - b.at)
+        speedSamples.set(key, merged)
+      }
+      if (migrated) {
+        statsCache.clear()
+        scheduleMetricsFlush()
       }
     }
   } catch { /* 损坏的采样文件当作没有历史，不让插件起不来 */ }
@@ -955,8 +1157,8 @@ export function apply(ctx, config = {}) {
    * 只追加、不裁剪：样本是看板统计的原始数据，条数上限会把「所选区间」偷换成
    * 「最近 N 条」。内存占用按调用次数线性增长，单条几十字节，正常量级可忽略。
    *
-   * @param {string} key - `provider/model`。
-   * @param {{ttftMs: number|null, inTokens: number|null, outTokens: number|null, cacheReadTokens: number|null, cacheWriteTokens: number|null, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, errorMessage: string|null, at: number}} sample - 一次调用的观测值。
+   * @param {string} key - `provider/model`（渠道裸 id，见 failKey）。
+   * @param {{ttftMs: number|null, inTokens: number|null, outTokens: number|null, cacheReadTokens: number|null, cacheWriteTokens: number|null, speedTps: number|null, waitMs: number, ok: boolean, errorCode: string|null, errorMessage: string|null, at: number, probe?: boolean}} sample - 一次调用的观测值；`probe: true` 标记「这条是测速打出来的」。
    * @returns {void}
    */
   function recordSpeedSample(key, sample) {
@@ -972,10 +1174,17 @@ export function apply(ctx, config = {}) {
    * @param {{since?: number, until?: number}} [window] - 采样时间窗（毫秒时间戳，两端包含）；
    *   省略则统计全部样本。日期筛选由这里做，而不是交给界面：分位数与合计都要按
    *   「所选区间」算。缓冲区不设条数上限，所以这里的统计就是全量历史。
-   * @returns {{samples: number, okSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, inTokens: number, outTokens: number, cacheReadTokens: number, cacheWriteTokens: number, tokenSamples: number, lifetimeInTokens: number, lifetimeOutTokens: number, lifetimeCacheReadTokens: number, lifetimeCacheWriteTokens: number, lifetimeTokenSamples: number, lastAt: number|null, lastErrorCode: string|null}} 汇总值。
+   * @returns {{samples: number, okSamples: number, probeSamples: number, ttftP50: number|null, ttftP90: number|null, tpsP50: number|null, tpsP90: number|null, waitP50: number|null, inTokens: number, outTokens: number, cacheReadTokens: number, cacheWriteTokens: number, tokenSamples: number, lifetimeInTokens: number, lifetimeOutTokens: number, lifetimeCacheReadTokens: number, lifetimeCacheWriteTokens: number, lifetimeTokenSamples: number, lastAt: number|null, lastErrorCode: string|null, lastErrorMessage: string|null}} 汇总值。
    */
   function speedStatsOf(key, window) {
     const all = speedSamples.get(key) ?? []
+    // 看板每 3 秒轮询一次，而一个模型的样本可能有上万条：不缓存的话每次轮询都要把
+    // 全部样本重排几遍算分位数，接口会从毫秒级涨到秒级（实测 9MB 采样、50 行表格时
+    // 一次 /metrics 要 2 秒以上）。缓存键是「桶身份 + 桶长度 + 窗口」——桶只追加，
+    // 长度变了就必然有新样本，窗口变了结果本来就不同，其余情况同一份输入。
+    const cacheKey = `${key}\u0000${all.length}\u0000${window === undefined ? '*' : `${window.since ?? ''}:${window.until ?? ''}`}`
+    const cached = statsCache.get(cacheKey)
+    if (cached !== undefined) return cached
     const list = window === undefined
       ? all
       : all.filter(s => (window.since === undefined || s.at >= window.since)
@@ -1023,9 +1232,12 @@ export function apply(ctx, config = {}) {
         break
       }
     }
-    return {
+    const stats = {
       samples: list.length,
       okSamples: list.filter(s => s.ok === true).length,
+      // 区间内由「测速」打出来的样本数：界面要说明历史列里有多少是本次实测，
+      // 而不是真实会话流量——两者混在一起看，用户会以为这个模型平时就在跑。
+      probeSamples: list.filter(s => s.probe === true).length,
       ttftP50: pick(ttfts, 0.5),
       ttftP90: pick(ttfts, 0.9),
       tpsP50: pick(tpss, 0.5),
@@ -1047,6 +1259,12 @@ export function apply(ctx, config = {}) {
       lastErrorCode,
       lastErrorMessage,
     }
+    // 缓存上限：窗口是 (since, until) 组合，用户来回切日期会积累；超过就整体清空，
+    // 而不是做 LRU——这份缓存的全部价值就是「同一份输入的第二次读」，清空的代价是
+    // 一轮重算，小于维护淘汰顺序的复杂度。
+    if (statsCache.size >= STATS_CACHE_MAX) statsCache.clear()
+    statsCache.set(cacheKey, stats)
+    return stats
   }
 
   /**
@@ -1063,14 +1281,19 @@ export function apply(ctx, config = {}) {
    * @returns {AsyncIterable<any>} 原样透传的 chunk 流。
    */
   async function* guardedStream(options, next) {
-    const provider = String(options?.provider ?? '')
+    // 并发/速度的键一律用裸 id：分组、/status、/metrics 都是从 groups.json 的裸 id
+    // 取键的，这里若用注册表 id（打了门面就是 ofm-qoder 这种），两边各记一份，
+    // 看板会一直显示 inflight=0、采样落在没人读的桶里，并发上限也形同虚设。
+    const provider = bareProvider(options?.provider)
     const model = String(options?.model ?? '')
-    const key = `${provider}/${model}`
+    const key = failKey(provider, model)
     const limit = concurrencyLimitOf(provider, model)
+    // 测速的最小请求：满了也放行（照常计数、照常记样本），见 speedTestCallOptions
+    const probe = speedTestCallOptions.has(options)
     const startedAt = Date.now()
     let release
     try {
-      release = acquireSlot(key, limit)
+      release = acquireSlot(key, limit, probe)
     } catch (err) {
       // 到这里只可能是「槽位已满」：不占槽、不生成，记一次失败样本，再把这次调用判成
       // CAPACITY_TIMEOUT——宿主会走 agent/request-error，本插件在那里换模型。
@@ -1078,7 +1301,8 @@ export function apply(ctx, config = {}) {
       recordSpeedSample(key, {
         ttftMs: null, inTokens: null, outTokens: null, speedTps: null,
         cacheReadTokens: null, cacheWriteTokens: null,
-        waitMs: Date.now() - startedAt, ok: false, errorCode: CAPACITY_TIMEOUT_CODE, errorMessage: null, at: Date.now(),
+        waitMs: Date.now() - startedAt, ok: false, errorCode: CAPACITY_TIMEOUT_CODE, errorMessage: null,
+        ...(probe ? { probe: true } : {}), at: Date.now(),
       })
       yield { type: 'finish', reason: { kind: 'error', failure: { message: err.message, code: CAPACITY_TIMEOUT_CODE } } }
       return
@@ -1155,6 +1379,9 @@ export function apply(ctx, config = {}) {
         ok: settledOk,
         errorCode: settledOk ? null : (failureCode ?? 'STREAM_ABORTED'),
         errorMessage: settledOk ? null : failureMessage,
+        // 测速样本单独标记：看板要能说「历史列里有 N 次是测速打出来的」，
+        // 否则用户会以为是真实会话流量。
+        ...(probe ? { probe: true } : {}),
         at: endedAt,
       })
     }
@@ -1234,7 +1461,8 @@ export function apply(ctx, config = {}) {
   }
 
   function resetFailed(provider, model) {
-    failedList = failedList.filter(f => !(f.provider === provider && f.model === model && f.day === todayKey()))
+    // 按 providerEquals 清：成功轮上报的可能是注册表 id（ofm-qoder），失败表里记的是裸 id。
+    failedList = failedList.filter(f => !(providerEquals(f.provider, provider) && f.model === model && f.day === todayKey()))
     saveFailed()
   }
 
@@ -1272,7 +1500,9 @@ export function apply(ctx, config = {}) {
     let busyFallback = null
     for (const m of models) {
       if (!routable(m)) continue
-      const key = `${m.provider}/${m.model}`
+      // 与闸门同一口径的键：分组条目虽然是裸 id，统一走 failKey 才不会在换了前缀
+      // 写法（或历史遗留的带前缀条目）之后读到另一个计数桶。
+      const key = failKey(m.provider, m.model)
       // 并发冷却期内的模型直接跳过：它刚刚打满过，换到组内其它模型正是用户要的
       // 「触发到并发时临时切换」。冷却到期后自动回到候选，不需要人工恢复。
       if (capacityCooldownOf(m.provider, m.model) !== null) {
@@ -1368,7 +1598,10 @@ export function apply(ctx, config = {}) {
     if (!provider || !model) return null
     const entry = groups.find(g => g.id === groupId)
     if (!entry) return null
-    return (entry.models || []).find(m => m.provider === provider && m.model === model) ?? null
+    // 必须用 providerEquals：currentModelOf() 优先给 agent.model.current() 的 provider，
+    // 那是注册表 id（ofm-qoder），而分组条目存的是裸 'qoder'。用 === 会查出 null，
+    // 于是 routable() 的时段/截止日/禁用三项检查被整段跳过（出了时段也不换模型）。
+    return (entry.models || []).find(m => providerEquals(m.provider, provider) && m.model === model) ?? null
   }
 
   /**
@@ -1399,7 +1632,8 @@ export function apply(ctx, config = {}) {
   /** 组内除 exclude 外的下一个可路由模型（按优先级顺序；优先压缩代理看得见的） */
   function nextInGroup(groupId, exclude, alsoSkip) {
     return pickCandidate(sortedModels(groupId).filter((m) => {
-      if (m.provider === exclude.provider && m.model === exclude.model) return false
+      // providerEquals：exclude 可能是注册表 id（ofm-qoder），分组里是裸 'qoder'
+      if (providerEquals(m.provider, exclude.provider) && m.model === exclude.model) return false
       // alsoSkip：本轮已因「请求被拒」跳过的模型（它们没被标记当日失败，只能靠这里排除）
       if (alsoSkip !== undefined && alsoSkip.has(failKey(m.provider, m.model))) return false
       return true
@@ -1433,11 +1667,12 @@ export function apply(ctx, config = {}) {
    * 「第一处命中即返回」的旧行为让排在前面那个分组成了隐形上限。
    */
   function findFailover(currentProvider, currentModel) {
-    const isSelf = (cand) => cand.provider === currentProvider && cand.model === currentModel
-    const holdsCurrent = (group) => group.models.some(m => m.provider === currentProvider && m.model === currentModel)
+    // 三处比较都用 providerEquals：当前模型可能来自注册表（ofm-qoder），分组里是裸 id
+    const isSelf = (cand) => providerEquals(cand.provider, currentProvider) && cand.model === currentModel
+    const holdsCurrent = (group) => group.models.some(m => providerEquals(m.provider, currentProvider) && m.model === currentModel)
     for (const group of groups) {
       if (!group.enabled || !holdsCurrent(group)) continue
-      const self = group.models.find(m => m.provider === currentProvider && m.model === currentModel)
+      const self = group.models.find(m => providerEquals(m.provider, currentProvider) && m.model === currentModel)
       const limit = self?.priority ?? 99
       const preferred = pickCandidate(sortedModels(group.id).filter((cand) => !isSelf(cand) && (cand.priority ?? 99) <= limit))
       if (preferred) return preferred
@@ -1587,7 +1822,10 @@ export function apply(ctx, config = {}) {
     // 空 effort 必须**删掉**该键：铺 reasoningEffort: undefined 会被 session 的
     // JSON 守卫拒绝；而沿用上一个模型的 effort 可能不被目标模型支持
     // （prepareCall 抛 UNSUPPORTED_REASONING_EFFORT）。
-    const selection = { provider: target.provider, model: target.model }
+    // 写进 selection 的必须是注册表此刻认识的 id（打了门面就是 ofm-qoder 这种），
+    // 否则宿主在 prepareCall 阶段报 NO_ADAPTER；而 overrides 记的是裸 id，
+    // 因为 /status、日志、分组配置用的都是裸 id，混用会让同一次切换出现两种 id。
+    const selection = { provider: liveProviderIdOf(target.provider), model: target.model }
     if (target.effort) selection.reasoningEffort = target.effort
     try {
       model.select(selection)
@@ -1595,7 +1833,8 @@ export function apply(ctx, config = {}) {
       ctx.logger.warn(`[model-failover] 切换 ${target.provider}/${target.model} 失败: ${e?.message || e}`)
       return false
     }
-    overrides.set(id, target)
+    // overrides 存裸 id：/status、/metrics 与分组条目都按裸渠道记账
+    overrides.set(id, { ...target, provider: bareProvider(target.provider) })
     ctx.logger.info(`[model-failover] ${isSubagentSession(agent.session) ? '子代理' : '会话'} ${id} 切换至 ${target.provider}/${target.model}${target.effort ? ' (effort=' + target.effort + ')' : ''}`)
     return true
   }
@@ -1795,7 +2034,8 @@ export function apply(ctx, config = {}) {
     const prev = capacitySwitches.get(id)
     if (!prev) return
     // 已经不在备用模型上了（用户手选 / 又被换过）→ 这条记录过期，清掉。
-    if (prev.provider === cur.provider && prev.model === cur.model) return
+    // providerEquals：cur.provider 可能是注册表 id，capacitySwitches 里记的是裸名
+    if (providerEquals(prev.provider, cur.provider) && prev.model === cur.model) return
     if (Date.now() - prev.at < capacitySwitchRevertMs) return
     capacitySwitches.delete(id)
     if (capacityCooldownOf(prev.provider, prev.model) !== null) return
@@ -1833,7 +2073,9 @@ export function apply(ctx, config = {}) {
     lastPicked.set(id, { provider: d.provider, model: d.model, ...(d.reasoningEffort ? { effort: d.reasoningEffort } : {}) })
     const cur = overrides.get(id)
     // 与自己刚写入的一致 → 是本插件的切换，保留覆盖；否则是用户手选，交还控制权。
-    if (cur && cur.provider === d.provider && cur.model === d.model) return
+    // overrides 里存的是裸 id，selection 事件带的是注册表 id（ofm-qoder 这种），
+    // 用 === 会让每次自动切换都被当成「用户手选」，接管状态立刻丢——所以走 providerEquals。
+    if (cur && providerEquals(cur.provider, d.provider) && cur.model === d.model) return
     overrides.delete(id)
   })
 
@@ -1871,11 +2113,19 @@ export function apply(ctx, config = {}) {
    * @returns {Promise<string|null>} 交回的账号 id；null 表示交给分组路由。
    */
   async function handoffToFreeModelAccount(provider, model, failure) {
-    // 名单里的 provider 由别的插件提供：池里可能还留着它的历史账号，但换号语义
-    // 不成立（冷却的是本次请求没用到的账号，还挡掉了本该发生的分组路由）。
-    if (ofmHandoffExcludedProviders.has(provider)) {
-      if (!ofmHandoffExcludedWarned.has(provider)) {
-        ofmHandoffExcludedWarned.add(provider)
+    // 换号是 dsh-our-free-model 的能力，只对它自己的渠道成立：裸 id（未打门面）或
+    // ofm- 前缀。别的插件前缀下的路由一律不换号——ca-codearts 的账号由 dsh-codearts
+    // 管、caa-codearts 由 dsh-codearts-auth 管，池里就算留着同名历史账号，冷却的也是
+    // 本次没用到的账号，还挡掉了本该发生的分组路由。
+    const ident = providerIdentity(provider)
+    if (ident.prefix !== '' && ident.prefix !== OFM_PROVIDER_PREFIX) return null
+    // 名单里的 provider 由别的插件提供（默认 codearts 由 dsh-codearts 提供），同上：
+    // 池里的历史账号不能让它们走换号。名单与告警去重都按裸名，裸 id 与 ca- 系路由
+    // 都要能被这条排除命中。
+    const bareForHandoff = ident.bare
+    if (ofmHandoffExcludedProviders.has(bareForHandoff)) {
+      if (!ofmHandoffExcludedWarned.has(bareForHandoff)) {
+        ofmHandoffExcludedWarned.add(bareForHandoff)
         ctx.logger.info(`[model-failover] ${provider} 不在 Our Free Model 换号范围（config.ofmHandoffExcludeProviders），失败直接走分组路由`)
       }
       return null
@@ -1885,7 +2135,8 @@ export function apply(ctx, config = {}) {
 
     let allAccounts
     try {
-      allAccounts = pool.listAccountsByProvider(provider)
+      // 账号池按裸 provider id 存账号（渠道包写 state.json 时用的就是裸名）。
+      allAccounts = pool.listAccountsByProvider(bareForHandoff)
     } catch (e) {
       ctx.logger.warn(`[model-failover] 读取 ${provider} 账号列表失败：${e?.message || e}`)
       return null
@@ -1906,7 +2157,7 @@ export function apply(ctx, config = {}) {
     // 选的也是它）。因此这里冷却它 = 冷却刚失败的账号。
     let next
     try {
-      next = await pool.getAvailableAccount(provider, model)
+      next = await pool.getAvailableAccount(bareForHandoff, model)
     } catch (e) {
       ctx.logger.warn(`[model-failover] 获取 ${provider} 的可用账号失败：${e?.message || e}`)
       return null
@@ -1959,6 +2210,32 @@ export function apply(ctx, config = {}) {
   /** provider id：dsh-codearts 自己导出的 CODEARTS_PROVIDER */
   const CODEARTS_PROVIDER_ID = 'codearts'
   /**
+   * dsh-codearts 的 provider 前缀（与 FREE_CHANNELS 里那条一致）。
+   *
+   * 只认裸 id 与 ca-：caa-codearts 是 dsh-codearts-auth 注册的另一条路由，
+   * providerEquals 会把「一侧无前缀」也算等价，这里不能用它判归属。
+   */
+  const CODEARTS_PROVIDER_PREFIX = 'ca-'
+  /**
+   * dsh-codearts 的 Loader 条目名（＝包名）。
+   *
+   * 不能写成 includes('dsh-codearts')：dsh-codearts-auth（Providers Hub）的名字以它开头，
+   * 两个条目同时在跑时会把 Provider Hub 的实例当成 codearts 重启，真正的池仍是死的。
+   */
+  const CODEARTS_PLUGIN_NAME = 'dsh-codearts'
+  /**
+   * Loader 条目名是不是承载 dsh-codearts 的那个。
+   *
+   * @param {unknown} raw entry.options.name
+   * @returns {boolean} 精确等于包名（允许前后有目录/URL 前缀）时为 true
+   */
+  function isCodeartsPluginEntryName(raw) {
+    const s = String(raw ?? '')
+    if (s === '') return false
+    const tail = s.replace(/[?#].*$/, '').split('/').filter(Boolean).pop() ?? ''
+    return tail === CODEARTS_PLUGIN_NAME
+  }
+  /**
    * 「池里挑不出号」的那句固定文案。
    *
    * 只有这一句才说明「一个上游请求都没发出去」；其它 codearts 错误是真实的模型级
@@ -1972,6 +2249,148 @@ export function apply(ctx, config = {}) {
   let lastCodeartsReviveAt = 0
   /** 最近一次 codearts 自救的结论，随 /status 回传 */
   let lastCodeartsDiagnosis = null
+  /** 上一次「Jet Hub 闸门自愈」的时刻：同一形态只救一次，避免和用户的主动关闭反复拉锯 */
+  let lastGateHealAt = 0
+  /** 闸门自愈的最短间隔（重开供应商是一次写盘 + 广播，失败会重复触发） */
+  const CODEARTS_GATE_HEAL_COOLDOWN_MS = 60_000
+  /** 本机宿主的 /api 端口：与 MFM 自己的 API 同源，改端口时两边一起改 */
+  const LOCAL_API_ORIGIN = 'http://127.0.0.1:3080'
+  /** Jet Hub 的 RPC 端点（dsh-codearts-auth 的 jet-hub-rpc.js 里导出的 JET_HUB_API_PATH） */
+  const JET_HUB_API_PATH = '/api/jet-hub'
+  /** 浏览器会话 cookie 的签名密钥在凭据库里的键（packages/client/connection/src/browser-auth.ts） */
+  const BROWSER_SESSION_KEY = 'client-connection/browser-session'
+
+  /**
+   * 造一枚合法的浏览器会话 cookie，用于调本机 /api。
+   *
+   * ## 为什么要自己造
+   *
+   * `/api` 与 `/api/jet-hub` 都要浏览器会话认证（未认证一律 401 "unauthorized"，
+   * 见 packages/client/connection/src/rpc-host.ts 的 admit()）。但会话 cookie 不是服务端
+   * 内存里的 session，而是**自包含的 HMAC 令牌**：`v1.<base64url(payload)>.<base64url(sig)>`，
+   * 签名密钥就存在本机凭据库（`records["client-connection/browser-session"].payload.secret`）。
+   * 所以插件能自己签发一枚，无需人工登录、也无需重启。
+   *
+   * 载荷里的 `authority` 必须与请求的 Host 完全一致（本机就是 `127.0.0.1:3080`），
+   * cookie 名是 `dsh-auth-` + base64url(sha256(authority))。
+   *
+   * @returns {Promise<string|null>} `name=value`；取不到密钥（凭据服务或记录缺失）时为 null。
+   */
+  async function mintLocalSessionCookie() {
+    let svc
+    try { svc = ctx.get('credentials') } catch { return null }
+    if (!svc || typeof svc.readRecord !== 'function') return null
+    let record
+    try { record = await svc.readRecord(BROWSER_SESSION_KEY) } catch { return null }
+    const payload = record && typeof record === 'object' ? record.payload : undefined
+    const secretB64 = payload && typeof payload === 'object' ? payload.secret : undefined
+    if (typeof secretB64 !== 'string' || secretB64 === '') return null
+    let secret
+    try { secret = Buffer.from(secretB64, 'base64url') } catch { return null }
+    if (secret.byteLength !== 32) return null
+    const b64url = (buf) => Buffer.from(buf).toString('base64')
+      .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+    const authority = new URL(LOCAL_API_ORIGIN).host
+    const now = Date.now()
+    const body = b64url(Buffer.from(JSON.stringify({
+      version: 1,
+      authority,
+      issuedAt: now,
+      expiresAt: now + 600_000,
+    }), 'utf8'))
+    const sig = b64url(createHmac('sha256', secret).update(body).digest())
+    return `dsh-auth-${b64url(createHash('sha256').update(authority).digest())}=v1.${body}.${sig}`
+  }
+
+  /**
+   * 调一次 Jet Hub RPC。
+   *
+   * @param {string} method - RPC 方法名（如 `provider.setEnabled`）。
+   * @param {object} payload - 方法入参。
+   * @returns {Promise<object|null>} `result.value`；拿不到会话（无密钥）或 RPC 报错时为 null。
+   */
+  async function callJetHubRpc(method, payload) {
+    const cookie = await mintLocalSessionCookie()
+    if (cookie === null) return null
+    const res = await fetch(`${LOCAL_API_ORIGIN}${JET_HUB_API_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, accept: 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: `mfm-${method}-${Date.now()}`,
+        method: 'jet-hub',
+        payload: { method, payload },
+      }),
+    })
+    if (!res.ok) return null
+    const body = await res.json()
+    const result = body && typeof body === 'object' ? body.result : undefined
+    return result && result.ok === true ? (result.value ?? {}) : null
+  }
+
+  /**
+   * 经 Jet Hub RPC 重新打开 codearts 供应商。
+   *
+   * 打开方向由 dsh-codearts-auth 自己收口（jet-hub-rpc.js 的 provider.setEnabled）：
+   * 一次清空模型黑名单与 `providerClosed` 意图、启用全部账号并广播目录变更。
+   * 插件不自己拼这几步，避免与它「先关模型再停账号」的顺序约定分叉。
+   *
+   * @returns {Promise<boolean>} 是否确认已打开。
+   */
+  async function openCodeartsProviderViaJetHub() {
+    const value = await callJetHubRpc('provider.setEnabled', { provider: CODEARTS_PROVIDER_ID, enabled: true })
+    if (value === null) return false
+    return value.enabled === true
+  }
+
+  /**
+   * Jet Hub 的闸门把 bili 的候选 ref 关死了，就把它打开。
+   *
+   * ## 为什么必须由失败路径触发，而不是在镜像轮询里自动救
+   *
+   * 关掉 codearts 供应商是**用户的显式决定**（Jet Hub 左侧那个开关）。镜像轮询每 10 秒
+   * 跑一次，若在那里自愈，用户点「关闭」后不到 10 秒就会被插件强行打开 —— 等于插件
+   * 不认用户的意图。只有在**真实请求已经被 bili 拒掉**之后才救，语义才是「这条链路现在
+   * 真的坏了，而修它的代价是重开一个你已经关掉的渠道」。
+   *
+   * ## 用什么救
+   *
+   * 走 Jet Hub RPC（`provider.setEnabled`），不碰 `jet-hub/state.json` 文件：那个文件是
+   * 运行中进程的**内存快照整体回写**目标，外部改它会被下一次保存静默覆盖（实测过一次：
+   * 手改磁盘后宿主一落盘就回到关闭态）。RPC 同时写内存与磁盘，且在打开方向会一并清掉
+   * `providerClosed`、模型黑名单与账号停用位。
+   *
+   * @param {object} gate - {@link inspectGate} 的现场。
+   * @returns {Promise<'healed'|'skipped'|'failed'>} 处置结论。
+   */
+  async function healCodeartsGate(gate) {
+    if (gate === null || gate === undefined) return 'skipped'
+    // 只有当「有账号、但 bili 一个 ref 都枚举不到」时才需要动供应商开关。
+    if (gate.accountsTotal === 0 || gate.seeableRefs > 0) return 'skipped'
+    const now = Date.now()
+    if (now - lastGateHealAt < CODEARTS_GATE_HEAL_COOLDOWN_MS) return 'skipped'
+    lastGateHealAt = now
+    let opened
+    try {
+      opened = await openCodeartsProviderViaJetHub()
+    } catch (e) {
+      ctx.logger.warn(`[model-failover] codearts 闸门自愈失败：${String((e && e.message) || e)}（请在 Jet Hub 里手动打开 codearts 供应商）`)
+      return 'failed'
+    }
+    if (opened !== true) {
+      ctx.logger.warn('[model-failover] codearts 闸门关闭，但走不通 Jet Hub RPC，无法自愈（请在 Jet Hub 里手动打开 codearts 供应商）')
+      return 'failed'
+    }
+    ctx.logger.warn(
+      `[model-failover] codearts 闸门已自愈：经 Jet Hub RPC 重新打开了 codearts 供应商`
+      + `——bili 的重签候选 ref 从 0 恢复到 ${gate.staleRefs} 个，CodeArts 请求不会再被本地拒收。`,
+    )
+    // 镜像侧缓存失效并立刻重同步：账号重新启用后 payload 可能没变，不失效这一轮会被跳过。
+    if (resignBridgeHandle !== null && typeof resignBridgeHandle.resyncNow === 'function') {
+      void resignBridgeHandle.resyncNow().catch(() => { /* 下一拍同步会重试 */ })
+    }
+    return 'healed'
+  }
 
   /**
    * 这个 provider 是不是 codearts。
@@ -1980,8 +2399,15 @@ export function apply(ctx, config = {}) {
    * 但都落在同一个 provider 上。
    */
   function isCodeartsFailure(provider, failure) {
-    if (provider === CODEARTS_PROVIDER_ID) return true
-    return String(failure?.provider ?? '') === CODEARTS_PROVIDER_ID
+    // provider 可能是注册表 id（ca-codearts）；两侧都按裸名比，否则整段自救逻辑不触发。
+    // 但归属必须看前缀：providerEquals 认为「任一侧无前缀」即等价，会把 caa-codearts
+    // （dsh-codearts-auth 的路由）也算成 codearts 池故障，去重启一个无关的实例。
+    const isCodeartsRoute = (id) => {
+      const ident = providerIdentity(id)
+      if (ident.bare !== CODEARTS_PROVIDER_ID) return false
+      return ident.prefix === '' || ident.prefix === CODEARTS_PROVIDER_PREFIX
+    }
+    return isCodeartsRoute(provider) || isCodeartsRoute(failure?.provider)
   }
 
   /**
@@ -2025,8 +2451,9 @@ export function apply(ctx, config = {}) {
     let target
     try {
       for (const entry of loader.entries()) {
-        const entryName = String(entry?.options?.name ?? '')
-        if (!entryName.includes('dsh-codearts')) continue
+        // 精确匹配包名：includes('dsh-codearts') 会把 dsh-codearts-auth（Providers Hub）
+        // 也算进来，两个条目同时在跑时会重启错误的实例，真正的 codearts 池仍是死的。
+        if (!isCodeartsPluginEntryName(entry?.options?.name)) continue
         if (!entry.fiber || entry.fiber.uid === null) continue
         target = entry
         break
@@ -2061,7 +2488,7 @@ export function apply(ctx, config = {}) {
       try {
         const llm = ctx.get('llm')
         const providers = llm?.listProviders?.() ?? []
-        if (providers.some(p => String(p?.id) === CODEARTS_PROVIDER_ID)) return true
+        if (providers.some(p => providerEquals(p?.id, CODEARTS_PROVIDER_ID))) return true
       } catch { /* 重启窗口内服务可能短暂不可读，继续等 */ }
       if (Date.now() >= deadline) return false
       await new Promise(resolve => setTimeout(resolve, 200))
@@ -2083,7 +2510,7 @@ export function apply(ctx, config = {}) {
       if (loader && typeof loader.entries === 'function') {
         loaderAvailable = true
         for (const entry of loader.entries()) {
-          if (!String(entry?.options?.name ?? '').includes('dsh-codearts')) continue
+          if (!isCodeartsPluginEntryName(entry?.options?.name)) continue
           if (!entry.fiber || entry.fiber.uid === null) continue
           entryId = String(entry.options?.id ?? '')
           break
@@ -2099,6 +2526,12 @@ export function apply(ctx, config = {}) {
       // 签名的请求；这是「池里挑不出号」最常见的成因，且重启救不了。
       blockedBySignature: state.blockedBySignature,
       slots: state.slots.map(s => ({ id: s.id, state: s.state, detail: s.detail ? String(s.detail).slice(0, 200) : undefined })),
+      // Jet Hub 的闸门现场：候选 ref 为 0 时 bili 必然拒收，而凭据镜像照样健康 ——
+      // 把它放在这里，看板一眼就能区分「凭据坏了」与「供应商被关了」。
+      gate: resignBridgeHandle !== null && typeof resignBridgeHandle.inspectGate === 'function'
+        ? await resignBridgeHandle.inspectGate().catch(() => null)
+        : null,
+      gateHealCooldownMs: Math.max(0, CODEARTS_GATE_HEAL_COOLDOWN_MS - (Date.now() - lastGateHealAt)),
       lastDiagnosis: lastCodeartsDiagnosis,
     }
   }
@@ -2133,27 +2566,21 @@ export function apply(ctx, config = {}) {
     try {
       providerIds = (ctx.get('llm')?.listProviders?.() ?? []).map(p => String(p?.id ?? '')).filter(Boolean)
     } catch { /* 只读诊断：注册表读不到就当没有在线渠道 */ }
-    // 同一个 provider id 可能被多个渠道认领（专用连接器与聚合渠道都接 trae / qoder）。
-    // 认领规则：撞号的 id 上，专用连接器只在它自己装了时认领，没装就让给聚合渠道；
-    // 不撞号的 id（codearts、workbuddy）照旧显示，装没装不影响它「此刻在不在线」。
-    // 取不到插件管理服务时 installed 一律 null，退回按静态顺序认领（同前行为）。
-    // 认领顺序与展示顺序分开：聚合渠道无论排第几都最后认领，否则它会把专用连接器的 id 全吃掉。
-    const aggregators = FREE_CHANNELS.filter(other => other.aggregator === true)
-    const contested = c => aggregators.some(a => providerIds.some(id => c.providers.test(id) && a.providers.test(id)))
-    const claimOrder = [
-      ...FREE_CHANNELS.filter(c => c.aggregator !== true),
-      ...FREE_CHANNELS.filter(c => c.aggregator === true),
-    ]
-    const claimed = new Set()
-    /** @type {Map<string, string[]>} */
-    const owned = new Map()
-    for (const c of claimOrder) {
-      const installedNow = managerAvailable ? installed.has(c.pkg) : null
-      const mayClaim = c.aggregator === true || installedNow === null || installedNow === true || !contested(c)
-      const mine = mayClaim ? providerIds.filter(id => !claimed.has(id) && c.providers.test(id)) : []
-      for (const id of mine) claimed.add(id)
-      owned.set(c.id, mine)
-    }
+    // 认领算法本身在 provider-prefix.mjs 的 claimFreeChannels（纯函数，可离线单测）：
+    //  · 同一个裸名可能被多个渠道认领（专用连接器与聚合渠道都接 trae / qoder）：
+    //    撞号时专用连接器只在「自己装了 / 装没装未知 / 该 id 没被聚合渠道命中」时认领，
+    //    没装就让给聚合渠道；不撞号的 id（codearts、workbuddy）装没装都照旧显示。
+    //  · 认领顺序与展示顺序分开：聚合渠道无论排第几都最后认领。
+    //  · 正则一律对本渠道前缀剥出来的裸名跑（channelBare）：门面态下注册表里是
+    //    ofm-qoder / caa-codearts 这种，别的插件前缀下的 id 不掺和本渠道的归属。
+    //  · 认领集合以**注册表原始 id** 为粒度，所以 ofm-qoder 与 caa-qoder 能同时列出；
+    //    返回的也是原始 id（界面展示的是「此刻在线的哪条路由」）。
+    const owned = claimFreeChannels({
+      channels: FREE_CHANNELS,
+      providerIds,
+      // 取不到插件管理服务时 installed 一律 null，退回按静态顺序认领（同前行为）
+      isInstalled: (pkg) => (managerAvailable ? installed.has(pkg) : null),
+    })
     const channels = FREE_CHANNELS.map(c => ({
       id: c.id,
       pkg: c.pkg,
@@ -2227,6 +2654,35 @@ export function apply(ctx, config = {}) {
       return 'fallthrough'
     }
 
+    // A0. 先看 Jet Hub 的闸门：它关着的时候 bili 一个候选 ref 都枚举不到，
+    //     表现与「没有重签凭据」**一模一样**（同样是 403 signed_request_requires_resign），
+    //     但成因和修法完全不同 —— 凭据其实新鲜且已镜像，要开的是供应商开关。
+    //     这条分支必须先于 A，否则每次都会把用户引去查凭据（实测踩过）。
+    if (state.blockedBySignature) {
+      const gate = resignBridgeHandle !== null && typeof resignBridgeHandle.inspectGate === 'function'
+        ? await resignBridgeHandle.inspectGate().catch(() => null)
+        : null
+      const healed = await healCodeartsGate(gate)
+      if (healed === 'healed') {
+        lastCodeartsDiagnosis = {
+          at: Date.now(), kind: 'gate-healed', disabled, cooling, gate,
+          hint: 'Jet Hub 里 codearts 供应商被关闭，导致 bili 的重签候选 ref 为 0（凭据本身是好的）；'
+            + '已重新打开该供应商并重同步凭据镜像。',
+        }
+        ctx.logger.warn(`[model-failover] ${provider}/${model} 的 403 不是凭据问题：Jet Hub 的 codearts 闸门关着（候选 ref 0 个），已自愈并重试`)
+        return 'retry'
+      }
+      if (healed === 'failed') {
+        lastCodeartsDiagnosis = {
+          at: Date.now(), kind: 'gate-heal-failed', disabled, cooling, gate,
+          hint: 'Jet Hub 里 codearts 供应商被关闭（bili 的重签候选 ref 为 0），但本插件取不到 providers-hub 的账号池，无法自愈；'
+            + '请在 Jet Hub 里手动打开 codearts 供应商。',
+        }
+        ctx.logger.error(`[model-failover] ${provider}/${model} 失败：Jet Hub 的 codearts 闸门关着且无法自愈（请手动打开该供应商）`)
+        return 'signature-blocked'
+      }
+    }
+
     // A. 签名中间层拒绝：重启没有任何用，账号凭据和池都是被「拒转发」连带污染的
     if (state.blockedBySignature) {
       lastCodeartsDiagnosis = {
@@ -2286,7 +2742,9 @@ export function apply(ctx, config = {}) {
    */
   function compressionGapOf(provider) {
     if (!compactionGuard) return null
-    const id = String(provider ?? '')
+    // 名单是裸 id，注册表 id 可能带插件前缀（ofm-qoder）；返回的也统一成裸 id，
+    // 免得上层拿它再比一遍名单时又对不上。
+    const id = bareProvider(provider)
     if (!uncompressedProviders.has(id)) return null
     if (!biliCompactionActive()) return null
     // shim 已经把这家的请求改成明文 OpenAI 送进 bili，压缩照常发生，不再算旁路。
@@ -2308,7 +2766,7 @@ export function apply(ctx, config = {}) {
    * @returns {boolean} 已接管则为 true。
    */
   function qoderShimCovers(provider) {
-    if (!QODER_SHIM_PROVIDERS.has(provider)) return false
+    if (!QODER_SHIM_PROVIDERS.has(bareProvider(provider))) return false
     if (qoderShimHandle === null) return false
     try {
       const st = qoderShimHandle.status()
@@ -2370,7 +2828,8 @@ export function apply(ctx, config = {}) {
     }
     const degradedSessions = []
     for (const [sessionId, m] of overrides.entries()) {
-      if (!compressionGapOf(m.provider)) continue
+      // overrides 里已是裸 id，再裸化一次保证与 uncompressedProviders 名单同形
+      if (!compressionGapOf(bareProvider(m.provider))) continue
       degradedSessions.push({ sessionId, provider: m.provider, model: m.model })
     }
     return {
@@ -2590,11 +3049,18 @@ export function apply(ctx, config = {}) {
     const endTurn = () => { errorTurns.set(id, turn); return action }
     // provider 优先取事件自带的（就是这次请求实际用的），model 只能从请求头取。
     // 原先两者都只读 requestHeader()，头缺失/滞后时会静默不处理——既不标记也不切换。
-    let provider; let model
+    let provider; let model; let rawProvider
     const active = overrides.get(id)
     try {
       const header = agent.session.requestHeader()
-      provider = eventProvider ?? active?.provider ?? header?.config?.provider
+      // 两个视图都要留着：归属判定看前缀，记账看裸名。
+      //   · 前缀：ca- 是 dsh-codearts 的路由、caa- 是 Providers Hub 的、ofm- 是 Our Free Model 的。
+      //     丢了前缀就没法把「账号池自愈」「换号」判给对的插件（caa-codearts 会被当成
+      //     dsh-codearts 的池故障，ofm-qoder 会被当成别人的路由而不换号）。
+      //   · 裸名：失败表与 isFailed 一律按裸 id 记账（见 failKey），不还原就会与
+      //     groups.json 里的裸 id 各记一份，同一模型永远不被判失败。
+      rawProvider = eventProvider ?? active?.provider ?? header?.config?.provider
+      provider = bareProvider(rawProvider)
       model = active?.model ?? header?.config?.model
     } catch {
       noteFailure(agent, eventProvider, failure, 'no-request-header')
@@ -2611,8 +3077,8 @@ export function apply(ctx, config = {}) {
     // 把账号停用（重启条目即可），也可能是 billion-context 拒绝转发签名请求
     // （重启无效，必须给 bili 重签凭据）。必须在换号/标记失败之前处理——否则会把
     // 一次可自愈的池状态写成「模型当日失败」，或者对注定失败的链路反复重试。
-    if (isCodeartsFailure(provider, failure)) {
-      const verdict = await handleCodeartsFailure(provider, model, failure)
+    if (isCodeartsFailure(rawProvider, failure)) {
+      const verdict = await handleCodeartsFailure(rawProvider, model, failure)
       noteFailure(agent, provider, failure, `codearts-${verdict}`, {
         model,
         detail: lastCodeartsDiagnosis?.hint ?? null,
@@ -2644,7 +3110,7 @@ export function apply(ctx, config = {}) {
     // 请求被拒也不换号：模型上限/参数问题与凭据无关，换号只会白等一轮。
     const handedTo = (capacityFailure || requestRejected)
       ? null
-      : await handoffToFreeModelAccount(provider, model, failure)
+      : await handoffToFreeModelAccount(rawProvider, model, failure)
     if (handedTo) {
       noteFailure(agent, provider, failure, 'account-handoff', { model, detail: '账号 ' + handedTo })
       return { kind: 'retry' }
@@ -2909,7 +3375,9 @@ export function apply(ctx, config = {}) {
     const active = overrides.get(id)
     try {
       const header = agent.session.requestHeader()
-      provider = active?.provider ?? header?.config?.provider
+      // isFailed/resetFailed 用裸 id 记账，这里先归一化（ofm-qoder → qoder），
+      // 否则成功轮永远清不掉失败标记。
+      provider = bareProvider(active?.provider ?? header?.config?.provider)
       model = active?.model ?? header?.config?.model
     } catch { return }
     if (!provider || !model) return
@@ -2929,6 +3397,11 @@ export function apply(ctx, config = {}) {
   // 不传 sessionId、也不传 purpose：llm-error-retry 只约束带 sessionId 的主请求，
   // 那套「首字 90s × 5 次」的重试不该覆盖测速——否则一个挂掉的模型会独占几分钟。
   // 超时由这里自己的 AbortController 控制，一个模型最多占 timeoutMs。
+  //
+  // 测速的请求**同样计入看板**：它走的就是 llm.stream，guardedStream 照常记一条
+  // 样本（首字、速度、token、成败），只是打上 probe 标记，看板据此说明「历史列里
+  // 有 N 次是测速打出来的」。这也是为什么测速不用自己拼 HTTP：另一条路径测出来的
+  // 数会被记进另一个桶，看板上永远看不见。
   const SPEED_TEST_MIN_TIMEOUT_MS = 5_000
   const SPEED_TEST_MAX_TIMEOUT_MS = 120_000
   const SPEED_TEST_DEFAULT_TIMEOUT_MS = 45_000
@@ -3002,7 +3475,7 @@ export function apply(ctx, config = {}) {
    * 测一个模型：发一次最小请求，回填首字延迟、输出速度与用量。
    *
    * 采样不在这里记：调用走的就是 `llm.stream`，`guardedStream` 已经按同一套口径
-   * 记了一条样本（首字/速度/token/成败），这里再记一遍会把看板计数翻倍。
+   * 记了一条样本（首字/速度/token/成败，带 probe 标记），这里再记一遍会把计数翻倍。
    *
    * @param {{provider: string, model: string, effort?: string}} target - 待测模型。
    * @param {number} timeoutMs - 单模型超时。
@@ -3014,7 +3487,7 @@ export function apply(ctx, config = {}) {
     let llm
     try { llm = ctx.get('llm') } catch { /* 下面统一报错 */ }
     if (!llm || typeof llm.stream !== 'function') {
-      return { ...base, ok: false, ttftMs: null, tps: null, inTokens: null, outTokens: null, cacheReadTokens: null, cacheWriteTokens: null, errorCode: 'NO_LLM_SERVICE', error: 'llm 服务不可用' }
+      return { ...base, route: null, ok: false, ttftMs: null, tps: null, inTokens: null, outTokens: null, cacheReadTokens: null, cacheWriteTokens: null, errorCode: 'NO_LLM_SERVICE', error: 'llm 服务不可用' }
     }
     const controller = new AbortController()
     const onOuterAbort = () => controller.abort()
@@ -3028,9 +3501,12 @@ export function apply(ctx, config = {}) {
     let usageCacheWrite = null
     let finish = null
     let thrown = null
+    // 注册表此刻认识的 id（打了门面就是 ofm-qoder 这种）：写进 llm.stream 的必须是它，
+    // 否则宿主在 prepareCall 阶段报 NO_ADAPTER，测出来的是「没装适配器」而不是速度。
+    const route = liveProviderIdOf(target.provider)
     try {
       const options = {
-        provider: target.provider,
+        provider: route,
         model: target.model,
         messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
         // 只要够触发一次首字与少量输出即可：测的是链路往返，不是回答质量。
@@ -3038,6 +3514,10 @@ export function apply(ctx, config = {}) {
         signal: controller.signal,
         ...(target.effort ? { reasoningEffort: target.effort } : {}),
       }
+      // 登记成「测速调用」：闸门据此允许它超出并发上限（照常计数、照常记样本），
+      // 否则一个正被会话打满的模型会让测速当场 CAPACITY_TIMEOUT——而它恰恰是
+      // 用户最想确认的那一个。登记按选项对象本身认，不依赖任何全局状态。
+      speedTestCallOptions.add(options)
       for await (const chunk of llm.stream(options)) {
         if (firstAt === null
           && (chunk?.type === 'text-delta' || chunk?.type === 'reasoning-delta' || chunk?.type === 'tool-call-delta')) {
@@ -3071,6 +3551,9 @@ export function apply(ctx, config = {}) {
       : null
     return {
       ...base,
+      // 这一行实际打到的是哪条注册表路由（分组里写的是裸 id，门面之后是 ofm-trae 这种）。
+      // 界面据此区分「同一个渠道在不同插件下的两条路由」，排障时也不用去猜。
+      route,
       ok,
       ttftMs,
       tps,
@@ -3229,7 +3712,7 @@ export function apply(ctx, config = {}) {
               const limit = concurrencyLimitOf(m.provider, m.model)
               return limit > 0 ? limit : null
             })(),
-            inflight: inflightByModel.get(`${m.provider}/${m.model}`) ?? 0,
+            inflight: inflightByModel.get(failKey(m.provider, m.model)) ?? 0,
             // 并发冷却现场：非 null 表示它此刻因并发被临时挡在路由之外，到期自动恢复
             capacityCooldown: (() => {
               const cd = capacityCooldownOf(m.provider, m.model)
@@ -3306,25 +3789,37 @@ export function apply(ctx, config = {}) {
       const until = parseDay(url.searchParams.get('until'), true)
       const window = since === undefined && until === undefined ? undefined : { since, until }
       // 只列出「分组里出现过的」模型，避免把宿主里几百个模型全塞给界面。
-      // 同一模型出现在多个分组时取第一条的 priority / groupName；并发上限来自
-      // modelConcurrency，与出现在哪个分组无关。
-      const seen = new Set()
+      //
+      // 一行 = **一个渠道 + 一个模型**，不是「一个分组成员」。同一个渠道同一个模型
+      // 出现在两个分组里（很常见：通用组 + DeepSeek 专项组）时，闸门、失败表、
+      // 采样桶都只有一份（键是裸 id + 模型），所以看板也只该有一行；分成两行会让
+      // 同一批样本被算两次，看起来像是「两个模型各自跑了一半」。
+      // 去重键因此是 failKey，而不是分组条目原文（条目可能带前缀，也可能是裸名）。
       const rows = []
+      /** failKey -> 该行所属的全部分组 {id, name}（按 groups 的先后顺序） */
+      const rowGroups = new Map()
       // 同一时刻的读数喂给所有行：一屏里的「总速度」必须是同一瞬间快照，
       // 否则逐行取 now 会让先算的行比后算的行早几毫秒，同一份响应自相矛盾。
       const sampledAt = Date.now()
       for (const g of groups) {
         for (const m of g.models || []) {
-          const key = `${m.provider}/${m.model}`
-          if (seen.has(key)) continue
-          seen.add(key)
+          const key = failKey(m.provider, m.model)
+          const own = rowGroups.get(key)
+          if (own !== undefined) {
+            // 已经有一行：只补记它还在哪些分组里（同一渠道同一模型的样本不分家）。
+            // 同一分组里重复登记的同一条（历史数据）不重复计数。
+            if (!own.some(x => x.id === g.id)) own.push({ id: g.id, name: g.name })
+            continue
+          }
+          rowGroups.set(key, [{ id: g.id, name: g.name }])
           const stats = speedStatsOf(key, window)
           const limit = concurrencyLimitOf(m.provider, m.model)
           const cooldown = capacityCooldownOf(m.provider, m.model)
           rows.push({
             provider: m.provider,
             model: m.model,
-            // priority 与 groupName 一起给，界面才能按「分组 → 优先级」排序
+            // priority 与 groupName 一起给，界面才能按「分组 → 优先级」排序；
+            // groupNames 是这一行所属的全部分组，界面显示它被哪些分组共用。
             priority: m.priority ?? 99,
             effort: m.effort ?? null,
             groupId: g.id,
@@ -3336,7 +3831,7 @@ export function apply(ctx, config = {}) {
             // 已完成调用的历史分位数，这条跟着「进行中」涨落。
             aggregateTps: liveSpeedOf(key, sampledAt),
             concurrency: limit > 0 ? limit : null,
-            inflight: inflightByModel.get(key) ?? 0,
+            inflight: inflightByModel.get(failKey(m.provider, m.model)) ?? 0,
             // 等槽位中的请求数：闸门自己不再排队，这个数只在「整组都满、正在等这个
             // 模型的槽位释放」时才不为 0（见 routeAfterModelFailure 的那条等待）。
             queued: (waitingByModel.get(key) ?? []).length,
@@ -3346,9 +3841,17 @@ export function apply(ctx, config = {}) {
             capacityUntil: cooldown === null ? null : cooldown.until,
             capacityReason: cooldown === null ? null : cooldown.reason,
             // 是否有会话正被从这个模型临时换走
-            switchedAway: [...capacitySwitches.values()].some(s => s.provider === m.provider && s.model === m.model),
+            // providerEquals：capacitySwitches 里的 provider 可能带前缀，分组条目是裸名
+            switchedAway: [...capacitySwitches.values()].some(s => providerEquals(s.provider, m.provider) && s.model === m.model),
           })
         }
+      }
+      // 收尾：把每行所属的全部分组摊平成 rowGroups 顺序的 groupNames，
+      // 并把 groups 数组留给界面（它要显示「渠道+模型被哪些分组共用」）。
+      for (const row of rows) {
+        const list = rowGroups.get(failKey(row.provider, row.model)) ?? []
+        row.groups = list
+        row.groupNames = list.map(x => x.name)
       }
       sendJson(res, 200, {
         rows,
@@ -3558,7 +4061,8 @@ export function apply(ctx, config = {}) {
           picked = firstAvailableInGroup(body.groupId)
           const agent = findAgent(ctx, body.sessionId)
           if (picked && agent?.session) await applyActiveModel(agent, picked)
-          else if (picked) overrides.set(String(body.sessionId), picked)
+          // overrides 存裸 id（与 /status、分组条目同形）
+          else if (picked) overrides.set(String(body.sessionId), { ...picked, provider: bareProvider(picked.provider) })
           else ctx.logger.warn(`[model-failover] 分组 ${body.groupId} 内无可用模型（全部当日失败）`)
         } else {
           // 故障兜底：不接管当前模型，交由用户手选
@@ -3706,7 +4210,8 @@ export function apply(ctx, config = {}) {
         let touched = 0
         for (const g of groups) {
           for (const m of g.models || []) {
-            if (m.provider !== body.provider || m.model !== body.model) continue
+            // providerEquals：界面可能传注册表 id（ofm-qoder），分组条目是裸 'qoder'
+            if (!providerEquals(m.provider, body.provider) || m.model !== body.model) continue
             if (want) m.disabled = true
             else delete m.disabled
             touched++
@@ -3856,7 +4361,8 @@ export function apply(ctx, config = {}) {
         shimRegistryProbe = {
           llm: llmSvc === null || llmSvc === undefined ? 'none' : 'ok',
           registry: reg === null || reg === undefined ? 'none' : (typeof reg.get === 'function' ? 'map:' + reg.size : typeof reg),
-          keys: reg !== null && reg !== undefined && typeof reg.forEach === 'function' ? (() => { const out = []; reg.forEach((v, k) => out.push(String(k))); return out.filter((k) => k.includes('qoder')) })() : [],
+          // 列出注册表里所有 qoder 系键（裸 qoder、ofm-qoder、caa-qoder…）：shim 要给每个活的打补丁
+          keys: reg !== null && reg !== undefined && typeof reg.forEach === 'function' ? (() => { const out = []; reg.forEach((v, k) => out.push(String(k))); return out.filter((k) => bareProvider(k).includes('qoder')) })() : [],
         }
         qoderShimHandle = await shimModule.startQoderShim({ ctx, logger: ctx.logger, port: qoderShimPort, wasmPath: qoderShimWasmPath })
         const st = qoderShimHandle.status()

@@ -36,6 +36,8 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+// 剥插件前缀（ca-codearts → codearts）：账号库里的 provider 是裸名，注册表侧才带前缀
+import { bareProvider } from './provider-prefix.mjs'
 
 const HOME_DIR = process.env['DSH_HOME'] || join(homedir(), '.dsh')
 /** dsh-codearts 的账号库：账号 id 为键，含 accessKeyId / secretAccessKey / token / expiration。 */
@@ -119,13 +121,53 @@ export async function candidateRefs(file = JET_HUB_STATE) {
   const refs = []
   for (const account of accounts) {
     if (account === null || typeof account !== 'object') continue
-    if (account.provider !== 'codearts') continue
+    // 落盘的 accounts 用裸 provider id，但状态文件可能被门面态（ca-codearts）写回，
+    // 两种写法都认，否则整份候选 ref 列表会突然变空、bili 退到 fallbackRefs。
+    if (bareProvider(account.provider) !== 'codearts') continue
     if (account.enabled === false) continue
     const ref = account.credentialRef
     if (typeof ref !== 'string' || ref.trim() === '') continue
     if (!refs.includes(ref.trim())) refs.push(ref.trim())
   }
   return refs
+}
+
+/**
+ * jet-hub 里 codearts 的闸门现场 —— bili 的候选 ref **完全由它决定**。
+ *
+ * bili 的 `codeartsRefCandidates()` 只读 `jet-hub/state.json`，跳过 `enabled === false`
+ * 的记录。所以用户一旦在 Jet Hub 里关掉 codearts 供应商（一次动作写三处：账号
+ * `enabled:false`、`providerClosed.codearts:true`、模型黑名单），候选清单就空了 ——
+ * bili 转发前直接回 403 `signed_request_requires_resign`，压缩随之消失。
+ *
+ * ⚠️ 这是本模块最危险的盲区：`fallbackRefs` 保证镜像永远「成功」，于是 /status 的
+ * `mirroredRefs` / `accountCount` / `lastError` 全都健康，而 bili 根本枚举不到任何 ref。
+ * 把闸门现场如实回传，是让这个盲区**可见**的唯一办法。
+ *
+ * @param {string} [file] - jet-hub 状态路径，缺省为 `$DSH_HOME/jet-hub/state.json`。
+ * @returns {Promise<object|null>} 闸门现场；读不到文件（没装 Providers Hub）时为 null。
+ */
+export async function jetHubGate(file = JET_HUB_STATE) {
+  let parsed
+  try {
+    parsed = JSON.parse(await readFile(file, 'utf8'))
+  } catch {
+    // 读不到 ≠ 被关闭：没有 jet-hub 时这一段整体不适用，返回 null 让调用方跳过。
+    return null
+  }
+  const rows = Array.isArray(parsed?.accounts) ? parsed.accounts : []
+  const ours = rows.filter((row) => row !== null && typeof row === 'object' && bareProvider(row.provider) === 'codearts')
+  const closed = (parsed?.providerClosed ?? {})['codearts'] === true
+  const hasRef = (row) => typeof row.credentialRef === 'string' && row.credentialRef.trim() !== ''
+  return {
+    closed,
+    accountsTotal: ours.length,
+    accountsDisabled: ours.filter((row) => row.enabled === false).length,
+    // bili 真正能枚举到的 ref 数（与 candidateRefs 同一判据）：0 = 重签臂必然失败
+    seeableRefs: ours.filter((row) => row.enabled !== false && hasRef(row)).length,
+    // 结构还在但被停用：ref 与凭据仍有效，自愈就是把它们捞回来
+    staleRefs: ours.filter((row) => row.enabled === false && hasRef(row)).length,
+  }
 }
 
 /**
@@ -176,6 +218,8 @@ export function startCodeartsResignBridge({ ctx, logger, settings, fallbackRefs 
     skipReason: enabled ? '尚未同步' : '已关闭',
     mirroredRefs: [],
     accountCount: 0,
+    // 闸门现场（见 jetHubGate）：bili 能不能枚举到 ref，取决于这里而不是镜像本身
+    gate: null,
   }
   const setState = (patch) => { Object.assign(state, patch); return snapshot() }
 
@@ -190,12 +234,50 @@ export function startCodeartsResignBridge({ ctx, logger, settings, fallbackRefs 
       skipReason: state.skipReason,
       mirroredRefs: [...state.mirroredRefs],
       accountCount: state.accountCount,
+      gate: state.gate,
     }
+  }
+
+  /** 上一次闸门告警的形态，用来把「每 10 秒刷一行」压成「只在形态变化时报一次」。 */
+  let gateWarnedSignature = null
+
+  /**
+   * 把闸门现场变成一条可执行的告警。
+   *
+   * 只有一种形态值得打扰用户：**有可用账号，但 bili 一个 ref 都枚举不到**（`seeableRefs === 0`）。
+   * 那种情况下镜像照样成功、/status 照样健康，而每次 CodeArts 请求都会被 bili 在转发前拒掉，
+   * 用户看到的是一句「本地代理拦下了这条签名请求」。其余形态（没装 Providers Hub、用户
+   * 没有 CodeArts 账号）都是正常部署，不打扰。
+   *
+   * @param {object|null} gate - {@link jetHubGate} 的返回值。
+   */
+  function reportGate(gate) {
+    if (gate === null || gate === undefined) return
+    const blind = gate.accountsTotal > 0 && gate.seeableRefs === 0
+    const signature = blind ? `blind:${gate.accountsTotal}:${gate.closed}` : `ok:${gate.seeableRefs}`
+    if (signature === gateWarnedSignature) return
+    gateWarnedSignature = signature
+    if (!blind) {
+      logger.info(`[model-failover] codearts 闸门已恢复：bili 能枚举到 ${gate.seeableRefs} 个候选 ref`)
+      return
+    }
+    const why = gate.closed
+      ? `Jet Hub 把整个 codearts 供应商标成了「已关闭」（providerClosed.codearts=true），${gate.accountsDisabled} 个账号随之停用`
+      : `Jet Hub 里 ${gate.accountsDisabled} 个 codearts 账号被停用`
+    logger.warn(
+      `[model-failover] codearts 闸门关闭：${why}；bili 的候选 ref 因此为 0，CodeArts 请求会在转发前被拒（403 signed_request_requires_resign），压缩也随之消失。`
+      + `凭据镜像本身是健康的（已镜像 ${state.mirroredRefs.length} 个 ref），别去查凭据 —— 要改的是 Jet Hub 的供应商开关。`
+      + `修法：Jet Hub 里把 codearts 供应商打开（provider.setEnabled {provider:"codearts",enabled:true}），或等本插件在真实失败时自愈。`,
+    )
   }
 
   const sync = async () => {
     if (stopped) return snapshot()
     if (!enabled) { setState({ skipReason: '已关闭' }); return snapshot() }
+    // 闸门现场先读：它是「镜像一切正常、bili 却仍拒收」的唯一解释来源（见 jetHubGate）。
+    const gate = await jetHubGate(jetHubStateFile)
+    setState({ gate })
+    reportGate(gate)
     const credSvc = ctx.get('credentials')
     if (credSvc === null || credSvc === undefined || typeof credSvc.set !== 'function') {
       failures += 1
@@ -278,6 +360,23 @@ export function startCodeartsResignBridge({ ctx, logger, settings, fallbackRefs 
   return {
     status: () => snapshot(),
     syncNow: () => sync(),
+    /**
+     * 闸门现场（供 /status 与真实失败路径共用一次读取）。
+     * @returns {Promise<object|null>} {@link jetHubGate} 的返回值。
+     */
+    inspectGate: () => jetHubGate(jetHubStateFile),
+    /**
+     * 让镜像忘掉「已写入」的缓存并立刻重同步一轮。
+     *
+     * 自愈刚把账号捞回来时必须走这里：`lastWritten` 记的是上一次的 payload，账号重新启用后
+     * 内容可能没变，不失效的话这一轮会判「无变化」跳过，而 bili 那边正等着这份凭据。
+     * @returns {Promise<object>} 同步后的现场。
+     */
+    resyncNow() {
+      lastWritten = new Map()
+      gateWarnedSignature = null
+      return sync()
+    },
     /**
      * 运行期改开关或间隔（设置页）。
      * @param {{ enabled?: boolean, intervalSeconds?: unknown }} next - 新的设置值。

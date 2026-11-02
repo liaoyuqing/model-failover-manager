@@ -23,6 +23,73 @@ const PENDING_TTL_MS = 120_000
 const PENDING_MAX = 256
 
 /**
+ * 本 shim 接管的渠道（裸 id）。
+ *
+ * 与 host.mjs 的 QODER_SHIM_PROVIDERS 同源，这里单独列一份而不是从 host 导入：
+ * host 是异步动态 import 本模块，反向 import host 会形成循环，且 shim 也允许被
+ * 单独启动（调试用）。两份名单要一起改。
+ */
+const SHIM_PROVIDER_IDS = new Set(['qoder', 'qodercn'])
+/**
+ * 从 llm 注册表挑出本 shim 接管的 adapter（纯函数，便于离线自检）。
+ *
+ * 每个插件都有自己的 provider 前缀（ofm- / caa- / cq- …），所以**同一个裸名会有多个
+ * 同时在线**：ofm-qoder 由 dsh-our-free-model 注册（走它内联进 pack.js 的那份加密器），
+ * caa-qoder 由 dsh-codearts-auth 注册（走它自己 lib/qoder-wasm.js 的另一份拷贝）——
+ * 两份是**不同的类**。本 shim 的整套设计是「给真正在跑的那份 adapter 的类原型打
+ * prepareInfer 补丁 + 给每个活 adapter 装 fetchImpl 传送门」（见下面的排障注释：多份
+ * 拷贝时只有活的那个打上才算数），所以这里必须**逐个全收**，只挑一条会漏掉另一条，
+ * 而 /status 仍会显示已接管。
+ *
+ * 顺序：先按 SHIM_PROVIDER_IDS 的裸名顺序（qoder 在 qodercn 前），同名内保持注册表
+ * 的枚举顺序。登记的是注册表里的原 id：它既是补丁的落点，也是 /status 的诊断标签，
+ * 不该被改写。
+ *
+ * @param {Map<string, object> | null | undefined} registry llm 的 adapter 注册表。
+ * @returns {{ adapters: Array<{ id: string, adapter: object }>, missing: string[], registeredIds: string[] }}
+ *   adapters 为全部命中的 (注册表 id, adapter) 对（一个注册表 id 一条）；
+ *   missing 为注册表里**一条都没命中**的裸名；registeredIds 为注册表里的全部键（诊断用）。
+ */
+export function collectShimRegistrations(registry) {
+  /** @type {string[]} */
+  const registeredIds = []
+  if (registry !== null && registry !== undefined && typeof registry.forEach === 'function') {
+    try { registry.forEach((_value, key) => registeredIds.push(String(key))) } catch { /* 注册表不可枚举时按无 adapter 处理 */ }
+  }
+  // 裸名 -> 该裸名在注册表里的全部 id（保持枚举顺序）。多前缀下同名会有多条。
+  /** @type {Map<string, string[]>} */
+  const idsByBare = new Map()
+  for (const registered of registeredIds) {
+    const bare = bareProvider(registered)
+    if (!SHIM_PROVIDER_IDS.has(bare)) continue
+    const bucket = idsByBare.get(bare)
+    if (bucket === undefined) idsByBare.set(bare, [registered])
+    else bucket.push(registered)
+  }
+  /** @type {Array<{ id: string, adapter: object }>} */
+  const adapters = []
+  /** @type {string[]} */
+  const missing = []
+  for (const bare of SHIM_PROVIDER_IDS) {
+    const ids = idsByBare.get(bare)
+    if (ids === undefined) { missing.push(bare); continue }
+    let hit = false
+    for (const id of ids) {
+      let reg = null
+      try { reg = registry.get?.(id) ?? null } catch { reg = null }
+      const adapter = reg === null || reg === undefined ? null : (reg.adapter ?? reg)
+      if (adapter === null) continue
+      hit = true
+      adapters.push({ id, adapter })
+    }
+    // missing 只报「一条都没命中」的裸名：同名多条里坏一条不影响另一条照常接管。
+    if (!hit) missing.push(bare)
+  }
+  return { adapters, missing, registeredIds }
+}
+
+
+/**
  * 认领注入口时的固定 label。
  *
  * 注入口（pack.js 里的 `globalThis.__mfQoderEncryptor = QoderEncryptedInfer`）要等
@@ -112,6 +179,8 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// 剥插件前缀（ofm-qoder / caa-qoder → qoder）：本 shim 按裸名认领 adapter，见 provider-prefix.mjs
+import { bareProvider } from './provider-prefix.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -396,18 +465,23 @@ async function collectTargets(ctx, wasmPath) {
   // 盘符大小写还会再分裂一次 ESM 实例），而运行时真正 new 出来的是哪一份，取决于
   // 谁先注册进 llm 注册表 —— 实测另外几份全打上了、prepareInfer 计数仍是 0。所以
   // 这里直接从**活着的 adapter 实例**反查它的类原型，无论它是哪份拷贝。
-  const adapters = []
   let registry = null
   try { registry = ctx?.get?.('llm')?.adapters ?? null } catch { registry = null }
-  for (const id of ['qoder', 'qodercn']) {
-    let reg = null
-    try { reg = registry === null ? null : registry.get?.(id) } catch { reg = null }
-    const adapter = reg === null || reg === undefined ? null : (reg.adapter ?? reg)
-    if (adapter === null) { notes.push('注册表里没有 ' + id + ' adapter'); continue }
-    adapters.push({ id, adapter })
+  const registrations = collectShimRegistrations(registry)
+  for (const bare of registrations.missing) notes.push('注册表里没有 ' + bare + ' adapter')
+  // 每个活 adapter 的真实类原型都要纳入目标：多前缀下同名 provider 有多条在线
+  // （ofm-qoder 与 caa-qoder 各走自己那份加密器拷贝），漏一条就等于那条链路没接管。
+  for (const item of registrations.adapters) {
+    let proto = null
+    try { proto = Object.getPrototypeOf(item.adapter) } catch { proto = null }
+    if (proto === null || proto === undefined) {
+      notes.push(item.id + ' 取不到原型')
+      continue
+    }
+    push('adapter:' + item.id, proto)
   }
 
-  return { targets, notes, adapters }
+  return { targets, notes, adapters: registrations.adapters }
 }
 /**
  * 造一份实现：持有一轮装载的 pending 表，负责把 ask 截成明文 OpenAI 请求，

@@ -9,7 +9,8 @@
  * 3. 数据看板：读 /metrics 展示每个模型的首字延迟、输出速度、并发占用与等槽，
  *    表头可点击排序（结果被记住）；并发上限在并发列直接改；模型行可单独测速、
  *    从路由移除，当日失败的行可恢复；排序顺眼时可按当前排序重设路由优先级，
- *    也能对整组一键测速。
+ *    也能对整组一键测速。一行按「渠道 + 模型」去重、副行列出所属的全部分组；
+ *    测速跑完立即回刷历史列，行内副行写明本次实测的实际路由与耗时。
  *
  * 数据来自 Host 半的 /api/model-failover 接口。
  */
@@ -28,7 +29,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v25'
+    var VERSION = 'v27'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -513,6 +514,65 @@ window.__ModuleLoader__.load({
     }
     function keyOf(provider, model) { return provider + '/' + model }
     /**
+     * 两个 provider id 是否指同一个渠道：裸名相同，且前缀相同或任一侧没前缀
+     * （与 host.mjs / provider-prefix.mjs 的 providerEquals 同一套规则）。
+     *
+     * 看板上的 provider 可能来自 /metrics（注册表 id，ofm-trae），也可能来自
+     * /status.groups（分组条目，多半是裸 trae）；两边要在同一行上对得上，否则
+     * 优先级、分组归属与「移除」都会各找各的。浏览器半不能 import 宿主模块，
+     * 所以这张前缀表在这里再写一份——两边改动时必须一起动。
+     */
+    var PROVIDER_PREFIXES = ['ofm-', 'ca-', 'cw-', 'ct-', 'cq-', 'caa-']
+    function providerPrefixOf(id) {
+      var s = String(id == null ? '' : id)
+      for (var i = 0; i < PROVIDER_PREFIXES.length; i++) {
+        if (s.indexOf(PROVIDER_PREFIXES[i]) === 0) return PROVIDER_PREFIXES[i]
+      }
+      return ''
+    }
+    /**
+     * 在某个分组的模型清单里找这一行对应的条目。
+     *
+     * 先按 provider/model 原文精确匹配，再按裸 id 比对（providerSame）：/metrics 行
+     * 的 provider 是注册表 id（门面之后是 ofm-trae），分组条目多半写裸 trae，原文
+     * 对不上会让优先级、移除、重设全部落空。
+     *
+     * @param {Array<{id: string, models?: Array<object>}>} groups - /status 的路由分组。
+     * @param {string} groupId - 目标分组 id。
+     * @param {string} provider - 行上的 provider（可能是注册表 id）。
+     * @param {string} model - 模型 id。
+     * @returns {object|null} 分组里的那条模型条目（含 priority / provider 原文），没有则 null。
+     */
+    function groupEntryIn(groups, groupId, provider, model) {
+      var g = (groups || []).find(function (x) { return x && x.id === groupId })
+      var list = (g && g.models) || []
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].provider === provider && list[i].model === model) return list[i]
+      }
+      for (var j = 0; j < list.length; j++) {
+        if (list[j].model === model && providerSame(list[j].provider, provider)) return list[j]
+      }
+      return null
+    }
+
+    /** 这一行在指定分组里的优先级；查不到按 99（与「没配优先级」的默认一致） */
+    function groupPriorityIn(groups, groupId, provider, model) {
+      var found = groupEntryIn(groups, groupId, provider, model)
+      return found && typeof found.priority === 'number' ? found.priority : 99
+    }
+
+    function providerSame(a, b) {
+      var x = String(a == null ? '' : a)
+      var y = String(b == null ? '' : b)
+      if (x === y) return true
+      var px = providerPrefixOf(x)
+      var py = providerPrefixOf(y)
+      var bx = px === '' ? x : x.slice(px.length)
+      var by = py === '' ? y : y.slice(py.length)
+      if (bx !== by) return false
+      return px === py || px === '' || py === ''
+    }
+    /**
      * 日界线文案：Host 的 failResetHour 决定「当日失败」几点重置（北京时间）。
      * Host 未返回该字段时（旧版）不提具体时间，只说按日重置——写死 8 点会
      * 与实际行为不符。
@@ -560,6 +620,18 @@ window.__ModuleLoader__.load({
     function rateOf(r) {
       return isNum(r.okSamples) && isNum(r.samples) && r.samples > 0 ? r.okSamples / r.samples : null
     }
+    /**
+     * 模型副行里的分组文本：1~2 个直接列出来，更多就只留前两个再给「+N」。
+     *
+     * 一行按「渠道 + 模型」去重后可能挂在好几个分组里，全列出来会把模型列撑高、
+     * 把 provider/model 挤成省略号；完整名单留在 title 里，悬停能看到。
+     */
+    function fmtGroupNames(names) {
+      if (!Array.isArray(names) || names.length === 0) return '未分组'
+      if (names.length <= 2) return names.join('、')
+      return names.slice(0, 2).join('、') + ' +' + (names.length - 2)
+    }
+
     /** 合法的并发上限：正整数；其余（空、0、非整数）都表示「没配，跟随默认」 */
     function validConc(v) {
       var n = Math.floor(Number(v))
@@ -659,6 +731,10 @@ window.__ModuleLoader__.load({
       /** 看板日期筛选：{ since, until } 均为 YYYY-MM-DD（北京时间整天）；空串 = 不限 */
       var rangePair = React.useState({ since: '', until: '' })
       var range = rangePair[0]; var setRange = rangePair[1]
+      // 测速轮询的 effect 只在 running 变化时重建，闭包里拿着启动那一刻的 range；
+      // 测速期间改过日期筛选时，任务结束时直接调 refreshMetrics 会拉错区间。
+      // 这份 ref 每次渲染同步成最新的 range，让 refreshMetrics 始终按当前筛选取数。
+      var rangeRef = React.useRef(range); rangeRef.current = range
       /** 错误重试页签的探测结果：null = 尚未探测，{ absent: true } = 没挂载那个插件，否则是它 /api/config 的返回 */
       var retryPair = React.useState(null); var retryProbe = retryPair[0]; var setRetryProbe = retryPair[1]
       /** 免费渠道页签的现场：null = 尚未读取；{ managerAvailable, channels, error? } 由宿主算好 */
@@ -750,12 +826,26 @@ window.__ModuleLoader__.load({
       /**
        * 一键测速的进度轮询：只有任务在跑时才每 1.5 秒问一次 /speedtest，
        * 跑完就停（最后一次响应里 running=false，不再续定时器）。
+       *
+       * 最后那次响应同时踢一次看板轮询：测速的往返在 Host 侧已经记进采样，
+       * 历史列（成功率 / 首字 / 速度 / token）此刻就该变；等下一个 3 秒周期再更，
+       * 用户会以为测速结果没落上。
        */
       React.useEffect(function () {
         if (!speedTest || !speedTest.running) return
+        // 进入本 effect 时任务一定还在跑；置 false 后不再重复回刷
+        var wasRunning = true
         var t = setInterval(function () {
           apiGet(API + '/speedtest').then(function (d) {
-            if (d) setSpeedTest(d)
+            if (!d) return
+            setSpeedTest(d)
+            if (wasRunning && d.running === false) {
+              wasRunning = false
+              // 任务一结束就回刷看板：测速的往返已经在 Host 侧记进采样，历史列
+              // 此刻就该变，不必等下一个 3 秒轮询。refreshMetrics 连 status 一起取，
+              // 所以测速把某行测成失败时，状态列也同时更新。
+              refreshMetrics()
+            }
           }).catch(function () { })
         }, 1500)
         return function () { clearInterval(t) }
@@ -1161,6 +1251,16 @@ window.__ModuleLoader__.load({
             '国内版 qoder 与国际版 qoder-global 可同时启用，签名与双层 SSE 由插件自己处理',
           ],
         },
+        'codearts-auth': {
+          // 仓库是改名后的 dsh-providers-hub；安装 spec 仍走旧名 dsh-codearts-auth（宿主 FREE_CHANNELS）。
+          repo: 'https://github.com/zhuweiyou/dsh-providers-hub',
+          title: 'Providers Hub',
+          tagline: '一个插件接入二十多家免费渠道的账号',
+          facts: [
+            '华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等，登录一次就在模型列表里多出该渠道的模型',
+            '多账号池与凭据静默续期，登录、状态、续期、积分领取都在它自己的设置页；附带一个本机 OpenAI 兼容网关',
+          ],
+        },
       }
 
       function channelTab() {
@@ -1401,9 +1501,14 @@ window.__ModuleLoader__.load({
         apiSend(API + '/settings', 'POST', { metricsSort: next }).catch(function () { })
       }
 
-      /** 看板与分组页签共用的刷新：metrics 与 status 一起重取（并发上限两边都显示） */
+      /**
+       * 看板与分组页签共用的刷新：metrics 与 status 一起重取（并发上限两边都显示）。
+       *
+       * 用 rangeRef.current 而不是闭包里的 range：测速轮询 effect 只在 running
+       * 变化时重建，它结束时调的正是这个函数，而那时 range 可能已经变了。
+       */
       function refreshMetrics() {
-        return Promise.all([loadMetrics(range), loadStatus()]).then(function (res) {
+        return Promise.all([loadMetrics(rangeRef.current), loadStatus()]).then(function (res) {
           if (res[0]) setMetrics(res[0])
           if (res[1]) setStatus(res[1])
         }).catch(function () { })
@@ -1517,14 +1622,18 @@ window.__ModuleLoader__.load({
        * 它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；
        * 移除连条目一起删，想加回来得从「模型」页签重新 ＋。
        *
-       * 看板一行对应一个分组（同一模型在两个分组里会有两行），所以只动这一行
-       * 所属的分组；要让某个模型彻底离开路由，就把它所在的每一行都移除。
+       * 看板一行 = 一个渠道 + 一个模型（可能同时属于多个分组），而「移除」是
+       * 分组级的动作，所以只动这一行所属的那个分组（groupId 来自 metrics 行）；
+       * 要让某个模型彻底离开路由，得在每个分组里各移除一次。
        */
       function removeFromRouting(provider, model, groupId) {
         var g = routeGroups.find(function (x) { return x.id === groupId })
         if (!g) { setOrderNotice({ ok: false, text: '分组信息已过期，刷新后再试' }); return }
         var models = g.models || []
-        var rest = models.filter(function (m) { return !(m.provider === provider && m.model === model) })
+        // 按 providerSame 比对，不能按原文 ===：看板行上的 provider 是注册表 id
+        // （ofm-trae），分组条目多半写裸 trae，原文相等会把「要点的那一行」过滤掉，
+        // 于是 PUT 送上去的清单与原来一模一样，Host 看起来像成功、实际一条没删。
+        var rest = models.filter(function (m) { return !(providerSame(m.provider, provider) && m.model === model) })
         if (rest.length === models.length) return
         setOrderNotice({ ok: true, text: '正在把 ' + provider + '/' + model + ' 从「' + g.name + '」移除…' })
         apiSend(API + '/groups', 'PUT', { id: groupId, models: rest })
@@ -1542,30 +1651,36 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 数据看板：把 /metrics 的每个模型摊平成一行，默认按分组 + 优先级排序。
-       * metrics 行里没有 priority，用 status.groups 里的分组条目补齐；
-       * 补不到时退化成 groupName/provider/model 排序，保证顺序稳定。
+       * 数据看板：把 /metrics 的每一行整理成看板行，默认按分组 + 优先级排序。
+       *
+       * Host v95 起一行 = 一个渠道 + 一个模型（多分组去重），行自带 groups /
+       * groupNames；旧 Host 只有 groupId / groupName，这里补成单元素列表，让渲染
+       * 与分组筛选只有一条路径。priority 不在 metrics 行里，按第一个分组到
+       * status.groups 的条目里取（providerSame 容忍裸 id 与注册表 id 的差异）。
        *
        * sort 为 { key, dir } 时按该列覆盖默认序：同值由稳定排序保持默认序，
        * 而 null（无采样、不限并发）无论升降序都排在最后，避免空行挤走有用的行。
        */
       function metricsSortedRows(rawRows, sort) {
-        var byKey = {}
-        routeGroups.forEach(function (g) {
-          var gm = g.models || []
-          for (var i = 0; i < gm.length; i++) {
-            byKey[keyOf(gm[i].provider, gm[i].model)] = { groupName: g.name, priority: gm[i].priority, groupId: g.id }
-          }
-        })
         var items = rawRows.map(function (r) {
-          var meta = byKey[keyOf(r.provider, r.model)] || {}
+          // Host v95 起，一行按「渠道 + 模型」去重，groups 给出它所属的全部分组；
+          // 旧 Host 只有单个 groupId/groupName，这里照样补成一条，渲染与筛选不用分叉。
+          var list = Array.isArray(r.groups) && r.groups.length > 0
+            ? r.groups.filter(function (g) { return g && g.id })
+            : (r.groupId ? [{ id: r.groupId, name: r.groupName || r.groupId }] : [])
+          // groupNames 优先用 Host 摊平好的；没有就按 groups 的名字推。
+          var names = Array.isArray(r.groupNames)
+            ? r.groupNames.filter(function (n) { return typeof n === 'string' && n !== '' })
+            : list.map(function (g) { return g.name || g.id })
+          if (names.length === 0 && r.groupName) names = [r.groupName]
           return {
             row: r,
-            groupName: r.groupName || meta.groupName || '',
-            priority: typeof meta.priority === 'number' ? meta.priority : 99,
-            // 这一行属于哪个分组：看板的「从路由移除」只动这一行所属的分组。
-            // metrics 行自带 groupId；补不到时用分组目录里的记录兜底。
-            groupId: r.groupId || meta.groupId || '',
+            groups: list,
+            groupNames: names,
+            // 默认序（以及下面按分组取值）只关心「首个分组 → 优先级」
+            groupName: names.length > 0 ? names[0] : '',
+            priority: list.length > 0 ? groupPriorityIn(routeGroups, list[0].id, r.provider, r.model) : 99,
+            groupId: list.length > 0 ? list[0].id : '',
           }
         }).sort(function (a, b) {
           if (a.groupName !== b.groupName) return a.groupName < b.groupName ? -1 : 1
@@ -1719,26 +1834,84 @@ window.__ModuleLoader__.load({
         var groupOptions = []
         var seenGroup = {}
         sorted.forEach(function (it) {
-          var gid = it.row.groupId
-          if (!gid || seenGroup[gid]) return
-          seenGroup[gid] = true
-          groupOptions.push({ id: gid, name: it.groupName || gid })
+          // 一行可能跨多个分组（Host v95 的 row.groups）：每个分组都要能选到，
+          // 否则只在「第二个分组」里的渠道会从下拉里消失。
+          (it.groups || []).forEach(function (g) {
+            if (!g || !g.id || seenGroup[g.id]) return
+            seenGroup[g.id] = true
+            groupOptions.push({ id: g.id, name: g.name || g.id })
+          })
         })
+        /**
+         * 这一行是否属于某个分组。跨分组的一行会同时算进每个它所属分组的目标清单，
+         * 否则「重设优先级 / 一键测速 / 批量恢复」会漏掉共享到别的分组里的模型。
+         */
+        function rowInGroup(it, gid) {
+          if (!gid) return false
+          var list = it.groups
+          if (Array.isArray(list) && list.length > 0) {
+            return list.some(function (x) { return x && x.id === gid })
+          }
+          return false
+        }
         var effOrderGroupId = orderGroupId || (groupOptions.length > 0 ? groupOptions[0].id : '')
-        // 有采样且属于目标分组、且没被手动禁用的行：按当前排序的先后顺序
+        /**
+         * 有采样、属于目标分组、且没被手动禁用的行：按当前排序的先后顺序。
+         *
+         * 还要求这一行在**该分组的条目清单里真的存在**（groupEntryIn 能找到）：
+         * /metrics 行由「分组目录」摊出来，正常必然能找到；但分组刚被别处改过、
+         * 而看板还拿着旧响应时，界面会列出一行、Host 却认为它不属于这个组。
+         * 用它过滤后，按钮的可点状态、提示里的数字与请求里的清单三者一致。
+         */
         var orderTargets = sorted.filter(function (it) {
-          return it.row.groupId === effOrderGroupId && hasSamples(it.row) && it.row.disabled !== true
-        }).map(function (it) { return it.row })
+          if (!rowInGroup(it, effOrderGroupId)) return false
+          if (!hasSamples(it.row) || it.row.disabled === true) return false
+          // 分组目录还没到（status 首次加载）时不拿它做判据，否则按钮会白闪一下
+          // 「无带数据模型」；清单本身仍会在 applyReorderPriority 里按条目现取。
+          if (routeGroups.length === 0) return true
+          return groupEntryIn(routeGroups, effOrderGroupId, it.row.provider, it.row.model) !== null
+        })
         // 测速目标：同样只测有数据之外也要测——「一键测速」的价值恰恰在于给
         // 还没采样的模型补数据，所以这里不按 samples 过滤，只排除已禁用的。
+        // 送行上的 provider（可能是注册表 id）：Host 的 probeModel 会用
+        // liveProviderIdOf 解析成实际路由，注册表 id 与裸名都能落到同一条。
         var speedTargets = sorted.filter(function (it) {
-          return it.row.groupId === effOrderGroupId && it.row.disabled !== true
+          return rowInGroup(it, effOrderGroupId) && it.row.disabled !== true
         }).map(function (it) { return it.row })
         // 当前分组里当日失败的行：操作条上的批量「恢复」只清这些模型。
         // 不带 body 的 /failed/reset 会清掉全天全部失败，跨了分组就是越权。
+        // 失败记录按裸 id 合计（Host 的 failKey），所以跨分组的一行在每个它所属
+        // 的分组里都算「本组失败」——恢复一个就等于恢复这条渠道全部失败记录，
+        // 这也正是 Host 按 providerEquals 清的行为，界面不该假装能只清一半。
         var failedInScope = sorted.filter(function (it) {
-          return it.row.groupId === effOrderGroupId && it.row.failed === true
+          return rowInGroup(it, effOrderGroupId) && it.row.failed === true
         }).map(function (it) { return it.row })
+
+        /**
+         * 重设优先级的请求清单：把目标行换成**当前分组条目里的原文**。
+         *
+         * Host 用 group.models 里的 `provider/model` 精确匹配 order（见
+         * /groups/reorder-priority 的 byKey），而 /metrics 行的 provider 是注册表 id
+         * （门面之后是 ofm-trae），分组条目多半写裸 trae——直接送行上的 provider
+         * 一条都匹配不上，Host 会回 400「order 里没有任何属于该分组的模型」。
+         * 所以这里按当前选中分组逐行取条目原文，取不到的行不送（它不在这个组里）。
+         */
+        function reorderPayloadFor(gid) {
+          var out = []
+          var seen = {}
+          orderTargets.forEach(function (it) {
+            // orderTargets 已经要求「本组里能找到条目」，这里只取原文并去重：
+            // 同一分组里重复登记的同一条（历史数据）只送一次，否则 Host 那边的
+            // 序号会被自己顶成两位数。
+            var entry = groupEntryIn(routeGroups, gid, it.row.provider, it.row.model)
+            if (!entry) return
+            var k = keyOf(entry.provider, entry.model)
+            if (seen[k]) return
+            seen[k] = true
+            out.push({ provider: entry.provider, model: entry.model })
+          })
+          return out
+        }
 
         /**
          * 按当前排序重设优先级：把 orderTargets 的先后顺序写回 priority。
@@ -1755,11 +1928,18 @@ window.__ModuleLoader__.load({
             setOrderNotice({ ok: false, text: '当前分组里没有带采样的模型，无法按排序重设' })
             return
           }
-          setOrderNotice({ ok: true, text: '正在重设 ' + orderTargets.length + ' 个模型的优先级…' })
+          // 只送这个分组里确实有条目的行：跨分组的一行在别的组里也有一份，
+          // 但这次只重排当前组。提示里的数字也用这份清单，与实际 applied 对得上。
+          var order = reorderPayloadFor(effOrderGroupId)
+          if (order.length === 0) {
+            setOrderNotice({ ok: false, text: '当前分组里没有带采样的模型，无法按排序重设' })
+            return
+          }
+          setOrderNotice({ ok: true, text: '正在重设 ' + order.length + ' 个模型的优先级…' })
           apiSend(API + '/groups/reorder-priority', 'POST', {
             groupId: effOrderGroupId,
             start: start,
-            order: orderTargets.map(function (r) { return { provider: r.provider, model: r.model } }),
+            order: order,
           }).then(function (res) {
             if (res && res.ok) {
               setOrderNotice({ ok: true, text: '已按当前排序重设 ' + res.applied + ' 个模型的优先级（' + res.start + ' 起）' })
@@ -1795,6 +1975,22 @@ window.__ModuleLoader__.load({
               return { provider: r.provider, model: r.model, effort: r.effort || undefined }
             }),
           }).then(function (res) {
+            // 409 = 已有任务在跑（另一条路径刚点过，或页面刷新前启动的那次还没跑完）。
+            // 响应里仍带完整快照：直接接着它显示进度，而不是把界面清成「启动失败」——
+            // 任务确实在跑，进度也是真的，用户只缺一句「这次没排上队」。
+            if (res && res.ok === false && isNum(res.startedAt)) {
+              // 接上的是**别人的**任务：本地 scope 换成它的目标清单，否则我们刚点
+              // 的那几行会被标成「测速中」，而真正在测的行反而一声不响。旧 Host 的
+              // 409 也带 targets（快照共用），取不到就清空 scope，退回按 results 判断。
+              if (Array.isArray(res.targets) && res.targets.length > 0) {
+                setSpeedScope(res.targets.map(function (t) { return keyOf(t.provider, t.model) }))
+              } else {
+                setSpeedScope([])
+              }
+              setSpeedTest(res)
+              setOrderNotice({ ok: false, text: (res.error || '测速正在进行中') + '（已在显示那次任务的进度）' })
+              return
+            }
             if (res) setSpeedTest(res)
             if (!res || res.ok === false) {
               setOrderNotice({ ok: false, text: (res && res.error) || '测速启动失败' })
@@ -1822,19 +2018,62 @@ window.__ModuleLoader__.load({
           launchSpeedTest([r])
         }
 
-        /** 测速结果按 provider/model 索引，行内直接标出本次实测值 */
+        /**
+         * 测速结果的索引与「这一行对应哪条结果」。
+         *
+         * 不能只按 provider/model 原文查：/metrics 行的 provider 是注册表 id
+         * （ofm-trae），而测速结果里的 provider 是分组条目原文（多半是裸 trae）；
+         * 两边原文不等时，行内会「测过却看不到结果」。所以依次匹配：
+         * 原文键 → providerSame（裸名 + 前缀规则）→ 结果自带的实际路由 route。
+         */
         var probeByKey = {}
         if (speedTest && speedTest.results) {
           speedTest.results.forEach(function (p) { if (p) probeByKey[keyOf(p.provider, p.model)] = p })
         }
+        function probeForRow(r) {
+          var exact = probeByKey[keyOf(r.provider, r.model)]
+          if (exact) return exact
+          var results = (speedTest && speedTest.results) || []
+          for (var i = 0; i < results.length; i++) {
+            var p = results[i]
+            if (!p || p.model !== r.model) continue
+            // route 是实际命中的注册表 id（Host v95 新增）；旧 Host 没有它，就靠裸名比对
+            if (p.route && p.route === r.provider) return p
+            if (providerSame(p.provider, r.provider)) return p
+          }
+          return null
+        }
+        /**
+         * 某个 scope/target 键是否命中这一行（同上，按裸名容忍前缀差异）。
+         *
+         * 键是 provider + '/' + model，按**第一个**斜杠切：provider id 不含斜杠，
+         * 而 model id 可能含（qwen/qwen-max 这种），用最后一个斜杠会把模型名切坏。
+         */
+        function keyMatchesRow(key, r) {
+          if (key === keyOf(r.provider, r.model)) return true
+          var slash = key.indexOf('/')
+          if (slash <= 0) return false
+          var kp = key.slice(0, slash)
+          var km = key.slice(slash + 1)
+          return km === r.model && providerSame(kp, r.provider)
+        }
         // 本次任务覆盖的行：本地 scope 优先（点了哪几行最准），旧 Host 的快照里
         // 没有 targets 时用它；两边都有则以本地为准。
+        // 判定与行对齐（keyMatchesRow）：scope 里的原文与行上的 provider 可能不同。
         var runningKeys = {}
         if (speedTest && speedTest.running) {
           var scopeKeys = speedScope.length > 0
             ? speedScope
             : (speedTest.targets || []).map(function (t) { return keyOf(t.provider, t.model) })
-          scopeKeys.forEach(function (k) { if (!probeByKey[k]) runningKeys[k] = true })
+          sorted.forEach(function (it) {
+            if (probeForRow(it.row)) return
+            for (var i = 0; i < scopeKeys.length; i++) {
+              if (keyMatchesRow(scopeKeys[i], it.row)) {
+                runningKeys[keyOf(it.row.provider, it.row.model)] = true
+                return
+              }
+            }
+          })
         }
 
 
@@ -1939,11 +2178,15 @@ window.__ModuleLoader__.load({
             + 'P90 表示 90% 的请求都比它快，只有最慢的一成超过它——所以 P90 明显高于 P50，说明偶发慢请求拖着一条长尾巴，'
             + '平均数会被少数慢样本带偏，才用这两个数一起看。'),
           metricsHelp && e('div', { style: S.metricsNote },
-            '副行灰字是该列的补充：成功率给成功数 / 采样数，首字给 P90，速度给活跃区间合计速度（没请求在产出时不显示），'
+            '副行灰字是该列的补充：成功率给成功数 / 采样数（悬停看其中多少次来自测速），首字给 P90，'
+            + '速度给活跃区间合计速度（没请求在产出时不显示），'
             + 'token 一行一个数给输入 / 缓存命中 / 缓存写入 / 输出（鼠标悬停大字看历史总量），'
-            + '并发给等槽时间与等槽位数（闸门里不排队，只有整组都满时才有人等），模型给所属分组。'
-            + '模型行的「移除」把这个模型从它所属分组里摘掉；当日失败的行点状态列的「恢复」立即重新参与路由。'
-            + '采样与 token 用量会落盘，重启后仍在。'),
+            + '并发给等槽时间与等槽位数（闸门里不排队，只有整组都满时才有人等），模型给所属的全部分组。'
+            + '一行 = 一个渠道 + 一个模型：同一渠道同一模型挂在多个分组里只出一行（样本、失败、并发都只有一份），'
+            + '副行把那些分组全列出来；「移除」按分组做，只摘掉当前行所属的那一个，'
+            + '要彻底离开路由得每个分组各移除一次。当日失败的行点状态列的「恢复」立即重新参与路由。'
+            + '模型下方的「测速 xxx · 已计入统计 · 路由 · 耗时」是这次人工测速的现场：它同时作为一条采样'
+            + '计入左侧成功率 / 首字 / 速度 / token。采样与 token 用量会落盘，重启后仍在。'),
           noneSampled && e('div', { style: S.hint }, '还没有采样：跑一次会话后这里会出现首字与速度数据。'),
           metrics === null && e('div', { style: S.hint }, '正在读取采样数据…'),
           metrics !== null && rows.length === 0 && e('div', { style: S.hint }, '分组里还没有模型。'),
@@ -1981,7 +2224,8 @@ window.__ModuleLoader__.load({
               title: orderTargets.length === 0
                 ? '当前分组里没有带采样的模型，先跑一次会话或点右侧「一键测速」'
                 : '按看板当前排序，把 ' + orderTargets.length + ' 个有数据的模型的优先级从 '
-                  + (orderStart || '1') + ' 起依次重排（无数据的模型保持原优先级）',
+                  + (orderStart || '1') + ' 起依次重排（只动这个分组里的条目；'
+                  + '跨分组的同一模型在别的分组里保持原优先级）',
               onClick: applyReorderPriority,
             }, '按当前排序重设优先级'),
             e('span', { style: { fontSize: '10px', opacity: .45 } },
@@ -1993,7 +2237,8 @@ window.__ModuleLoader__.load({
               title: failedInScope.length === 0
                 ? '当前分组里没有当日失败的模型'
                 : '把当前分组里 ' + failedInScope.length + ' 个当日失败的模型立即恢复参与路由'
-                  + '（逐个清除，只清这些模型，其它分组的失败记录不受影响）',
+                  + '（逐个清除，只清这些模型）。失败记录按渠道裸 id 记，'
+                  + '所以跨分组的同一模型恢复一次即在所有分组里同时恢复',
               onClick: function () { restoreFailedInScope(failedInScope) },
             }, failedInScope.length > 0 ? '恢复本组失败 (' + failedInScope.length + ')' : '本组无失败'),
             e('span', { style: { marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' } },
@@ -2088,19 +2333,30 @@ window.__ModuleLoader__.load({
                 e('div', { style: S.metricsCellModel },
                   e('div', {
                     style: S.metricsModel,
-                    title: r.provider + '/' + r.model + (it.groupName ? '\n分组：' + it.groupName : ''),
+                    title: r.provider + '/' + r.model
+                      + (it.groupNames.length > 0 ? '\n所属分组（' + it.groupNames.length + ' 个）：' + it.groupNames.join('、') : ''),
                   }, r.provider + '/' + r.model),
                   e('div', { style: S.metricsSubLine },
+                    // 一行 = 一个渠道 + 一个模型，可能同时属于多个分组。副行只留前两个
+                    // 名字 + 「+N」，完整名单在 title 里——分组一多，全列出来会把模型列
+                    // 撑高、把 provider/model 挤成省略号，而这一行最要紧的是后者。
                     e('span', {
                       style: S.metricsSubText,
-                      title: it.groupName ? '所属分组：' + it.groupName : '这个模型还没进任何分组',
-                    }, it.groupName ? it.groupName : '未分组'),
-                    // 从路由移除：这一行属于哪个分组就从哪个分组里摘掉它。
-                    // 同一模型在两个分组里会有两行，要彻底离开路由就两行都移除。
+                      title: it.groupNames.length > 0
+                        ? '所属分组（' + it.groupNames.length + ' 个）：' + it.groupNames.join('、')
+                        : '这个模型还没进任何分组',
+                    }, fmtGroupNames(it.groupNames)),
+                    // 「移除」按分组做：同一渠道+模型的样本合并成一行后，按钮只摘掉
+                    // 这一行所属的那个分组（it.groupId），其余分组里这条照旧参与路由。
+                    // 要彻底离开路由，得在分组页签里把每个分组的那条都移除。
                     it.groupId && e('button', {
                       style: S.metricsMiniBtn,
                       title: '把 ' + r.provider + '/' + r.model + ' 从「' + (it.groupName || '分组')
-                        + '」移除：不再参与路由，分组里其它模型与优先级不变（想加回来从「模型」页签重新 ＋）',
+                        + '」移除：不再参与路由，分组里其它模型与优先级不变（想加回来从「模型」页签重新 ＋）'
+                        + (it.groupNames.length > 1
+                          ? '\n它还在其它分组里（' + it.groupNames.filter(function (n) { return n !== it.groupName }).join('、')
+                            + '），那边不受影响；要彻底离开路由，每个分组都得移除一次'
+                          : ''),
                       onClick: function () { removeFromRouting(r.provider, r.model, it.groupId) },
                     }, '移除'),
                     // 单模型测速：整组测一次要打十几个请求，只想确认某一个模型时
@@ -2118,18 +2374,32 @@ window.__ModuleLoader__.load({
                   // 一键测速的本次实测结果：贴在模型名下，与看板的历史聚合值区分开。
                   // 失败只标错误码，不占一整行——表格里最要紧的是「通 / 不通」。
                   (function () {
-                    var p = probeByKey[k]
+                    var p = probeForRow(r)
                     if (!p) return null
+                    // 测速的结果会作为一条普通采样落进同一份样本表（Host 侧口径），
+                    // 所以触发的往返同时体现在上面各列的历史值里：副行要写明
+                    // 「已计入左侧统计」，否则用户会把副行的首字和成功率那列当成两回事。
+                    // title 再补两条只在这里有的现场：实际命中的注册表路由（带渠道前缀
+                    // 时，分组条目是裸名，用户看不出走的是哪条）与整次往返耗时。
+                    var routeText = typeof p.route === 'string' && p.route !== '' ? p.route : null
+                    var head = p.ok
+                      ? '测速 ' + fmtMs(p.ttftMs) + ' · ' + fmtTps(p.tps)
+                      : '测速失败 ' + (p.errorCode || 'ERROR')
+                    var tail = p.ok ? ' · 已计入统计' : ''
+                    var titleText = (p.ok
+                      ? '本次测速：首字 ' + fmtMs(p.ttftMs) + '，速度 ' + fmtTps(p.tps)
+                        + (isNum(p.outTokens) ? '，输出 ' + p.outTokens + ' tok' : '')
+                      : '本次测速失败：' + (p.errorCode || 'ERROR') + (p.error ? '（' + p.error + '）' : ''))
+                      + '\n路由：' + (routeText || '—')
+                      + (isNum(p.elapsedMs) ? '，整次往返 ' + fmtMs(p.elapsedMs) : '')
+                      + '\n这次往返已作为一条采样计入左侧历史统计（成功率 / 首字 / 速度 / token）'
                     return e('div', {
                       style: Object.assign({}, S.metricsSub, { opacity: .85 },
                         p.ok ? {} : { color: 'var(--dsw-alias-state-warn-label)' }),
-                      title: p.ok
-                        ? '本次测速：首字 ' + fmtMs(p.ttftMs) + '，速度 ' + fmtTps(p.tps)
-                          + (isNum(p.outTokens) ? '，输出 ' + p.outTokens + ' tok' : '')
-                        : '本次测速失败：' + (p.errorCode || 'ERROR') + (p.error ? '（' + p.error + '）' : ''),
-                    }, p.ok
-                      ? '测速 ' + fmtMs(p.ttftMs) + ' · ' + fmtTps(p.tps)
-                      : '测速失败 ' + (p.errorCode || 'ERROR'))
+                      title: titleText,
+                    }, head + tail
+                      + (routeText ? ' · ' + routeText : '')
+                      + (isNum(p.elapsedMs) ? ' · ' + fmtMs(p.elapsedMs) : ''))
                   })()),
                 // 成功率：主行百分比、副行「成功数/采样数」。没样本（分母 0）两行都写 —，
                 // 不显示 0%——0% 会被读成「全都失败」，与「还没打过」是两回事。
@@ -2143,12 +2413,18 @@ window.__ModuleLoader__.load({
                     e('span', {
                       style: Object.assign({}, S.metricsNumMain,
                         warn ? { color: 'var(--dsw-alias-state-warn-label)', fontWeight: 600 } : {}),
-                      title: '成功率 = 成功调用 / 采样数（区间内全部采样，不限条数）'
-                        + (isNum(r.okSamples) && isNum(r.samples) ? '\n' + r.okSamples + ' 成功 / ' + r.samples + ' 次' : ''),
+                      // probeSamples 是区间内由测速产生的样本数（Host v95 新增）。
+                      // 成功率把测速的往返一并算进分母，这里点明有多少来自测速，
+                      // 免得用户把这几次人工探测误当日常流量。旧 Host 没有该字段，
+                      // 整句省略，不写「0 次」那种看着像统计失败的零。
+                      title: '成功率 = 成功调用 / 采样数（区间内全部采样，不限条数，含测速）'
+                        + (isNum(r.okSamples) && isNum(r.samples) ? '\n' + r.okSamples + ' 成功 / ' + r.samples + ' 次' : '')
+                        + (isNum(r.probeSamples) && r.probeSamples > 0 ? '\n其中测速样本 ' + r.probeSamples + ' 次' : ''),
                     }, rateText === null ? '—' : rateText),
                     rateText !== null && e('span', {
                       style: S.metricsNumSub,
-                      title: '成功数 / 采样数',
+                      title: '成功数 / 采样数'
+                        + (isNum(r.probeSamples) && r.probeSamples > 0 ? '（含测速 ' + r.probeSamples + ' 次）' : ''),
                     }, (isNum(r.okSamples) ? r.okSamples : 0) + '/' + (isNum(r.samples) ? r.samples : 0)))
                 })(),
                 p90Cell(r.ttftP50, r.ttftP90, fmtMs),

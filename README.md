@@ -15,7 +15,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 | **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 `dsh-llm-error-retry` 自己的配置页，保存即生效 |
-| **免费渠道** | Our Free Model / CodeArts / WorkBuddy / Trae / Qoder 五个能直接补免费模型的插件，带 GitHub 地址与一键安装（Our Free Model 排第一张） |
+| **免费渠道** | Our Free Model / CodeArts / WorkBuddy / Trae / Qoder / Providers Hub 六个能直接补免费模型的插件，带 GitHub 地址与一键安装（Our Free Model 排第一张，Providers Hub 排最后一张） |
 
 ## 界面
 
@@ -67,6 +67,115 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - 未安装该插件时，这段逻辑静默跳过。
 - 「属于哪个插件」由 `ofmHandoffExcludeProviders` 决定，而不是由池里有没有账号决定：池是按 provider 字符串存的持久表，渠道退役后账号条目仍在，只看账号会把别的插件提供的模型也卷进换号流程（例如 `codearts` 的 429 被当成换号，冷却一个本次没用到的账号，还挡掉了本该发生的分组路由）。默认排除 `codearts`。
 
+### 六个免费渠道插件的 provider 前缀
+
+「免费渠道」页签里的六个插件都会往宿主 llm 注册 provider，其中好几个用**同名 id**：`qoder`、`qodercn`、`trae`、`cline`、`loomy`、`raccoon`、`minimax`、`zcode`、`gemini`、`codearts`、`workbuddy` …。宿主的 `llm` 注册表对同一个 provider 只允许一个 adapter（`packages/llm/llm/src/index.ts` 的 `prepareRoutes` 会抛 `DUPLICATE_ADAPTER`，且整组 all-or-nothing），后注册的一方要么撞错，要么被 `registerAdapterIdempotent` 静默吞掉——两条路都表现为「装了但模型没出现」。
+
+方案是**每个插件一个 provider 前缀**，用插件名各单词的首字母：
+
+| 插件 | 前缀 | 真实注册表里的 id |
+| --- | --- | --- |
+| `dsh-our-free-model` | `ofm-` | `ofm-qoder`、`ofm-trae` … |
+| `dsh-codearts` | `ca-` | `ca-codearts` |
+| `dsh-connect-workbuddy` | `cw-` | `cw-workbuddy` |
+| `dsh-connect-trae` | `ct-` | `ct-trae` |
+| `@dmh2002/dsh-connect-qoder` | `cq-` | `cq-qoder` |
+| `dsh-codearts-auth`（Providers Hub） | `caa-` | `caa-codearts`、`caa-buddy` … |
+
+- **前缀加在真实注册表侧**，由 llm 门面在 cordis 的 `isolate` realm 内 `provide llm` 时拼上。插件自身代码一行都不改：它内部那些硬编码的裸 id 表照旧，门面对它呈现裸 id，对真实注册表呈现带前缀的 id。
+- **界面里 provider 会显示成 `ofm-qoder` 这种**（模型页签、看板、日志都是注册表 id），而**分组文件、配置、失败表里始终是裸 id**（`qoder`）——两者由本插件换算。
+- **未打门面的插件仍是裸 id**。只有部分插件装了门面时，注册表里会同时存在裸 `trae` 与 `ofm-qoder` 这种混合视图，本插件两种都认。
+- 未打门面时的命名冲突依旧存在（那是部署问题，不是本插件能绕开的）：见下面「门面部署」两行。
+
+### 门面部署（写在 `$DSH_HOME/cordis.patch.yml`）
+
+每个渠道一行门面条目（在自己的 realm 里 provide llm）+ 该渠道 Loader 条目的一行 `isolate`（把它关进同一个 realm）。前五个渠道各 2 行，`dsh-codearts-auth` 那条要多隔离 11 个服务名（见本节末），合计 22 行。home 层最后应用，能覆盖 profile 与插件自带的 patch：
+
+```yaml
+# 每个渠道：一行门面（自己的 realm）+ 一行 isolate（把自己的条目关进同一个 realm）
+- insert:
+    - id: mfm-prefix-ofm
+      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      isolate:
+        llm: mfm-ofm
+      config:
+        prefix: ofm-
+- id: our-free-model
+  isolate:
+    llm: mfm-ofm
+- insert:
+    - id: mfm-prefix-ca
+      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      isolate:
+        llm: mfm-ca
+      config:
+        prefix: ca-
+- id: llm-codearts
+  isolate:
+    llm: mfm-ca
+- insert:
+    - id: mfm-prefix-cw
+      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      isolate:
+        llm: mfm-cw
+      config:
+        prefix: cw-
+- id: dsh-connect-workbuddy
+  isolate:
+    llm: mfm-cw
+- insert:
+    - id: mfm-prefix-ct
+      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      isolate:
+        llm: mfm-ct
+      config:
+        prefix: ct-
+- id: trae
+  isolate:
+    llm: mfm-ct
+- insert:
+    - id: mfm-prefix-cq
+      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      isolate:
+        llm: mfm-cq
+      config:
+        prefix: cq-
+- id: qoder
+  isolate:
+    llm: mfm-cq
+- insert:
+    - id: mfm-prefix-caa
+      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      isolate:
+        llm: mfm-caa
+      config:
+        prefix: caa-
+- id: codearts-auth
+  isolate:
+    llm: mfm-caa
+    # 以下 11 个必须一起隔离，原因见本节下一条
+    lobsteraiAuth: mfm-caa
+    qoderAuth: mfm-caa
+    qodercnAuth: mfm-caa
+    traeAuth: mfm-caa
+    clineAuth: mfm-caa
+    loomyAuth: mfm-caa
+    raccoonAuth: mfm-caa
+    minimaxAuth: mfm-caa
+    zcodeAuth: mfm-caa
+    geminiAuth: mfm-caa
+    accountPool: mfm-caa
+```
+
+- **每个渠道的两行必须同时存在，label 必须一致。** 只加门面 = 多一个空 realm；只 isolate 不给门面 = 该插件拿不到 `llm`，模型全部消失。
+- **这些是 Loader 条目的 `id`，不是包名。** 本机当前实际值：`our-free-model`（dsh-our-free-model）、`llm-codearts`（dsh-codearts）、`dsh-connect-workbuddy`（dsh-connect-workbuddy）、`codearts-auth`（dsh-codearts-auth）；`trae` / `qoder` 两行要等对应连接器装上后才存在。改包名（`dsh-providers-hub`）不影响这一行；`id` 一旦改掉或写错，`isolate` 就落在了别的条目上——宿主只出一条 warning，插件照样启动，但那个渠道的模型会全部消失。
+- **每个渠道用自己的 label**（`mfm-ofm`、`mfm-ca` …），不要与别的插件共用。
+- **渠道插件本身必须真的在跑，这行 isolate 才有意义。** Loader 只创建 profile 的 `dsh.profile.bundles` 列表里那些包带来的条目；没列进去的包，它自带的 `cordis.patch.yml` 连 compose 都不参与，`- id: <条目>` 就成了一条打空的 warning（宿主只 warn 不报错）。所以启用 `dsh-codearts-auth`（Providers Hub）要改**两处**：profile 的 `package.json` 里 `dsh.profile.bundles` 加上它，再把 profile `cordis.patch.yml` 里的 `- id: codearts-auth` + `disabled: true` 去掉。两处必须同批改。
+- ⚠️ **门面条目必须放在没有 `dsh.client` 声明的独立包目录里。** `client-modules` 按**包名**归并 bundle：门面文件所在的包一旦在 `package.json` 里声明了 `dsh.client.platform`，就会被算成「同名包的另一个 client bundle」，与真正带 client 的那个包互相覆盖，**宿主直接启动失败**——这是上次把 DSH 搞崩的直接原因。所以那个包的 `package.json` 只有 `private` + `type: module` + `main`/`exports`，不含任何 `dsh` 字段。
+- ⚠️ **`dsh-codearts-auth` 还要额外隔离 11 个 cordis 服务名，否则会连带打死 Our Free Model 的渠道。** 这两家不只撞 provider 名，还撞 **cordis 服务名**：两边都用 `super(ctx, \`${product.id}Auth\`)` 各自注册 `lobsteraiAuth`、`qoderAuth`、`qodercnAuth`、`traeAuth`、`clineAuth`、`loomyAuth`、`raccoonAuth`、`minimaxAuth`、`zcodeAuth`、`geminiAuth` 和 `accountPool` 这 11 个。cordis 的 `provide` 对同名服务直接抛 `service "<name>" has been registered at <...>`（`vendor/cordis/src/reflect.ts:302-305`），谁先装载谁占名；后装的一方在自己 `apply` 的第一句就抛，整个聚合包（channels pack）的 apply 中断 ⇒ 它的十条渠道 adapter 一条都不会注册 ⇒ 那个插件在模型页签里彻底消失。实测就是「装了 Providers Hub，Our Free Model 的 qoder/trae/cline … 全不见」。把上面那 11 个服务名连同 `llm` 一起塞进 `codearts-auth` 条目自己的 realm，两边就能并存（已实测同屏共存：`ofm-*` 11 条 + `caa-*` 27 条）。**这 11 个名字来自两家当前版本的实现，任一方升级后需要重新核对**（对法：`grep -n "super(ctx" dsh-codearts-auth/lib/*-auth.js` 与 OFM `vendor/channel-pack/pack.js` 里各家 `id` 的 `Auth` 后缀）。
+- 本插件对两种视图都做了归一，全部换算集中在 `provider-prefix.mjs`：`bareProvider()` 剥前缀（失败计数、并发、容量冷却、速度采样、`ofmHandoffExcludeProviders`、免费渠道认领都按裸 id 记账），`providerEquals()` 做渠道等价（裸 id 与自己的前缀等价、不同插件的前缀互不等价），`liveProviderIdOf()` 在真正下发给 `llm` 时换回注册表此刻认识的 id（按 `ofm- → ca- → cw- → ct- → cq- → caa-` 的顺序试，即免费渠道卡片顺序）。**装卸门面不需要改用户数据。**
+- 怎么确认生效：`/api/model-failover/free-channels` 里每张卡片认领到的都是带自己前缀的 id，`/status.allModels` 里仍是裸 id。
+
 ## 与 dsh-codearts 的配合
 
 `dsh-codearts` 有一个已知的失败模式，本插件会兜住：**报「429 没有可用账号」，但账号和积分都正常**。
@@ -85,6 +194,18 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - **缺东西时不硬来**：没有 `credentials` 服务（`dsh-credentials` 未装载）或没有可用账号时不动手，只把原因写进现场（`skipReason`），日志压成「首次一次 + 之后每 10 次一次」。
 - **怎么调**：设置页有「CodeArts 凭据镜像」开关、间隔输入框与「立即同步」；`POST /resign-bridge/sync` 也能量外触发一轮。间隔越短，轮换后「用旧 AK 签出来的请求被上游判 401」的窗口越小——10 秒是可设的最小值。
 
+#### 闸门：镜像健康 ≠ bili 能用
+
+bili 的候选 ref **完全由 `jet-hub/state.json` 决定**：它只读这个文件，并跳过 `enabled === false` 的记录。于是存在一个很隐蔽的失败形态——**用户在 Jet Hub 里关掉 codearts 供应商**（一次动作同时写账号 `enabled:false`、`providerClosed.codearts:true` 和模型黑名单），候选清单随之清空，bili 在转发前直接回 403 `signed_request_requires_resign`。
+
+坑在于：这一层有 `fallbackRefs` 兜底，镜像**永远会成功**——`mirroredRefs`、`accountCount`、`lastError` 全都健康，而 bili 一个 ref 都枚举不到。用户看到的是一句「本地代理拦下了这条签名请求」，照提示去查凭据只会白忙（凭据其实新鲜且已镜像）。
+
+所以本插件把闸门**单独读出来**，而不是靠镜像成功去推断：
+
+- **看得到**：`/status.resignBridge.gate` 与 `/status.codeartsSelfHeal.gate` 回 `{closed, accountsTotal, accountsDisabled, seeableRefs, staleRefs}`。`seeableRefs` 就是 bili 真正枚举得到的数量，**为 0 即必然拒收**。闸门开合变化时打一条 warn/info，同一形态只报一次。
+- **自愈只在真失败后触发**：关掉供应商是用户的显式决定，若在 10 秒一轮的镜像里自动打开，等于插件不认用户的意图。只有**真实请求已经被 bili 拒掉**（403 `signed_request_requires_resign` 且闸门见 `seeableRefs === 0`）才自愈：经 Jet Hub RPC `provider.setEnabled` 重新打开该供应商（同时清掉 `providerClosed`、模型黑名单与账号停用位），再重同步一轮凭据镜像，然后同一步重试。自愈有 60 秒冷却，避免和用户反复拉锯。
+- **走 RPC，不碰文件**：`jet-hub/state.json` 是运行中进程的**内存快照整体回写**目标，外部改它会被下一次保存静默覆盖（实测过一次：手改磁盘后宿主一落盘就回到关闭态）。RPC 同时写内存与磁盘。认证用自签的浏览器会话 cookie——`/api` 的 cookie 是 HMAC 自包含令牌，密钥就在本机凭据库，插件能自己签，不需要人工登录或重启。
+
 ## 与 dsh-llm-error-retry 的配合
 
 「所有重试耗尽后才换模型」里的重试由 [dsh-llm-error-retry](https://github.com/liaoyuqing/dsh-llm-error-retry) 负责，本插件不重写它的规则引擎：
@@ -97,7 +218,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ## 免费渠道推荐
 
-弹窗的「免费渠道」页签列五个「装上一登录就多几条免费模型」的插件，顺序固定、Our Free Model 排第一张（不登录、不填 Key 就能用，其余四条都要登录本机账号），每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
+弹窗的「免费渠道」页签列六个「装上一登录就多几条免费模型」的插件，顺序固定、Our Free Model 排第一张（不登录、不填 Key 就能用，其余五条都要登录本机账号），每个卡片带一句定位、两条事实、GitHub 地址（一键复制）与安装状态：
 
 | 渠道 | 包 | 提供什么 |
 | --- | --- | --- |
@@ -106,6 +227,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 | Trae | `dsh-connect-trae` | 本机已登录的 Trae 账号，国内版 / 企业版 / 国际版各注册一个 provider；附每日签到与积分读数，企业版默认关闭 |
 | Qoder | `@dmh2002/dsh-connect-qoder` | Qoder（通义灵码）账号额度，只需一个 PAT（`pt-` 开头），支持多账号池、每日签到与自动换号；国内版 `qoder` 与国际版 `qoder-global` 可同时启用 |
 | Our Free Model | `dsh-our-free-model` | 不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道 |
+| Providers Hub | `dsh-codearts-auth` | 一个插件接入二十多家免费渠道的账号（华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关 |
 
 装完之后它们提供的模型就和别的模型一样出现在「模型」页签里，可以排进路由分组——本插件的失败切换与「与 Our Free Model 的配合」里的换号逻辑对它们同样生效。
 
@@ -113,9 +235,15 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 - **不代批构建脚本。** 装包需要执行安装/构建脚本时，宿主返回待批准项；页签只把这件事原样显示出来（`pendingBuilds`），批准与否由你在插件管理里决定。
 - **状态是现场的。** 「已安装 / 未安装」读 `pluginManager.listBundles()` 里该 profile 的依赖，**在线渠道**读 `llm` 注册表现场算——装了但没登录时，卡片会显示「已安装」而「在线渠道」为空，这两个本来就该分开看。
-- **推荐表是固定的五条。** 候选写死在宿主半的 `FREE_CHANNELS`（包名、安装 spec、provider 匹配），介绍文案与 GitHub 地址写在 `client.js` 的 `FREE_CHANNEL_COPY`。加一条要两边同时改；宿主不认识的新 id 不会出现在页签里。
+- **推荐表是固定的六条。** 候选写死在宿主半的 `FREE_CHANNELS`（包名、安装 spec、provider 匹配），介绍文案与 GitHub 地址写在 `client.js` 的 `FREE_CHANNEL_COPY`。加一条要两边同时改；宿主不认识的新 id 不会出现在页签里。
 
-Trae 与 Qoder 这两条是**专用连接器**，与 Our Free Model 内置的同名渠道（它也接 Trae、Qoder 账号）撞号。归属按现场状态定：专用连接器**装了**就由它认领这些 provider id，没装则留给聚合渠道——所以只装 Our Free Model 时，`trae` / `qoder` 仍会算在它那一张卡片上，不会凭空消失，也不会两张卡片重复计数。
+Trae 与 Qoder 这两条是**专用连接器**，与 Our Free Model 内置的同名渠道（它也接 Trae、Qoder 账号）撞号。归属按现场状态定：专用连接器**装了**就由它认领这些 provider id（`ct-trae` / `cq-qoder` 这种带自己前缀的，或未打门面时的裸 `trae` / `qoder`），没装则留给聚合渠道——所以只装 Our Free Model 时，那些 id 仍会算在它那一张卡片上，不会凭空消失，也不会两张卡片重复计数。
+
+认领按**注册表原始 id** 计数（不是按裸名去重）：打了门面后 `ofm-qoder` 与 `caa-qoder` 是两条不同的在线路由，会同时出现在各自的卡片上；同一张卡片里 `ofm-qoder` 与裸 `qoder` 并存也照列。判定归属时先用渠道自己的前缀剥裸名（`channelBare`），**别的插件前缀下的 id 不参与本渠道的归属**——所以 `caa-codearts` 归 Providers Hub，不会被算成 `dsh-codearts` 的那张卡片。
+
+Providers Hub 是**第二个聚合渠道**，认领顺序是专用连接器（`codearts` / `workbuddy` / `trae` / `qoder`）在前，然后聚合渠道按推荐表顺序认领——Our Free Model 先、Providers Hub 后，所以 Our Free Model 仍拿大头，Providers Hub 只拿没人认领的那些。它自己的 provider 正则不含 `codearts` 与 `workbuddy`，这两个裸名因此仍只算在各自的专用卡片上：装没装 Providers Hub 都不影响那两张卡上的「在线渠道」。而**它自己前缀下的 id（`caa-codearts`、`caa-buddy`…）无论正则怎么写都归它**——前缀本身就是归属声明，不需要靠在正则里再列一遍。
+
+Providers Hub 的安装 spec 仍是 `dsh-codearts-auth`：该包 0.2.0-rc.11 起在 npm 上改名为 `dsh-providers-hub`，旧名仍可安装，页签给的也是旧名（GitHub 地址指向改名后的 `dsh-providers-hub` 仓库）。别按新名装，页签里没有这条 spec。
 
 已知不足：这一页只负责「装上」，登录、扫码、账号池这些各自的引导在它们自己的界面上。`Our Free Model` 的安装 spec 走 npm 包名——npm 上的版本比 GitHub 主干旧一些，但 GitHub 源要拉 83MB 的仓库 tarball，而且 pnpm 每次安装 profile 都会重拉一遍，GitHub 慢的时候整个插件市场的更新都会被拖过上限，所以这里不用它。想装最新 GitHub 版本就手动 `dsh plugin add github:Ebony-Vinyl/dsh-our-free-model`，但要清楚这个代价。
 
@@ -325,7 +453,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 ## 并发与临时切换
 
-每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。`defaultConcurrency` 是**出厂值**（写在 `cordis.patch.yml`），实际生效值可以在**数据看板标题栏**改：改一次就对所有没单独设上限的模型生效，覆盖值存进 `settings.json`（`defaultConcurrency: null` 表示没覆盖、跟随 config），重启后仍在。界面上「跟随配置 / 已设置」就是这两种状态。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。占槽位同时也是**计数**：没配上限（`0`）的模型不会被判满，但从进入的那一刻就记进「进行中」——所以看板上它的并发数也是真实值，只是主值写成 `N（不限）` 而不是 `N/上限`。上限与计数是两件事，`0` 只意味着不限，不意味着不数。
+每个模型可以单独设并发上限，作用于**所有**路由分组：同一个模型挂在多个分组、多个会话绑不同分组时连的是同一批上游账号，上限必须统一，所以它记在按模型索引的表里（`model-concurrency.json`），不在分组成员上。这张表的键是「**渠道裸 id + 模型**」，与闸门、失败表、采样桶同一口径：分组条目写 `trae`、注册表里是 `ofm-trae` 时，两边数的是同一批槽位，上限才真的管得到。界面上的入口在模型弹窗的模型行右侧。正整数即上限；留空跟随 `defaultConcurrency`；`0` 表示不限。`defaultConcurrency` 是**出厂值**（写在 `cordis.patch.yml`），实际生效值可以在**数据看板标题栏**改：改一次就对所有没单独设上限的模型生效，覆盖值存进 `settings.json`（`defaultConcurrency: null` 表示没覆盖、跟随 config），重启后仍在。界面上「跟随配置 / 已设置」就是这两种状态。闸门挂在 `llm/stream` 上：一次流式请求进入时占一个槽位，流出（完成、报错、取消）时释放。占槽位同时也是**计数**：没配上限（`0`）的模型不会被判满，但从进入的那一刻就记进「进行中」——所以看板上它的并发数也是真实值，只是主值写成 `N（不限）` 而不是 `N/上限`。上限与计数是两件事，`0` 只意味着不限，不意味着不数。
 
 占不到槽位的处理是**换模型，不是排队**：闸门当场不调用下游适配器，直接以 `CAPACITY_TIMEOUT` 收尾；宿主把这个失败交给本插件，本插件按分组路由切到组内空闲的模型（`pickCandidate` 本来就跳过已满的模型，所以满员的那个不会被选中，也就没有「等它空出来」这一步）。只有**整组都满、无处可换**时才真的等：那时等的是那个目标模型的槽位，上限由 `concurrencyQueueTimeoutMs` 控制（`0` = 无限等），等到就切过去，超时才记为 `all-capacity` 放弃。**并发类失败不写「当日失败」**——它只说明此刻太挤，模型本身没坏，停一整天不合理。取而代之的是一次短冷却（`capacityCooldownMs`，默认 30 秒）：冷却期间 `pickCandidate` 跳过它，到期自动回到候选队列。
 
@@ -348,6 +476,24 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 采样**不设条数上限**：每个模型保留启动以来的全部调用样本。条数上限会把「所选区间」偷换成「最近 N 条」——筛选早一点的日期、或模型一天里跑上万次，成功率和 token 合计就只是最后一段的和。单条样本只有几十字节，按条数砍掉的是用户要看的历史。
 
 样本会落盘到 `dataDir/metrics.json`（全量样本，写盘防抖 1.5 秒、卸载时强制刷新），所以看板数据跨重启保留。老样本缺 token 字段时按「无数据」处理，不补 0。
+
+### 一行 = 一个渠道 + 一个模型，记账键必须统一
+
+看板的一行是「一个渠道 + 一个模型」，不是「某个分组里的一条」。同一渠道同一模型同时挂在「免费」与「DeepSeek V4.1分组」里时只出**一行**，副行列出它所属的全部分组（多于两个收敛成「A、B +N」，完整名单在悬停提示里）。这不是为了省地方：闸门、失败表、采样桶按的都是同一个身份——同一批请求连的是同一个上游账号池，分成两行会让同一批样本被算两次，看起来像两个模型各跑了一半。
+
+所以记账键（失败键、并发表键、采样桶键、看板行键）一律是「**渠道裸 id + 模型**」：`ofm-trae` 与裸 `trae` 是同一个渠道的两种路由写法，都记进 `trae/...` 这一个桶。三个后果值得记住：
+
+- 分组条目写裸 `trae`、宿主注册表里是 `ofm-trae` 时看板照样有数据；反过来（条目写带前缀的 id）也一样。前缀只决定「哪条路由真的被调用」，不改变统计口径。
+- 并发上限按同一个键生效：给 `trae/deepseek-v4.1-flash` 设 3，走 `ofm-trae` 还是裸 `trae` 数的都是同一批槽位。旧版把两套键分开记，看板对这些条目永远显示 0 次采样、`inflight` 恒为 0、并发上限形同虚设——这一版修的就是它。
+- 早期 `metrics.json` 用注册表 id 当键（`ofm-trae/...`、`ca-codearts/...`）。启动时这类旧桶会**并进**裸名桶（按 `at` 升序重排，只迁一次、幂等），升级后历史不会凭空消失。
+
+### 测速也计入首字与速度统计
+
+「一键测速」和每行的单模型「测速」发的都是真实的 `llm.stream` 最小请求，所以这次往返会作为**一条普通采样**进历史列——首字、速度、token、成败都算；行内副行同时给出本次实测值（实际命中的路由 `route`、整次耗时 `elapsedMs`）并注明「已计入统计」。成功率列的悬停提示会写明区间内有多少条样本是测速打出来的（`probeSamples`）：「这个模型平时多快」和「我刚测了一下」是两件事，混着看会误读。
+
+测速不受并发闸门拦截：一个正被会话打满的模型，恰恰是用户最想确认的那一个，所以闸门对测速请求**超出上限也放行**（照常计数、照常记样本），不会当场判 `CAPACITY_TIMEOUT`。这只对测速生效；真实会话调用仍然是「满了就换模型」。
+
+测速结果一出来界面就立刻回刷历史列（任务从 `running` 变 `false` 的那次响应直接触发刷新），不必等下一个 3 秒轮询周期；点测速时若已有任务在跑（HTTP 409），界面接上那次任务的快照继续显示进度，而不是把面板清成「启动失败」。
 
 ## 请求被拒也算失败，也要换模型
 
@@ -377,7 +523,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`）、凭据镜像现场（`resignBridge`：开关、间隔、`lastSyncAt`、`mirroredRefs`、`skipReason`） |
+| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`）、凭据镜像现场（`resignBridge`：开关、间隔、`lastSyncAt`、`mirroredRefs`、`skipReason`、`gate` 闸门现场），以及 codearts 自救现场（`codeartsSelfHeal`：loader 条目、账号槽位、`blockedBySignature`、`gate`、`gateHealCooldownMs`） |
 | POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`、凭据镜像 `resignBridgeEnabled` 与 `resignBridgeIntervalSeconds`）。`dialogMode` 出厂为 `true`（新装即弹窗），只有显式传 `false` 才落成下拉；`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组。`PUT` 的 `models` 是**整体替换**：看板的「移除」用它把某个模型从所属分组的清单里摘掉，其余模型与优先级保持不变 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
@@ -389,7 +535,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | POST | `/model-concurrency` | 设置/清除某个模型的并发上限（`concurrency` 正整数即设置，`null`/`0`/`""` 清除覆盖回落到 `defaultConcurrency`）；按模型索引，作用于所有分组 |
 | POST | `/resign-bridge/sync` | 立刻同步一轮 CodeArts 凭据镜像：成功回 200 `{ok:true, resignBridge}`；镜像没挂载时回 503 |
 | POST | `/groups/reorder-priority` | 按看板当前排序重设某个分组的优先级：`{groupId, start, order: [{provider, model}]}`，按 `order` 的顺序从 `start` 起连续写回（`start` 缺省 1，需 1..999）。不在该分组里的名字被忽略，重复条目只认第一次 |
-| GET | `/speedtest` | 测速的进度快照：`{running, startedAt, finishedAt, total, done, targets, results}`；`targets` 是本次覆盖的模型清单（界面用它标出「哪几行正在测」），`results` 每项含 `provider/model/ok/ttftMs/tps/inTokens/outTokens/errorCode` |
+| GET | `/speedtest` | 测速的进度快照：`{running, startedAt, finishedAt, total, done, targets, results}`；`targets` 是本次覆盖的模型清单（界面用它标出「哪几行正在测」），`results` 每项含 `provider/model/route/ok/ttftMs/tps/inTokens/outTokens/elapsedMs/errorCode`（`route` 是这次实际命中的注册表 provider id，`probe: true` 标记它同时也是看板里的一条采样） |
 | POST | `/speedtest` | 启动一次测速：`{models: [{provider, model}]}`（整组或**单个模型**都走这里）或 `{groupId}`（整组，跳过已禁用的模型；显式点名的清单不排除禁用模型，方便排查一个被禁用的模型到底通不通），可选 `timeoutMs`（5s..120s，默认 45s）与 `parallel`（1..6，默认 2）。立即返回任务快照，任务在后台跑；已有任务在跑时返回 409 |
 | GET | `/free-channels` | 免费渠道推荐现场：`{managerAvailable, channels:[{id, pkg, spec, installed, version, providers}]}`。`installed` 读 `pluginManager.listBundles()`（`null` = 取不到插件管理服务，界面显示「状态未检测」），`providers` 是此刻 `llm` 注册表里匹配该渠道的 provider id；被前面已安装的渠道认领走的 id 不重复列出（Trae / Qoder 与 Our Free Model 撞号时按安装状态归属） |
 | POST | `/free-channels/install` | 一键安装某个推荐渠道：`{id}`，转调 `pluginManager.installBundle(spec)`。成功回 200 `{ok:true, message}`；需要批准构建脚本、未知 id、没有插件管理服务都回 409 `{ok:false, message, pendingBuilds?}`——待批准项原样抛回，不代批 |
@@ -397,7 +543,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | POST | `/session-model` | 直接给某个会话定模型（子代理会话只能走这条路） |
 | GET | `/debug/sessions` | 只读诊断：列出活会话的 header、覆盖、绑定与继承解析结果 |
 | GET | `/debug/status-log?sessionId=&limit=` | 只读诊断：最近 200 条运行态事件（`agent/status`、转发给界面的 `api-session/status`、续跑排队与投递），带自增 `seq` 与毫秒时间戳 |
-| GET | `/metrics?since=&until=` | 每个模型的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略。每行另带 `lifetimeInTokens`/`lifetimeOutTokens`/`lifetimeCacheReadTokens`/`lifetimeCacheWriteTokens`/`lifetimeTokenSamples`——该模型的**全量历史**用量（含缓存命中），不随筛选变化；`lastErrorCode`/`lastErrorMessage` 是区间内最后一次失败的错误码与完整报错文案（看板上悬停显示的就是它）；`aggregateTps` 是该模型**活跃并发区间内的合计速度**：把此刻还在跑、且已经吐出过增量的请求放进同一区间（起点 = 它们中间最早吐首字的那一刻，终点 = 采样时刻），区间内的总输出字符 ÷ 4 ÷ 区间秒数（拿不到真实 token，按输出字符估，1 token ≈ 4 字符）；等首字的请求既不贡献字符也不拉长区间，没有请求在产出时为 `null`——它只描述当下，不参与区间统计 |
+| GET | `/metrics?since=&until=` | 每个**渠道 + 模型**的首字延迟与输出速度（P50/P90）、等槽时间、样本数、并发现场与并发冷却剩余；数据看板页签用它。一行 = 一个渠道 + 模型（多分组去重），另带 `groups: [{id, name}]` 与 `groupNames: string[]`（它所属的全部分组）以及 `probeSamples`（区间内由测速打出的样本数）。`since`/`until` 为 `YYYY-MM-DD`（北京时间整天，两端包含），省略即统计全部保留的样本；非法值被忽略。每行另带 `lifetimeInTokens`/`lifetimeOutTokens`/`lifetimeCacheReadTokens`/`lifetimeCacheWriteTokens`/`lifetimeTokenSamples`——该模型的**全量历史**用量（含缓存命中），不随筛选变化；`lastErrorCode`/`lastErrorMessage` 是区间内最后一次失败的错误码与完整报错文案（看板上悬停显示的就是它）；`aggregateTps` 是该模型**活跃并发区间内的合计速度**：把此刻还在跑、且已经吐出过增量的请求放进同一区间（起点 = 它们中间最早吐首字的那一刻，终点 = 采样时刻），区间内的总输出字符 ÷ 4 ÷ 区间秒数（拿不到真实 token，按输出字符估，1 token ≈ 4 字符）；等首字的请求既不贡献字符也不拉长区间，没有请求在产出时为 `null`——它只描述当下，不参与区间统计 |
 
 「错误重试」页签不经过这里的接口：它直接读写 `dsh-llm-error-retry` 自己的 `GET/POST /llm-error-retry/api/config`（同源，`iframe` 内嵌），本插件只负责探测与把页面放对位置。
 
@@ -406,11 +552,11 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 - **排序会被记住**：点表头（升序 → 降序 → 回到默认序）后写回 `settings.json`，刷新页面、换个浏览器、甚至重启宿主之后打开看板，仍是上次那一列与方向；认不出的旧值回落成默认序，不会让插件带病启动。
 - **token 列的大字是所选区间内的用量**：主行显示该模型**区间内**的输入+输出+缓存命中+缓存写入合计，**跟着日期筛选走**；副行一行一个数（`↑输入` / `缓存命中` / `缓存写入` / `↓输出`），一行一个是因为挤在一行会被列宽截掉，而缓存命中最不该被截。历史总量（不随筛选变化）与「有多少条样本带 token」放在悬停提示里。表头排序用的是同一个区间内数值。
 - **按当前排序重设优先级**：表格上方的操作条可选目标分组、填起始优先级，然后按当前排序把**有采样**的模型从起始序号连续编号；**没有数据的模型被排除**、保持原优先级不变（操作条上直接显示会有几个模型参与）。
-- **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会进入上面的采样），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。
+- **一键测速**：对目标分组里未禁用的模型各发一次最小请求（真实走 `llm.stream`，所以这一次测量也会作为一条普通采样进入历史列），任务在后台执行、界面每 1.5 秒轮询进度，结果按模型显示在名称下方并注明「已计入统计」；同一时刻只允许一个测速任务——并测会把首字延迟测成排队时间。点测速时若已有任务在跑（409），界面接上那次任务的快照继续显示进度。
 - **单个模型单独测速**：每行模型名下方都有「测速」按钮，只测这一个模型，不牵连整组。它不受当前分组下拉的限制，**分组里已禁用的模型也能测**——单独点某一行的场景恰恰是排查「这个模型到底通不通」。要同时测整组还是用操作条上的「一键测速」。
 - **恢复失败模型**：当日失败的行在状态列直接给「恢复」按钮（只清这一个模型的失败记录）；操作条上的「恢复本组失败 (N)」只清当前分组里的失败模型——不带模型名的 `/failed/reset` 会清掉全天全部失败，跨了分组就是越权。
 - **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。没有单独设上限的模型跟的是数据看板标题栏那个「默认并发」（输入框就在标题栏上，改一次全表生效，存 `settings.json`）。这一格分两行：上行是输入框，下行是「进行中 / 生效上限」——有上限时是 `N/上限`，没配上限时是 `N（不限）`，两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；等槽时间与等槽位数（只有整组都满时才有人等）接在下行后面。并排一行放不下：76px 的列里输入框先占掉一半，剩下的读数只剩省略号。
-- **从路由移除**：模型名下方的「移除」按钮把这个模型从它所属分组里摘掉，分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。同一模型在两个分组里会出现两行，要彻底离开路由就两行都移除。
+- **从路由移除**：模型名下方的「移除」按钮把这个模型从**它所属的那个分组**里摘掉（看板一行可能同时属于多个分组，这一行只按首个分组动，想彻底离开路由要到每个分组里各移除一次），分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。
 
 ## 数据文件
 
@@ -423,7 +569,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | `default-binding.json` | 新会话沿用的默认绑定 |
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
 | `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值、凭据镜像开关与间隔覆盖值（`resignBridgeEnabled` / `resignBridgeIntervalSeconds`，`null` = 跟随 config）。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
-| `model-concurrency.json` | 按模型记录的并发上限（`provider/model` → 上限），对所有分组生效 |
+| `model-concurrency.json` | 按模型记录的并发上限（`渠道裸 id/模型` → 上限），对所有分组生效；旧版用注册表 id 当键（`ofm-qoder/...`），启动时并到裸名键上 |
 
 重试规则不在这里：它属于 `dsh-llm-error-retry`，存在 `$DSH_HOME/llm-error-retry/`（`rules.json` 保存界面改过的规则，`status.json` 是等待与最近事件）。两个插件的目录互不读写。
 
@@ -463,6 +609,7 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 | 文件 | 说明 |
 | --- | --- |
 | `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、CodeArts 凭据镜像的接线、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
+| `provider-prefix.mjs` | provider 前缀换算（纯函数，无副作用）：六个插件各一个前缀、`bareProvider` / `providerEquals` / `liveProviderIdOf` 用的身份与等价判断、免费渠道认领算法。背景见「六个免费渠道插件的 provider 前缀」 |
 | `codearts-resign-bridge.mjs` | CodeArts 凭据镜像（原独立插件 `dsh-codearts-resign-bridge` 的功能，已并进来）：读账号库与候选 ref，把每个可用账号写成 bili 认识的字段 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
 | `client.js` | 浏览器半（DSH dynamic client bundle），六个页签、免费渠道卡片与 GitHub 复制都在这里 |
@@ -478,10 +625,11 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 - 依赖 DSH 的 `slots`、`modelDirectories`、`sessions`、`remote`、`remote.session` 服务与 `agent/request-error` 事件；宿主接口变动时需同步跟进。
 - 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。并发类失败不进这套状态，走的是几十秒的临时冷却。
+- 与其它免费渠道插件的 provider 撞号靠**部署侧**的 `isolate` + 门面条目解决（见「门面部署」，前五个渠道各 2 行、`dsh-codearts-auth` 再多隔离 11 个服务名，合计 22 行），插件本身装好不会自动改 `$DSH_HOME/cordis.patch.yml`：没写那些行时，各插件仍注册撞号的裸 id，后注册的一方被 `DUPLICATE_ADAPTER` 拒掉或被静默吞掉，而本插件只能把两边都见过的 id 归一，不能让它们共存。
 - 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 - 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
-- 「免费渠道」页签只负责安装，不负责登录与账号配置：五个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定五条，也只在这五个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
+- 「免费渠道」页签只负责安装，不负责登录与账号配置：六个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定六条，也只在这六个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
 - 页签里的安装 spec 一律是 npm 包名，不推荐 `github:` / `git+` 源：那类依赖要拉整个仓库 tarball（`dsh-our-free-model` 有 83MB），pnpm 在每次安装 profile 时都会重拉没缓存的那份、codeload 又不支持断点，GitHub 一慢就把插件市场的更新拖过 15 分钟上限并整批回滚——2026-11-01 这台机器就是这样卡死的。`dsh-llm-error-retry` 没有 npm 包，是本条唯一的例外，它体积很小。
 - 对 `dsh-llm-error-retry` 的依赖固定到具体 commit（`5543c34`，0.20.0），不是版本范围：「错误重试」页签内嵌的是它的页面与 `/llm-error-retry/api/config`，字段或路径一变页签就空，所以升级它要连这个页签一起验。
 - `pack.js` 有两份副本（`$DSH_HOME/plugins/` 下的开发副本与 `$DSH_HOME/profiles/<name>/node_modules/` 下宿主真正 import 的那份），尺寸与 mtime 会不同。插件对每一份都做检查，`hookRepair.copies` 逐份列出；只补 `plugins` 那份是不够的。
@@ -493,7 +641,8 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - Registers `conversation.input.model` with `priority: -1`, so it shadows the built-in selector: a split-pane dialog by default (providers on the left, models on the right, six tabs above them: models, routing groups, dashboard, failed models, error retry, free channels), or a compact dropdown once the dialog toggle is turned off. A fresh install runs in dialog mode.
 - The *error retry* tab embeds `dsh-llm-error-retry`'s own configuration page in an iframe (same origin, `/llm-error-retry`) instead of re-implementing the editor: one rule table, one place to save it. The tab probes the plugin, and when it is not mounted it says so and offers a re-probe.
 - It also mirrors CodeArts credentials (the job the standalone `dsh-codearts-resign-bridge` plugin used to do, so that plugin can be uninstalled): every `codeartsResignBridgeIntervalSeconds` (minimum 10 s) it reads `dsh-codearts`'s account store, maps each unexpired account onto the refs `billion-context` scans for re-signing, and writes `access_key_id` / `secret_access_key` / `security_token` / `expires_at` only when the value actually changed. bili matches credentials by the inbound AK, so each account needs its own ref; a static ref outlives the rotated key and the request is rejected with `403 signed_request_requires_resign`. Toggle, interval and a manual sync live in Settings.
-- The *free channel* tab recommends five plugins that add free models — CodeArts (`dsh-codearts`), WorkBuddy (`dsh-connect-workbuddy`), Trae (`dsh-connect-trae`), Qoder (`@dmh2002/dsh-connect-qoder`), and Our Free Model (`dsh-our-free-model`) — each with a one-line pitch, its facts, a copyable GitHub address, and an install button. Installing goes through `pluginManager.installBundle`, the same engine as the plugin market and `dsh plugin add`; a package that needs its install scripts approved comes back as a pending-build report rather than being approved for you. "Installed" is read from the profile dependencies and "providers online" from the live `llm` registry, so a channel that is installed but not logged in shows both facts separately. Trae and Qoder are dedicated connectors whose provider ids (`trae`, `trae-enterprise`, `trae-global`, `qoder`, `qoder-global`) overlap with the ones Our Free Model registers for the same accounts; a dedicated connector owns those ids once it is installed, and the aggregator card gets only what nobody claimed, so no id is counted twice.
+- The *free channel* tab recommends six plugins that add free models — CodeArts (`dsh-codearts`), WorkBuddy (`dsh-connect-workbuddy`), Trae (`dsh-connect-trae`), Qoder (`@dmh2002/dsh-connect-qoder`), Our Free Model (`dsh-our-free-model`), and Providers Hub (`dsh-codearts-auth`, which reaches the accounts of more than twenty free channels through one plugin) — each with a one-line pitch, its facts, a copyable GitHub address, and an install button. Installing goes through `pluginManager.installBundle`, the same engine as the plugin market and `dsh plugin add`; a package that needs its install scripts approved comes back as a pending-build report rather than being approved for you. "Installed" is read from the profile dependencies and "providers online" from the live `llm` registry, so a channel that is installed but not logged in shows both facts separately. Trae and Qoder are dedicated connectors whose provider ids (`trae`, `trae-enterprise`, `trae-global`, `qoder`, `qoder-global`) overlap with the ones the aggregators register for the same accounts. A claim goes to a dedicated connector first (`codearts`, `workbuddy`, `trae`, `qoder`), then to the aggregators in card order — Our Free Model before Providers Hub — so Our Free Model keeps the bulk of what it already served and Providers Hub gets only what nobody claimed. Providers Hub's own provider pattern leaves out `codearts` and `workbuddy`, so those two ids stay on their dedicated cards whether or not it is installed, and no id is counted twice.
+- The six free-channel plugins all register providers whose ids collide — `qoder`, `qodercn`, `trae`, `cline`, `loomy`, `raccoon`, `minimax`, `zcode`, `gemini`, `codearts`, `workbuddy` — and the host keeps one adapter per provider, so whichever side registers last is either rejected with `DUPLICATE_ADAPTER` or swallowed silently. Each plugin therefore gets its own id prefix, applied on the **real registry** side by an llm facade inside a cordis `isolate` realm: `ofm-` (Our Free Model), `ca-` (`dsh-codearts`), `cw-` (WorkBuddy), `ct-` (Trae), `cq-` (Qoder), `caa-` (Providers Hub). The plugins themselves are untouched: the facade shows bare ids to its consumer and prefixed ids to the real registry, so the dialog lists `ofm-qoder` while group files, the config and the failed-model table keep saying `qoder`. A plugin without the facade still registers bare ids, and both views may coexist. Deployment is a facade row plus an `isolate` row per channel in `$DSH_HOME/cordis.patch.yml` (22 rows: Providers Hub also needs the 11 cordis service names below in its isolate); each pair must use the same label, and the facade entry must live in a package directory with **no `dsh.client` declaration** — `client-modules` merges bundles by package name, so a second client bundle under the same name makes the host fail to boot (that is what broke DSH last time). Providers Hub also collides on **cordis service names**, not just provider ids: it and Our Free Model both register `lobsteraiAuth`, `qoderAuth`, `qodercnAuth`, `traeAuth`, `clineAuth`, `loomyAuth`, `raccoonAuth`, `minimaxAuth`, `zcodeAuth`, `geminiAuth` and `accountPool` through `super(ctx, `${product.id}Auth`)`, and cordis throws on a duplicate service name — aborting the later plugin's whole `apply`, so none of its channel adapters register and it vanishes from the model tabs. Its `isolate` therefore lists those 11 names next to `llm` under the same label; recheck them after either side upgrades. All conversion is centralised in `provider-prefix.mjs`: `bareProvider()` for accounting keys, `providerEquals()` for channel identity (a bare id equals its own prefixed form, two different plugins never equal), and `liveProviderIdOf()` to hand the registry the id it actually knows, trying `ofm- → ca- → cw- → ct- → cq- → caa-` in card order.
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.
