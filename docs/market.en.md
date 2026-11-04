@@ -4,6 +4,8 @@ Replaces the composer's model seat with a grouped model picker that fails over t
 
 One install brings two pieces: it depends on [dsh-llm-error-retry](https://github.com/liaoyuqing/dsh-llm-error-retry) and embeds that plugin's configuration page as a dialog tab, so retry rules are edited in one place.
 
+The dialog's **Free channels** tab also gathers the six plugins that add free models, so one click puts dozens of models you can run without paying into the model list.
+
 ## The dialog
 
 ![Models tab](preview-model-selection.png)
@@ -42,7 +44,24 @@ Requires DSH `>=0.2.1-0 <0.3.0` (pre-releases such as rc/alpha included).
 - **A failure no longer interrupts you.** Inner retry policies run first; once they all decline, the plugin records the model as failed for the day, switches to the next routable model in the group, and continues the same turn on its own — no manual resend.
 - **Accounts and models are handled separately.** Our Free Model channels try another account first and only then switch models; a CodeArts pool poisoned by 401/403 is restarted through its own loader entry.
 - **State is visible.** Which model failed today and why, first-token latency, concurrency, success rate — all on the dashboard, no log digging.
-- **Free channels install in one click.** Our Free Model, CodeArts, WorkBuddy, Trae, Qoder and Providers Hub install from the tab through the same engine the plugin market uses.
+- **Free channels install in one click.** The six channel plugins install from the tab through the same engine the plugin market uses; each one adds a batch of free models that join your routing groups and fail over like any other.
+
+## Free channel platforms it supports
+
+The six cards cover **23 third-party platforms**, plus the anonymous free channel Our Free Model runs itself (a platform's domestic, international and enterprise editions each count as a separate provider route). None of the platforms is implemented by this plugin: it installs them, lists them, and makes their models routable. With all six installed, the registry shows 40+ prefixed provider routes.
+
+| Card | Package | Provider prefix | Platforms covered |
+| --- | --- | --- | --- |
+| **Our Free Model** | `dsh-our-free-model` | `ofm-` | The anonymous free channel (DeepSeek V4.1 Flash, Kimi K3) plus ten account channels: Qoder, Qoder China, TRAE, Cline, Youdao LobsterAI, iFlytek Loomy, SenseTime Raccoon, MiniMax Code, Zhipu ZCode, Gemini Code Assist |
+| **CodeArts** | `dsh-codearts` | `ca-` | Huawei Cloud CodeArts |
+| **WorkBuddy** | `dsh-connect-workbuddy` | `cw-` | WorkBuddy domestic and international |
+| **Trae** | `dsh-connect-trae` | `ct-` | TRAE domestic, enterprise and international |
+| **Qoder** | `@dmh2002/dsh-connect-qoder` | `cq-` | Qoder (Tongyi Lingma) domestic and international |
+| **Providers Hub** | `dsh-providers-hub` | `caa-` | Huawei Cloud CodeArts, Tencent CodeBuddy, WorkBuddy international, Youdao LobsterAI, Qoder domestic and international, TRAE, Cline, iFlytek Loomy, SenseTime Raccoon, MiniMax Code domestic and international, Zhipu ZCode, OpenCode, Gemini Code Assist, OfficeAce, Alibaba Accio, iFlytek AStudio, AutoClaw Zhipu and international, ModelScope, Qiniu, Codely (Unity), MonkeyCode domestic and international, Baizhi Cloud, MagiCrew domestic and international — 28 routes |
+
+Providers Hub claims exactly these provider ids: `caa-codearts`, `caa-buddy`, `caa-qoder`, `caa-qodercn`, `caa-workbuddy`, `caa-lobsterai`, `caa-trae`, `caa-cline`, `caa-loomy`, `caa-raccoon`, `caa-minimax`, `caa-minimaxintl`, `caa-zcode`, `caa-opencode`, `caa-gemini`, `caa-officeace`, `caa-accio`, `caa-astudio`, `caa-autoclaw`, `caa-autoclawintl`, `caa-modelscope`, `caa-qiniu`, `caa-codely`, `caa-monkeycode`, `caa-monkeycodeintl`, `caa-baizhi`, `caa-magicrew`, `caa-magicrewintl`.
+
+**Only Our Free Model needs no login.** Its built-in anonymous channel works without an account or an API key; the other five expect you to already have an account on that platform (or its desktop client signed in on this machine) and merely route that quota into DSH. On desktop there is also an EAC co-payment channel.
 
 ## Free channels tab
 
@@ -50,16 +69,18 @@ Requires DSH `>=0.2.1-0 <0.3.0` (pre-releases such as rc/alpha included).
 
 Each recommendation adds a few models you can run without paying. The card order is fixed, with Our Free Model on top — the only one that needs neither a login nor an API key — and Providers Hub last:
 
-- **Our Free Model** (`dsh-our-free-model`): a no-login, no-API-key channel including DeepSeek V4.1 Flash and Kimi K3, which also routes Trae and Qoder accounts since 2.0.
+- **Our Free Model** (`dsh-our-free-model`): a no-login, no-API-key channel including DeepSeek V4.1 Flash and Kimi K3, which also routes LobsterAI, Qoder, TRAE, Cline, Loomy, Raccoon, MiniMax, ZCode and Gemini accounts since 2.0.
 - **CodeArts** (`dsh-codearts`): models bundled with a Huawei Cloud CodeArts account, with built-in OAuth2 login (PKCE + DPoP).
 - **WorkBuddy** (`dsh-connect-workbuddy`): the WorkBuddy account already signed in on this machine (domestic / international), with per-model rate multipliers, account switching and daily check-in.
 - **Trae** (`dsh-connect-trae`): the Trae desktop account already signed in on this machine; domestic, enterprise and international each register a provider, with daily check-in and credit readouts.
 - **Qoder** (`@dmh2002/dsh-connect-qoder`): a Qoder account's model quota through a single PAT, with a multi-account pool and automatic switching; domestic and international can run side by side.
-- **Providers Hub** (`dsh-providers-hub`, formerly `dsh-codearts-auth`): the accounts of more than twenty free channels through one plugin — Huawei Cloud CodeArts, Tencent CodeBuddy, Youdao LobsterAI, Qoder, TRAE, Cline, MiniMax, Zhipu ZCode, Gemini, Accio, iFlytek AStudio and others; one login puts that channel's models in the model list, with a multi-account pool, silent renewal and a local OpenAI-compatible gateway.
+- **Providers Hub** (`dsh-providers-hub`, formerly `dsh-codearts-auth`): the accounts of more than twenty free channels through one plugin (the list is in the previous section); one login puts that channel's models in the model list, with a multi-account pool, silent renewal and a local OpenAI-compatible gateway.
 
 Three separate facts per card: **installed** (read from the profile dependencies), **providers online** (read from the live `llm` registry), and the **GitHub address** (one click to copy). A channel that is installed but not logged in therefore never reads as "not installed".
 
-Trae and Qoder are dedicated connectors whose provider ids overlap with the ones the aggregators register for the same accounts: an installed connector owns them, an absent one leaves them to the aggregators, so no id is counted twice and none disappears. Providers Hub is the second aggregator: a claim goes to a dedicated connector (`codearts`, `workbuddy`, `trae`, `qoder`) first, then to the aggregators in card order — Our Free Model before Providers Hub — so Our Free Model keeps the bulk and Providers Hub gets only what nobody claimed. Its own provider pattern leaves out `codearts` and `workbuddy`, so those ids stay on their dedicated cards.
+Trae and Qoder are dedicated connectors whose provider ids overlap with the ones the aggregators register for the same accounts: an installed connector owns them, an absent one leaves them to the aggregators, so no id is counted twice and none disappears.
+
+Providers Hub is the second aggregator: a claim goes to a dedicated connector (`codearts`, `workbuddy`, `trae`, `qoder`) first, then to the aggregators in card order — Our Free Model before Providers Hub — so Our Free Model keeps the bulk and Providers Hub gets only what nobody claimed. Its own provider pattern leaves out `codearts` and `workbuddy`, so those ids stay on their dedicated cards.
 
 The install button calls the host's `pluginManager.installBundle` — the same path as the plugin market and `dsh plugin add`. When a package needs its install scripts approved the tab reports the pending builds and never approves on your behalf. Installed channels show up in the Models tab and can join a routing group like any other model.
 

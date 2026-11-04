@@ -2858,9 +2858,17 @@ ok('㊳ 市场卡片图标是随包发布的方形 PNG（SVG 会被市场拒绝�
 
 const zhMeta = JSON.parse(readFileSync(new URL('./locale/zh.json', import.meta.url), 'utf8')).meta
 const enMeta = JSON.parse(readFileSync(new URL('./locale/en.json', import.meta.url), 'utf8')).meta
-ok('㊳ 市场描述不超过 50 字，且 package.json 与中文 locale 是同一句',
-  [...pkg.description].length <= 50 && zhMeta.description === pkg.description,
+// 描述字数不再设上限（市场卡片按 5 行截断、详情页不截断），只守「同一句」与
+// 「说得出覆盖了哪些平台」这两件最容易漏掉的事。
+ok('㊳ 市场描述在 package.json 与中文 locale 是同一句',
+  typeof pkg.description === 'string' && pkg.description.trim() !== ''
+  && zhMeta.description === pkg.description,
   [...pkg.description].length + ' 字：' + pkg.description)
+ok('㊳ 市场描述点名了六个免费渠道与它们覆盖的平台，不是一句泛泛的话',
+  ['Our Free Model', 'CodeArts', 'WorkBuddy', 'Trae', 'Qoder', 'Providers Hub',
+    'CodeBuddy', 'LobsterAI', 'MiniMax', 'ZCode', 'Gemini', 'Accio', 'AStudio']
+    .every(name => zhMeta.description.includes(name)),
+  zhMeta.description)
 ok('㊳ 英文市场描述以句号结尾（awesome-dsh-plugin 的硬性要求）',
   typeof enMeta.description === 'string' && enMeta.description.trim().endsWith('.'),
   enMeta.description)

@@ -231,6 +231,19 @@ bili 的候选 ref **完全由 `jet-hub/state.json` 决定**：它只读这个�
 | Our Free Model | `dsh-our-free-model` | 不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道 |
 | Providers Hub | `dsh-providers-hub` | 一个插件接入二十多家免费渠道的账号（华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关 |
 
+六个插件合计覆盖 23 个第三方平台（同一个平台的国内版 / 国际版 / 企业版各算一条 provider 路由）；全部装上时注册表里会出现 40 多条带前缀的路由。逐条对照：
+
+| 渠道 | 平台 |
+| --- | --- |
+| Our Free Model | 匿名免费通道（DeepSeek V4.1 Flash、Kimi K3）、Qoder、Qoder 中国版、TRAE、Cline、LobsterAI（有道）、Loomy（讯飞）、Raccoon（商汤）、MiniMax Code、ZCode（智谱）、Gemini Code Assist |
+| CodeArts | 华为云 CodeArts |
+| WorkBuddy | WorkBuddy 国内版 / 国际版 |
+| Trae | TRAE 国内版 / 企业版 / 国际版 |
+| Qoder | Qoder（通义灵码）国内版 / 国际版 |
+| Providers Hub | 华为云 CodeArts、腾讯 CodeBuddy、WorkBuddy 国际版、LobsterAI（有道）、Qoder 国内版 / 国际版、TRAE、Cline、Loomy（讯飞）、Raccoon（商汤）、MiniMax Code 国内版 / 国际版、ZCode（智谱）、OpenCode、Gemini Code Assist、OfficeAce、Accio（阿里）、AStudio（讯飞）、AutoClaw 智谱 / 国际版、ModelScope（魔搭）、Qiniu（七牛云）、Codely（Unity）、MonkeyCode 国内 / 国际站、百智云、MagiCrew 国内 / 国际版 |
+
+其中**只有 Our Free Model 内置的匿名通道免登录**；其余五条都要求你已有对应平台的账号（或本机已登录它的桌面客户端），插件只是把那份额度接进 DSH。桌面端另有 EAC 协付渠道。
+
 装完之后它们提供的模型就和别的模型一样出现在「模型」页签里，可以排进路由分组——本插件的失败切换与「与 Our Free Model 的配合」里的换号逻辑对它们同样生效。
 
 **一键安装走插件市场的同一个引擎。** 按钮调的是宿主的 `pluginManager.installBundle(spec)`，也就是插件市场（`dshmarket`）和执行 `dsh plugin add` 时用的那条路径，本插件不自己跑 `pnpm`、不自己改 profile 清单。三条边界：

@@ -1,8 +1,8 @@
 # 模型故障转移管理
 
 把 composer 的模型选择位换成带**路由分组**的选择弹窗，并在模型彻底失败（所有重试都放弃）后自动切到组内下一个可用模型。
-
 一次安装带两件：依赖 [dsh-llm-error-retry](https://github.com/liaoyuqing/dsh-llm-error-retry)，并在弹窗里内嵌它的配置页 —— 重试规则不用另开一个界面改。
+弹窗里的**免费渠道**页签还把六个能直接补免费模型的插件聚在一起，一键装上就能让模型列表多出几十条可以白跑的模型。
 
 ## 界面
 
@@ -34,7 +34,6 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```
 
 这一条会把 `dsh-llm-error-retry` 一起装上（它在 `dependencies` 里，固定到具体 commit）。装完重启 DSH，模型位就会变成弹窗；不想用弹窗可以在 **设置 → 模型故障转移** 里关掉，退回紧凑下拉。
-
 要求 DSH `>=0.2.1-0 <0.3.0`（含 rc/alpha 等预发布）。
 
 ## 它解决什么
@@ -42,7 +41,24 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 - **失败不再打断你**：一次失败，内层重试先按规则重试；全都放弃后本插件标记该模型当日失败、切到组内下一个可用模型，并自动续跑当前这一轮 —— 不用手动重发。
 - **账号和模型分开处理**：Our Free Model 的渠道先尝试换账号，账号试完才换模型；CodeArts 池被 401/403 打成「无可用账号」时自动重启它自己的 Loader 条目自救。
 - **状态看得见**：哪个模型今天失败过、为什么失败、首字多慢、并发多少、成功率如何，都在看板里，不用翻日志。
-- **免费渠道一步装上**：Our Free Model、CodeArts、WorkBuddy、Trae、Qoder、Providers Hub 六个插件在页签里直接安装，走的是插件市场同一个引擎。
+- **免费渠道一步装上**：六个渠道插件在页签里直接安装，走的是插件市场同一个引擎；装上一个就多一批免费模型，接进路由分组后自动参与失败转移。
+
+## 支持的免费渠道平台
+
+六张卡片合计覆盖 **23 个第三方平台**（加上 Our Free Model 自己那条匿名免费通道；同一个平台的国内版 / 国际版 / 企业版各算一条路由）—— 这些平台都不是本插件自己实现的，本插件只负责把它们装起来、列出来、并让它们的模型能进路由分组。六个插件全部装上时，注册表里能看到四十多条带前缀的 provider 路由。
+
+| 卡片 | 插件包 | provider 前缀 | 覆盖的平台 |
+| --- | --- | --- | --- |
+| **Our Free Model** | `dsh-our-free-model` | `ofm-` | 匿名免费通道（DeepSeek V4.1 Flash、Kimi K3），以及 Qoder、Qoder 中国版、TRAE、Cline、有道 LobsterAI、讯飞 Loomy、商汤 Raccoon、MiniMax Code、智谱 ZCode、Gemini Code Assist 十个账号渠道 |
+| **CodeArts** | `dsh-codearts` | `ca-` | 华为云 CodeArts |
+| **WorkBuddy** | `dsh-connect-workbuddy` | `cw-` | WorkBuddy 国内版 / 国际版 |
+| **Trae** | `dsh-connect-trae` | `ct-` | TRAE 国内版 / 企业版 / 国际版 |
+| **Qoder** | `@dmh2002/dsh-connect-qoder` | `cq-` | Qoder（通义灵码）国内版 / 国际版 |
+| **Providers Hub** | `dsh-providers-hub` | `caa-` | 华为云 CodeArts、腾讯 CodeBuddy、WorkBuddy 国际版、有道 LobsterAI、Qoder 国内版 / 国际版、TRAE、Cline、讯飞 Loomy、商汤 Raccoon、MiniMax Code 国内版 / 国际版、智谱 ZCode、OpenCode、Gemini Code Assist、OfficeAce、阿里 Accio、讯飞 AStudio、AutoClaw 智谱 / 国际版、魔搭 ModelScope、七牛云 Qiniu、Codely（Unity）、MonkeyCode 国内 / 国际站、百智云、超级麦吉 MagiCrew 国内 / 国际版 —— 共 28 条渠道 |
+
+它认领的 provider id 就是 `caa-codearts`、`caa-buddy`、`caa-qoder`、`caa-qodercn`、`caa-workbuddy`、`caa-lobsterai`、`caa-trae`、`caa-cline`、`caa-loomy`、`caa-raccoon`、`caa-minimax`、`caa-minimaxintl`、`caa-zcode`、`caa-opencode`、`caa-gemini`、`caa-officeace`、`caa-accio`、`caa-astudio`、`caa-autoclaw`、`caa-autoclawintl`、`caa-modelscope`、`caa-qiniu`、`caa-codely`、`caa-monkeycode`、`caa-monkeycodeintl`、`caa-baizhi`、`caa-magicrew`、`caa-magicrewintl` 这些。
+
+**免登录的那一条只有 Our Free Model。** 它内置的匿名免费通道不登录、不填 API Key 就能用；其余五个都要求你已经有对应平台的账号（或者本机已经登录了它的桌面客户端），插件只是把那份额度接进 DSH。桌面端另有 EAC 协付渠道。
 
 ## 免费渠道页签
 
@@ -50,12 +66,12 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 六个推荐渠道都能让模型列表多出几条可以白跑的模型，卡片顺序固定，Our Free Model 在最上面（只有它不登录、不填 Key 就能用），Providers Hub 在最后一张：
 
-- **Our Free Model**（`dsh-our-free-model`）：不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起也接 Trae、Qoder 等账号渠道。
+- **Our Free Model**（`dsh-our-free-model`）：不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起也接 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 十个账号渠道。
 - **CodeArts**（`dsh-codearts`）：华为云 CodeArts 账号自带的模型额度，内置 OAuth2 登录（PKCE + DPoP）。
 - **WorkBuddy**（`dsh-connect-workbuddy`）：本机已登录的 WorkBuddy 账号（国内版 / 国际版），按上游目录读积分倍率，支持换号与每日签到。
 - **Trae**（`dsh-connect-trae`）：本机已登录的 Trae 桌面端账号，国内版 / 企业版 / 国际版各注册一个 provider，附每日签到与积分读数。
 - **Qoder**（`@dmh2002/dsh-connect-qoder`）：Qoder（通义灵码）账号额度，只需一个 PAT（`pt-` 开头），支持多账号池与自动换号，国内版与国际版可同时启用。
-- **Providers Hub**（`dsh-providers-hub`，旧名 `dsh-codearts-auth`）：一个插件接入二十多家免费渠道的账号（华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关。
+- **Providers Hub**（`dsh-providers-hub`，旧名 `dsh-codearts-auth`）：一个插件接入二十多家免费渠道的账号（清单见上一节），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关。
 
 卡片上三件事分开写清楚：**装没装**（读 profile 依赖）、**在线渠道**（读当前 llm 注册表）、**GitHub 地址**（一键复制）。所以「装了但没登录」不会显示成「没装」。
 

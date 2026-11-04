@@ -1,7 +1,7 @@
 {
   "name": "model-failover-manager",
-  "version": "2.26.0",
-  "description": "模型选择弹窗＋路由分组：模型失败后自动换到组内下一个可用模型并继续本轮；另含数据看板、免费渠道页签。",
+  "version": "2.27.0",
+  "description": "模型选择弹窗＋路由分组：模型失败后自动换到组内下一个可用模型并继续本轮；免费渠道页签一键装 Our Free Model、CodeArts、WorkBuddy、Trae、Qoder、Providers Hub 六个插件，覆盖华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等 23 个免费平台；另含数据看板与错误重试配置。",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
