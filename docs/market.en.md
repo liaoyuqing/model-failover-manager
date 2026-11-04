@@ -48,21 +48,50 @@ Requires DSH `>=0.2.1-0 <0.3.0` (pre-releases such as rc/alpha included).
 
 ## Free channel platforms it supports
 
-The six cards cover **23 third-party platforms**, plus the anonymous free channel Our Free Model runs itself (a platform's domestic, international and enterprise editions each count as a separate provider route). None of the platforms is implemented by this plugin: it installs them, lists them, and makes their models routable. With all six installed, the registry shows 40+ prefixed provider routes.
+The six cards cover **23 third-party platforms** — the **deduplicated union**, each platform counted once. The table below is exactly those 23 rows; the third column says which cards provide it, so a channel several plugins implement (Qoder is reachable through three) still occupies one row.
 
-| Card | Package | Provider prefix | Platforms covered |
+| # | Platform | Cards that provide it |
+| --- | --- | --- |
+| 1 | Qoder (Tongyi Lingma) | Our Free Model, Qoder, Providers Hub |
+| 2 | TRAE (ByteDance) | Our Free Model, Trae, Providers Hub |
+| 3 | Huawei Cloud CodeArts | CodeArts, Providers Hub |
+| 4 | WorkBuddy | WorkBuddy, Providers Hub |
+| 5 | Cline | Our Free Model, Providers Hub |
+| 6 | Youdao LobsterAI | Our Free Model, Providers Hub |
+| 7 | iFlytek Loomy | Our Free Model, Providers Hub |
+| 8 | SenseTime Raccoon | Our Free Model, Providers Hub |
+| 9 | MiniMax Code | Our Free Model, Providers Hub |
+| 10 | Zhipu ZCode | Our Free Model, Providers Hub |
+| 11 | Gemini Code Assist | Our Free Model, Providers Hub |
+| 12 | Tencent CodeBuddy | Providers Hub |
+| 13 | OpenCode | Providers Hub |
+| 14 | OfficeAce | Providers Hub |
+| 15 | Alibaba Accio | Providers Hub |
+| 16 | iFlytek AStudio | Providers Hub |
+| 17 | AutoClaw (Zhipu) | Providers Hub |
+| 18 | ModelScope | Providers Hub |
+| 19 | Qiniu | Providers Hub |
+| 20 | Codely (Unity) | Providers Hub |
+| 21 | MonkeyCode | Providers Hub |
+| 22 | Baizhi Cloud | Providers Hub |
+| 23 | MagiCrew | Providers Hub |
+
+The "40+ routes" figure counts the same channels the other way: routes are provider ids in the registry, and a platform's domestic, international and enterprise editions each take one. Per card:
+
+| Card | Package | Provider prefix | Routes |
 | --- | --- | --- | --- |
-| **Our Free Model** | `dsh-our-free-model` | `ofm-` | The anonymous free channel (DeepSeek V4.1 Flash, Kimi K3) plus ten account channels: Qoder, Qoder China, TRAE, Cline, Youdao LobsterAI, iFlytek Loomy, SenseTime Raccoon, MiniMax Code, Zhipu ZCode, Gemini Code Assist |
-| **CodeArts** | `dsh-codearts` | `ca-` | Huawei Cloud CodeArts |
-| **WorkBuddy** | `dsh-connect-workbuddy` | `cw-` | WorkBuddy domestic and international |
-| **Trae** | `dsh-connect-trae` | `ct-` | TRAE domestic, enterprise and international |
-| **Qoder** | `@dmh2002/dsh-connect-qoder` | `cq-` | Qoder (Tongyi Lingma) domestic and international |
-| **Providers Hub** | `dsh-providers-hub` | `caa-` | Huawei Cloud CodeArts, Tencent CodeBuddy, WorkBuddy international, Youdao LobsterAI, Qoder domestic and international, TRAE, Cline, iFlytek Loomy, SenseTime Raccoon, MiniMax Code domestic and international, Zhipu ZCode, OpenCode, Gemini Code Assist, OfficeAce, Alibaba Accio, iFlytek AStudio, AutoClaw Zhipu and international, ModelScope, Qiniu, Codely (Unity), MonkeyCode domestic and international, Baizhi Cloud, MagiCrew domestic and international — 28 routes |
+| **Our Free Model** | `dsh-our-free-model` | `ofm-` | 1 main channel + 10 account channels (10 of the 23 platforms above) |
+| **CodeArts** | `dsh-codearts` | `ca-` | 1 (Huawei Cloud CodeArts) |
+| **WorkBuddy** | `dsh-connect-workbuddy` | `cw-` | 2 (domestic, international) |
+| **Trae** | `dsh-connect-trae` | `ct-` | 3 (domestic, enterprise, international) |
+| **Qoder** | `@dmh2002/dsh-connect-qoder` | `cq-` | 2 (domestic, international) |
+| **Providers Hub** | `dsh-providers-hub` | `caa-` | 28 (covering the 23 platforms above, with Qoder, MiniMax Code, AutoClaw, MonkeyCode and MagiCrew each holding a domestic and an international route) |
 
-Providers Hub claims exactly these provider ids: `caa-codearts`, `caa-buddy`, `caa-qoder`, `caa-qodercn`, `caa-workbuddy`, `caa-lobsterai`, `caa-trae`, `caa-cline`, `caa-loomy`, `caa-raccoon`, `caa-minimax`, `caa-minimaxintl`, `caa-zcode`, `caa-opencode`, `caa-gemini`, `caa-officeace`, `caa-accio`, `caa-astudio`, `caa-autoclaw`, `caa-autoclawintl`, `caa-modelscope`, `caa-qiniu`, `caa-codely`, `caa-monkeycode`, `caa-monkeycodeintl`, `caa-baizhi`, `caa-magicrew`, `caa-magicrewintl`.
+1 + 10 + 1 + 2 + 3 + 2 + 28 = **47 routes**, landing on 23 platforms after deduplication. One platform provided by two plugins is normal rather than a mistake: an installed dedicated connector owns those ids, an absent one leaves them to the aggregators, so each id is counted in one place at a time (the claim rules are in the next section).
+
+None of the platforms is implemented by this plugin: it installs them, lists them, and makes their models routable. Providers Hub claims exactly these provider ids: `caa-codearts`, `caa-buddy`, `caa-qoder`, `caa-qodercn`, `caa-workbuddy`, `caa-lobsterai`, `caa-trae`, `caa-cline`, `caa-loomy`, `caa-raccoon`, `caa-minimax`, `caa-minimaxintl`, `caa-zcode`, `caa-opencode`, `caa-gemini`, `caa-officeace`, `caa-accio`, `caa-astudio`, `caa-autoclaw`, `caa-autoclawintl`, `caa-modelscope`, `caa-qiniu`, `caa-codely`, `caa-monkeycode`, `caa-monkeycodeintl`, `caa-baizhi`, `caa-magicrew`, `caa-magicrewintl`.
 
 **Only Our Free Model needs no login.** Its built-in anonymous channel works without an account or an API key; the other five expect you to already have an account on that platform (or its desktop client signed in on this machine) and merely route that quota into DSH. On desktop there is also an EAC co-payment channel.
-
 ## Free channels tab
 
 ![Free channels tab: Our Free Model first](preview-free-channels.png)

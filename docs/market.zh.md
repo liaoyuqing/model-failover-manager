@@ -45,21 +45,50 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 ## 支持的免费渠道平台
 
-六张卡片合计覆盖 **23 个第三方平台**（加上 Our Free Model 自己那条匿名免费通道；同一个平台的国内版 / 国际版 / 企业版各算一条路由）—— 这些平台都不是本插件自己实现的，本插件只负责把它们装起来、列出来、并让它们的模型能进路由分组。六个插件全部装上时，注册表里能看到四十多条带前缀的 provider 路由。
+六张卡片合计覆盖 **23 个第三方平台** —— 这是**去重后的并集**，一个平台只算一次。下面这张表就是那 23 行；第三列说明它由哪几张卡片提供，同一条渠道被多个插件重复实现时（比如 Qoder 三张卡片都能接），这里仍然只占一行。
 
-| 卡片 | 插件包 | provider 前缀 | 覆盖的平台 |
+| # | 平台 | 由哪些卡片提供 |
+| --- | --- | --- |
+| 1 | Qoder（通义灵码） | Our Free Model、Qoder、Providers Hub |
+| 2 | TRAE（字节） | Our Free Model、Trae、Providers Hub |
+| 3 | 华为云 CodeArts | CodeArts、Providers Hub |
+| 4 | WorkBuddy | WorkBuddy、Providers Hub |
+| 5 | Cline | Our Free Model、Providers Hub |
+| 6 | 有道 LobsterAI | Our Free Model、Providers Hub |
+| 7 | 讯飞 Loomy | Our Free Model、Providers Hub |
+| 8 | 商汤 Raccoon | Our Free Model、Providers Hub |
+| 9 | MiniMax Code | Our Free Model、Providers Hub |
+| 10 | 智谱 ZCode | Our Free Model、Providers Hub |
+| 11 | Gemini Code Assist | Our Free Model、Providers Hub |
+| 12 | 腾讯 CodeBuddy | Providers Hub |
+| 13 | OpenCode | Providers Hub |
+| 14 | OfficeAce | Providers Hub |
+| 15 | 阿里 Accio | Providers Hub |
+| 16 | 讯飞 AStudio | Providers Hub |
+| 17 | AutoClaw（智谱） | Providers Hub |
+| 18 | 魔搭 ModelScope | Providers Hub |
+| 19 | 七牛云 Qiniu | Providers Hub |
+| 20 | Codely（Unity） | Providers Hub |
+| 21 | MonkeyCode | Providers Hub |
+| 22 | 百智云 | Providers Hub |
+| 23 | 超级麦吉 MagiCrew | Providers Hub |
+
+至于「40 多条路由」是同一批渠道的另一种数法：路由按注册表里的 provider id 数，同一个平台的国内版 / 国际版 / 企业版各占一条。按卡片拆开就是：
+
+| 卡片 | 插件包 | provider 前缀 | 路由数 |
 | --- | --- | --- | --- |
-| **Our Free Model** | `dsh-our-free-model` | `ofm-` | 匿名免费通道（DeepSeek V4.1 Flash、Kimi K3），以及 Qoder、Qoder 中国版、TRAE、Cline、有道 LobsterAI、讯飞 Loomy、商汤 Raccoon、MiniMax Code、智谱 ZCode、Gemini Code Assist 十个账号渠道 |
-| **CodeArts** | `dsh-codearts` | `ca-` | 华为云 CodeArts |
-| **WorkBuddy** | `dsh-connect-workbuddy` | `cw-` | WorkBuddy 国内版 / 国际版 |
-| **Trae** | `dsh-connect-trae` | `ct-` | TRAE 国内版 / 企业版 / 国际版 |
-| **Qoder** | `@dmh2002/dsh-connect-qoder` | `cq-` | Qoder（通义灵码）国内版 / 国际版 |
-| **Providers Hub** | `dsh-providers-hub` | `caa-` | 华为云 CodeArts、腾讯 CodeBuddy、WorkBuddy 国际版、有道 LobsterAI、Qoder 国内版 / 国际版、TRAE、Cline、讯飞 Loomy、商汤 Raccoon、MiniMax Code 国内版 / 国际版、智谱 ZCode、OpenCode、Gemini Code Assist、OfficeAce、阿里 Accio、讯飞 AStudio、AutoClaw 智谱 / 国际版、魔搭 ModelScope、七牛云 Qiniu、Codely（Unity）、MonkeyCode 国内 / 国际站、百智云、超级麦吉 MagiCrew 国内 / 国际版 —— 共 28 条渠道 |
+| **Our Free Model** | `dsh-our-free-model` | `ofm-` | 主通道 1 条 + 账号渠道 10 条（上面 23 个平台里的 10 个） |
+| **CodeArts** | `dsh-codearts` | `ca-` | 1 条（华为云 CodeArts） |
+| **WorkBuddy** | `dsh-connect-workbuddy` | `cw-` | 2 条（国内版 / 国际版） |
+| **Trae** | `dsh-connect-trae` | `ct-` | 3 条（国内版 / 企业版 / 国际版） |
+| **Qoder** | `@dmh2002/dsh-connect-qoder` | `cq-` | 2 条（国内版 / 国际版） |
+| **Providers Hub** | `dsh-providers-hub` | `caa-` | 28 条（覆盖上面 23 个平台，其中 Qoder、MiniMax Code、AutoClaw、MonkeyCode、超级麦吉 MagiCrew 各占国内 / 国际两条） |
 
-它认领的 provider id 就是 `caa-codearts`、`caa-buddy`、`caa-qoder`、`caa-qodercn`、`caa-workbuddy`、`caa-lobsterai`、`caa-trae`、`caa-cline`、`caa-loomy`、`caa-raccoon`、`caa-minimax`、`caa-minimaxintl`、`caa-zcode`、`caa-opencode`、`caa-gemini`、`caa-officeace`、`caa-accio`、`caa-astudio`、`caa-autoclaw`、`caa-autoclawintl`、`caa-modelscope`、`caa-qiniu`、`caa-codely`、`caa-monkeycode`、`caa-monkeycodeintl`、`caa-baizhi`、`caa-magicrew`、`caa-magicrewintl` 这些。
+1 + 10 + 1 + 2 + 3 + 2 + 28 = **47 条路由**，去重后落在 23 个平台上。一个平台被两个插件同时提供是常态而不是错误：装上专用连接器后那些 id 归它，没装则留给聚合渠道，同一时刻只算一处（下面「免费渠道页签」一节讲认领规则）。
 
-**免登录的那一条只有 Our Free Model。** 它内置的匿名免费通道不登录、不填 API Key 就能用；其余五个都要求你已经有对应平台的账号（或者本机已经登录了它的桌面客户端），插件只是把那份额度接进 DSH。桌面端另有 EAC 协付渠道。
+这些平台都不是本插件自己实现的，本插件只负责把它们装起来、列出来、并让它们的模型能进路由分组。Providers Hub 认领的 provider id 是 `caa-codearts`、`caa-buddy`、`caa-qoder`、`caa-qodercn`、`caa-workbuddy`、`caa-lobsterai`、`caa-trae`、`caa-cline`、`caa-loomy`、`caa-raccoon`、`caa-minimax`、`caa-minimaxintl`、`caa-zcode`、`caa-opencode`、`caa-gemini`、`caa-officeace`、`caa-accio`、`caa-astudio`、`caa-autoclaw`、`caa-autoclawintl`、`caa-modelscope`、`caa-qiniu`、`caa-codely`、`caa-monkeycode`、`caa-monkeycodeintl`、`caa-baizhi`、`caa-magicrew`、`caa-magicrewintl`。
 
+**免登录的只有 Our Free Model 一条。** 它内置的匿名免费通道不登录、不填 API Key 就能用；其余五个都要求你已经有对应平台的账号（或者本机已经登录了它的桌面客户端），插件只是把那份额度接进 DSH。桌面端另有 EAC 协付渠道。
 ## 免费渠道页签
 
 ![免费渠道页签：Our Free Model 排在最上面](preview-free-channels.png)

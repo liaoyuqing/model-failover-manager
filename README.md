@@ -231,16 +231,35 @@ bili 的候选 ref **完全由 `jet-hub/state.json` 决定**：它只读这个�
 | Our Free Model | `dsh-our-free-model` | 不登录、不填 API Key 的免费通道，含 DeepSeek V4.1 Flash、Kimi K3 等；2.0 起接入 LobsterAI、Qoder、TRAE、Cline、Loomy、Raccoon、MiniMax、ZCode、Gemini 等账号渠道 |
 | Providers Hub | `dsh-providers-hub` | 一个插件接入二十多家免费渠道的账号（华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、Qoder、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等），登录一次就在模型列表里多出该渠道的模型；带多账号池、静默续期与本地 OpenAI 兼容网关 |
 
-六个插件合计覆盖 23 个第三方平台（同一个平台的国内版 / 国际版 / 企业版各算一条 provider 路由）；全部装上时注册表里会出现 40 多条带前缀的路由。逐条对照：
+六个插件合计覆盖 **23 个第三方平台** —— 去重后的并集，一个平台只算一次。下面 23 行就是全部；第三列说明它由哪几张卡片提供（Qoder 三张卡片都能接，这里也只占一行）：
 
-| 渠道 | 平台 |
-| --- | --- |
-| Our Free Model | 匿名免费通道（DeepSeek V4.1 Flash、Kimi K3）、Qoder、Qoder 中国版、TRAE、Cline、LobsterAI（有道）、Loomy（讯飞）、Raccoon（商汤）、MiniMax Code、ZCode（智谱）、Gemini Code Assist |
-| CodeArts | 华为云 CodeArts |
-| WorkBuddy | WorkBuddy 国内版 / 国际版 |
-| Trae | TRAE 国内版 / 企业版 / 国际版 |
-| Qoder | Qoder（通义灵码）国内版 / 国际版 |
-| Providers Hub | 华为云 CodeArts、腾讯 CodeBuddy、WorkBuddy 国际版、LobsterAI（有道）、Qoder 国内版 / 国际版、TRAE、Cline、Loomy（讯飞）、Raccoon（商汤）、MiniMax Code 国内版 / 国际版、ZCode（智谱）、OpenCode、Gemini Code Assist、OfficeAce、Accio（阿里）、AStudio（讯飞）、AutoClaw 智谱 / 国际版、ModelScope（魔搭）、Qiniu（七牛云）、Codely（Unity）、MonkeyCode 国内 / 国际站、百智云、MagiCrew 国内 / 国际版 |
+| # | 平台 | 由哪些卡片提供 |
+| --- | --- | --- |
+| 1 | Qoder（通义灵码） | Our Free Model、Qoder、Providers Hub |
+| 2 | TRAE（字节） | Our Free Model、Trae、Providers Hub |
+| 3 | 华为云 CodeArts | CodeArts、Providers Hub |
+| 4 | WorkBuddy | WorkBuddy、Providers Hub |
+| 5 | Cline | Our Free Model、Providers Hub |
+| 6 | 有道 LobsterAI | Our Free Model、Providers Hub |
+| 7 | 讯飞 Loomy | Our Free Model、Providers Hub |
+| 8 | 商汤 Raccoon | Our Free Model、Providers Hub |
+| 9 | MiniMax Code | Our Free Model、Providers Hub |
+| 10 | 智谱 ZCode | Our Free Model、Providers Hub |
+| 11 | Gemini Code Assist | Our Free Model、Providers Hub |
+| 12 | 腾讯 CodeBuddy | Providers Hub |
+| 13 | OpenCode | Providers Hub |
+| 14 | OfficeAce | Providers Hub |
+| 15 | 阿里 Accio | Providers Hub |
+| 16 | 讯飞 AStudio | Providers Hub |
+| 17 | AutoClaw（智谱） | Providers Hub |
+| 18 | 魔搭 ModelScope | Providers Hub |
+| 19 | 七牛云 Qiniu | Providers Hub |
+| 20 | Codely（Unity） | Providers Hub |
+| 21 | MonkeyCode | Providers Hub |
+| 22 | 百智云 | Providers Hub |
+| 23 | 超级麦吉 MagiCrew | Providers Hub |
+
+「40 多条路由」是同一批渠道的另一种数法：路由按注册表 provider id 数，同一平台的国内版 / 国际版 / 企业版各占一条（Our Free Model 1 + 10、CodeArts 1、WorkBuddy 2、Trae 3、Qoder 2、Providers Hub 28 = 47 条），去重后仍落在 23 个平台上。一个平台被两个插件同时提供是常态：专用连接器装了那些 id 就归它，没装则留给聚合渠道，同一时刻只算一处。
 
 其中**只有 Our Free Model 内置的匿名通道免登录**；其余五条都要求你已有对应平台的账号（或本机已登录它的桌面客户端），插件只是把那份额度接进 DSH。桌面端另有 EAC 协付渠道。
 
