@@ -1178,7 +1178,25 @@ export async function startQoderShim(options) {
     })
   }
 
-  await new Promise((done) => { server.listen(port, '127.0.0.1', done) })
+  // listen 的失败是异步 'error' 事件：没有监听器时它就是未捕获异常，会结束整个宿主
+  // 进程（端口被占是常态：旧实例还没退干净、或另一份部署用同一个端口）。本 shim 的
+  // 承诺是「装不上只告警、qoder 退回直发」，所以必须折成可捕获的失败，并把已经打上的
+  // 补丁与 portal 全部还原，不留半接管状态。
+  try {
+    await new Promise((done, fail) => {
+      const onError = (err) => { server.removeListener('listening', onListening); fail(err) }
+      const onListening = () => { server.removeListener('error', onError); done() }
+      server.once('error', onError)
+      server.once('listening', onListening)
+      server.listen(port, '127.0.0.1')
+    })
+  } catch (err) {
+    stats.lastError = '监听 127.0.0.1:' + port + ' 失败：' + (err && err.message ? err.message : String(err))
+    await stop()
+    throw err
+  }
+  // 监听之后的运行时错误同样不能让进程崩：记进 /status，让受影响的请求各自失败。
+  server.on('error', (err) => { stats.lastError = '监听期间错误：' + (err && err.message ? err.message : String(err)) })
   globalThis[STATE_KEY] = { port, wasmPath, stats, impl, patched, portals, retry, reconcile, server, stop }
   info('[model-failover] qoder 压缩 shim 已监听 127.0.0.1:' + port + '（明文经 bili 压缩后再加密发往上游；覆盖 ' + patched.length + ' 个目标：' + stats.targets.join(', ') + '）')
 

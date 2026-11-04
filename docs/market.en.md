@@ -67,6 +67,12 @@ Providers Hub installs under the spec `dsh-providers-hub`, the name the plugin m
 
 Install specs are registry package names on purpose: a `github:` source pulls a whole-repository tarball (83 MB for Our Free Model) that pnpm re-fetches on every profile install, which is what drags the market's own updates past their timeout on a slow GitHub day.
 
+## When several channels share a provider name
+
+The six channel plugins register overlapping provider ids, so each carries its own prefix (`ofm-`, `ca-`, `cw-`, `ct-`, `cq-`, `caa-`) applied to both the id and the display name: the model tab shows `ca-CodeArts` or `ofm-Qoder`, so it is obvious which route a row belongs to. The plugins themselves are untouched, and group files, configuration and the failed-model table keep the bare ids.
+
+Compression is transparent to prefixes — the compaction guard, the qoder and trae compression shims and the CodeArts self-heal all normalise an id to its bare name before deciding, so prefixed models still get context compression. The one place that must not be prefixed is the account `provider` field in Jet Hub's store (`jet-hub/state.json`): billion-context enumerates resign credentials by a literal `codearts`, so a prefixed value leaves it with no credential.
+
 ## Full documentation
 
 Configuration keys, the `/api/model-failover` endpoints, the failover decision order, and the qoder compression shim (including how to tell whether compression is actually happening) are documented in the repository [README](README.md).

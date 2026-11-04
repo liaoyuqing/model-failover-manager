@@ -83,7 +83,9 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 | `dsh-providers-hub`（Providers Hub；旧名 `dsh-codearts-auth`） | `caa-` | `caa-codearts`、`caa-buddy` … |
 
 - **前缀加在真实注册表侧**，由 llm 门面在 cordis 的 `isolate` realm 内 `provide llm` 时拼上。插件自身代码一行都不改：它内部那些硬编码的裸 id 表照旧，门面对它呈现裸 id，对真实注册表呈现带前缀的 id。
-- **界面里 provider 会显示成 `ofm-qoder` 这种**（模型页签、看板、日志都是注册表 id），而**分组文件、配置、失败表里始终是裸 id**（`qoder`）——两者由本插件换算。
+- **id 和显示名一起加前缀**：门面把 `providerInfo` 的 name 与设置页目录的 `displayName` 一并翻成 `ca-CodeArts` / `ofm-Qoder` 这种形态（幂等：已带本前缀的名字原样返回，套两层门面不会变成 `ca-ca-CodeArts`）。只加 id 不加名字，界面里会出现并排的两个 "CodeArts"——模型选择器拿 `group.provider.name` 当分组标题，设置页拿 `entry.displayName` 当行标题，两处都只看名字。
+- **界面里 provider 会显示成 `ca-CodeArts` 这种**（模型页签、看板、日志都是注册表 id 与注册表名），而**分组文件、配置、失败表里始终是裸 id**（`codearts`）——两者由本插件换算。
+- **目录注册的 `replace` 也要翻译**：渠道插件会在设置变更时用 `directory.replace(…)` 重发整张目录（`dsh-connect-workbuddy` 的 `syncRegionRegistration` 就是），门面在返回的 handle 上包了一层 translate，否则一次设置变更就会用裸 id 把带前缀的那份覆盖掉。
 - **未打门面的插件仍是裸 id**。只有部分插件装了门面时，注册表里会同时存在裸 `trae` 与 `ofm-qoder` 这种混合视图，本插件两种都认。
 - 未打门面时的命名冲突依旧存在（那是部署问题，不是本插件能绕开的）：见下面「门面部署」两行。
 
@@ -174,7 +176,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 - ⚠️ **门面条目必须放在没有 `dsh.client` 声明的独立包目录里。** `client-modules` 按**包名**归并 bundle：门面文件所在的包一旦在 `package.json` 里声明了 `dsh.client.platform`，就会被算成「同名包的另一个 client bundle」，与真正带 client 的那个包互相覆盖，**宿主直接启动失败**——这是上次把 DSH 搞崩的直接原因。所以那个包的 `package.json` 只有 `private` + `type: module` + `main`/`exports`，不含任何 `dsh` 字段。
 - ⚠️ **`dsh-providers-hub`（旧名 `dsh-codearts-auth`）还要额外隔离 11 个 cordis 服务名，否则会连带打死 Our Free Model 的渠道。** 这两家不只撞 provider 名，还撞 **cordis 服务名**：两边都用 `super(ctx, \`${product.id}Auth\`)` 各自注册 `lobsteraiAuth`、`qoderAuth`、`qodercnAuth`、`traeAuth`、`clineAuth`、`loomyAuth`、`raccoonAuth`、`minimaxAuth`、`zcodeAuth`、`geminiAuth` 和 `accountPool` 这 11 个。cordis 的 `provide` 对同名服务直接抛 `service "<name>" has been registered at <...>`（`vendor/cordis/src/reflect.ts:302-305`），谁先装载谁占名；后装的一方在自己 `apply` 的第一句就抛，整个聚合包（channels pack）的 apply 中断 ⇒ 它的十条渠道 adapter 一条都不会注册 ⇒ 那个插件在模型页签里彻底消失。实测就是「装了 Providers Hub，Our Free Model 的 qoder/trae/cline … 全不见」。把上面那 11 个服务名连同 `llm` 一起塞进 `codearts-auth` 条目自己的 realm，两边就能并存（已实测同屏共存：`ofm-*` 11 条 + `caa-*` 27 条）。**这 11 个名字来自两家当前版本的实现，任一方升级后需要重新核对**（对法：`grep -n "super(ctx" dsh-providers-hub/lib/*-auth.js`（装旧包名时看同名目录）与 OFM `vendor/channel-pack/pack.js` 里各家 `id` 的 `Auth` 后缀）。
 - 本插件对两种视图都做了归一，全部换算集中在 `provider-prefix.mjs`：`bareProvider()` 剥前缀（失败计数、并发、容量冷却、速度采样、`ofmHandoffExcludeProviders`、免费渠道认领都按裸 id 记账），`providerEquals()` 做渠道等价（裸 id 与自己的前缀等价、不同插件的前缀互不等价），`liveProviderIdOf()` 在真正下发给 `llm` 时换回注册表此刻认识的 id（按 `ofm- → ca- → cw- → ct- → cq- → caa-` 的顺序试，即免费渠道卡片顺序）。**装卸门面不需要改用户数据。**
-- 怎么确认生效：`/api/model-failover/free-channels` 里每张卡片认领到的都是带自己前缀的 id，`/status.allModels` 里仍是裸 id。
+- 怎么确认生效：`/api/model-failover/free-channels` 里每张卡片认领到的都是带自己前缀的 id，`/status.allModels` 里仍是裸 id；模型页签与设置页的提供商行显示的是 `ca-CodeArts` 这种带前缀的名字（读 `llm.listProviders()` 的 `name` 与 `llm.listConfigurableProviders()` 的 `displayName`）。改了门面代码要**重启 DSH** 才生效——模块只在启动时 import 一次。
 
 ## 与 dsh-codearts 的配合
 
@@ -265,7 +267,22 @@ Providers Hub 的安装 spec 用插件市场里这条的包名 `dsh-providers-hu
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `compactionGuard` | `true` | 总开关。关掉后名单内的 provider 恢复原优先级参与路由，失败也不再打压缩旁路诊断 |
-| `uncompressedProviders` | `["qoder", "qodercn"]` | 声明哪些 provider 的端点注定绕过 bili 压缩。写成 `[]` 表示一个都不声明，效果等同于关掉守卫 |
+| `uncompressedProviders` | `["qoder", "qodercn"]` | 声明哪些 provider 的端点注定绕过 bili 压缩。**写裸 id**（`qoder`，不是 `ofm-qoder`）—— 守卫判据会先把注册表 id 剥成裸名。写成 `[]` 表示一个都不声明，效果等同于关掉守卫 |
+
+### 压缩链路对「带前缀的 provider」是透明的
+
+六个渠道各打一个门面之后，注册表里是 `ca-codearts`、`ofm-qoder`、`ct-trae` 这种 id，而压缩链路的每一环都是按**裸名**写的。所以每一环都必须先归一，否则加前缀会悄悄打挂压缩：
+
+| 环节 | 归一方式 |
+| --- | --- |
+| 压缩旁路守卫 `compressionGapOf` | 先 `bareProvider(provider)` 再查 `uncompressedProviders`，返回的也是裸名 |
+| qoder shim 覆盖判定 `qoderShimCovers` | `QODER_SHIM_PROVIDERS.has(bareProvider(provider))` |
+| trae shim 覆盖判定 `traeShimCovers` | 同上；并额外要求该 provider 的**某一条注册表路由**出现在 `status.targets` 里（`trae-global` 没接管、`trae` 接管了时不能被当成全覆盖） |
+| shim 认领 adapter（两家） | `collectShimRegistrations` / `collectAdapters` 按裸名分组、**同裸名的多条活路由逐条全收**（`ofm-qoder` 与 `caa-qoder` 各有一份加密器拷贝，只收一条会有另一条静默直发） |
+| trae shim 接管判据 `isTraeShimProvider` | `TRAE_SHIM_PROVIDERS.has(bareProvider(id))` |
+| codearts 自救 `isCodeartsFailure` | `providerIdentity(id)` 取 `{prefix, bare}`：裸名必须是 `codearts` 且前缀为 `''` 或 `ca-`——**刻意排除 `caa-`**，那是 Providers Hub 的路由，重启 dsh-codearts 救不了它 |
+
+只有一处**不能**加前缀：`$DSH_HOME/jet-hub/state.json` 里账号的 `provider` 字段必须留裸 `codearts`。bili 的 `codeartsRefCandidates()` 按字面量 `provider === "codearts"` 枚举重签凭据，写成 `ca-codearts` 会让重签臂失明、压缩直接退回「拒绝转发」（400/403）。这是 Jet Hub 账户库的命名，与 DSH 的 llm 注册表 id 是两套东西。
 
 ### qoder 压缩 shim
 
@@ -406,6 +423,32 @@ lastExchange.diff[1] = {kind:"shrunk", role:"user", beforeLen:6003, afterLen:410
 - `targets`：实际打了补丁的目标。出现 `pack:__mfQoderEncryptor` 才说明接管了运行时真正在跑的那份加密器。
 - `hookRepair`：`pack.js` 注入口的检查结果，`copies` 逐份列出（`plugins` 与 `profile:<name>` 是两份不同文件，宿主读的是后者）。`repaired` 表示刚补回（下一次宿主启动生效），`pending-restart` 表示文件里有、进程还没执行到。
 - `portals` / `seenRequests`：在 adapter 的 `fetchImpl` 上装的观测点数量与经过它的请求数。它只用来确认「请求到底走向 shim 还是直连加密端点」，不参与压缩。
+
+### trae 压缩 shim
+
+TRAE 的推理请求走自己的 SOLO wire：`POST /api/agent/v3/llm_utils_chat`，body 是 SOLO JSON（`content` 是 `[{type:"text"}]`、assistant 的 `tool_calls` 用 `function_call`、`tools.parameters` 是 JSON 字符串、`model` 与 `config_name` 双字段），响应是 SOLO 自定义 SSE（`event: output` / `token_usage` / `done`）。bili 只改写它认得的协议路径（`/chat/completions`、`/v1/messages` …），这个路径不在白名单里 ⇒ 请求被 DIRECT 直发、一次也不压缩；而 bili 一旦生效又会关掉宿主自带的 `compaction-basic`，于是 TRAE 会话等于完全没有压缩，历史只涨不降。
+
+处理办法与 qoder 同形，但**没有加密要解**，难的只是协议差异被搬到了压缩的两端：
+
+1. **接管**：给活着的 TRAE adapter 包一层实例属性 `fetchImpl`（adapter 的 `send()` 最终就是 `this.fetchImpl(url, init)`，这是唯一不需要拿到内部类的接缝）。接管条件写得很窄——只有「URL 以 `/api/agent/v3/llm_utils_chat` 结尾 **且** method 为 POST」才进改造；拉模型目录、刷新凭据那些请求原样透传。
+2. **折成 OpenAI 送进 bili**：把 SOLO body 折成 OpenAI body（`config_name` / `function` / `model_auto_selection` 之类 SOLO 专属字段先摘掉，否则 bili 按 OpenAI 语义读会误判上下文），改指本机 shim `http://127.0.0.1:47011/trae/<rid>/chat/completions`。路径以 `/chat/completions` 结尾、又是会话内发起的 POST，bili 的原生 fetch 链就会把它改写进代理并压缩。
+3. **压缩后还原 SOLO**：shim 拿到的是**已经被压过**的 OpenAI body，以**原始 SOLO body 为底**还原（只覆盖 `messages` / `tools` / 采样字段，保住 `config_name`、`function` 通道与 Max 模式那几项），再用**原始请求头**直发上游——刻意绕开 bili，免得它按 OpenAI 协议把 SOLO 请求再改写一次。
+4. **回程重建成 SOLO SSE**：实测 bili 的返回腿只透传 OpenAI `data:` 帧，SOLO 的 `event:` 行会被整段丢弃。所以 shim 把上游 SOLO SSE 转成 OpenAI SSE 写回，包装器拿到响应后再**本地**把 OpenAI SSE 重建为 SOLO 事件交给 adapter —— adapter 看到的永远是自己认识的那套事件。
+
+**任何一步失败都退回原始行为**：转换失败、body 不是字符串、shim 没起来、上游非 SSE —— 一律把原始 `fetchImpl` 的响应原样交给 adapter。回环请求本身抛错时**不吞**，原样抛回 adapter 的 `TRANSPORT` 分支（那里本来就有重试与换号）。端口被占是常见触发（旧实例没退干净、或另一份部署用了同一个端口），shim 把它折成可捕获的失败并还原已装的包装，原因进 `/status.traeShim.startError`。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `traeShim` | `true` | 总开关。关掉后 TRAE 回到「DIRECT 直发、没有压缩」 |
+| `traeShimPort` | `47011` | shim 监听端口，只绑 `127.0.0.1` |
+
+与 qoder shim 的差别值得知道：
+
+- **它不依赖任何第三方内部模块**，只需要 llm 注册表里有一个活 adapter，所以默认开启；qoder 的要打 `pack.js` 注入口，默认值才保守。
+- **它的接管清单是三个裸 id**：`trae`、`trae-enterprise`、`trae-global`。装上门面之后注册表里是 `ct-trae` / `ofm-trae` 这种带前缀的 id，判据先 `bareProvider()` 剥前缀，再要求**该 provider 的某一条注册表路由**出现在 `/status.traeShim.targets` 里——「`trae` 接管了、`trae-global` 没接管」不能被当成全覆盖。
+- **它按 adapter 实例记包装**（`WeakMap`）。adapter 被它自己的 fiber 重启换掉后，旧实例会被回收，新的那份由 10 秒一轮的对账定时器重新认领（`rebindTicks` 是已重试的拍数）。
+
+取证只看一个字段：`/status.traeShim.folded`（正文真的变短的次数）。`compacted` 会把 bili 注入系统提示也算成「变了」，涨了不等于压了；`intercepted` 只说明请求被改道，不说明压缩真的发生。`lastExchange` 给最近一次往返的 `beforeCount` / `afterCount` / `beforeContentChars` / `afterContentChars` / `contentShrank` 与逐条 `diff`；`returnLeg` 分开记「bili 回了几帧 OpenAI」（`openAiFrames`）、「我们重建出几帧 SOLO」（`soloFrames`）、「重建失败/空重建」（`rebuildErrors` / `emptyRebuilds`）——回程出问题时，看这三者就能分清是 bili 没回还是回了没转出来。
 
 ## 安装
 
@@ -608,10 +651,12 @@ token 列的排序键跟大字是同一个数（区间内总量），不按历�
 
 | 文件 | 说明 |
 | --- | --- |
-| `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、CodeArts 凭据镜像的接线、压缩旁路守卫、qoder 压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
+| `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、CodeArts 凭据镜像的接线、压缩旁路守卫、qoder 与 trae 两个压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
 | `provider-prefix.mjs` | provider 前缀换算（纯函数，无副作用）：六个插件各一个前缀、`bareProvider` / `providerEquals` / `liveProviderIdOf` 用的身份与等价判断、免费渠道认领算法。背景见「六个免费渠道插件的 provider 前缀」 |
 | `codearts-resign-bridge.mjs` | CodeArts 凭据镜像（原独立插件 `dsh-codearts-resign-bridge` 的功能，已并进来）：读账号库与候选 ref，把每个可用账号写成 bili 认识的字段 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
+| `trae-compress-shim.mjs` | trae 压缩 shim：接管 TRAE adapter 的 `fetchImpl`，把 SOLO body 折成 OpenAI 送进 bili 压缩、再以原始 SOLO body 为底还原后直发上游，回程把 OpenAI SSE 重建为 SOLO 事件；失败一律退回原始行为 |
+| `trae-compress-shim.selfcheck.mjs` | trae 压缩 shim 的离线自检（不随包发布）：折/还原/回程重建的往返用例，以及端口被占时只 reject、不崩进程 |
 | `client.js` | 浏览器半（DSH dynamic client bundle），六个页签、免费渠道卡片与 GitHub 复制都在这里 |
 | `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
 | `locale/en.json`、`locale/zh.json` | 界面文案。`meta.detail` 指向插件市场详情页要渲染的文档（`docs/market.zh.md` / `docs/market.en.md`），图片按文档所在目录解析 |
@@ -642,7 +687,9 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - The *error retry* tab embeds `dsh-llm-error-retry`'s own configuration page in an iframe (same origin, `/llm-error-retry`) instead of re-implementing the editor: one rule table, one place to save it. The tab probes the plugin, and when it is not mounted it says so and offers a re-probe.
 - It also mirrors CodeArts credentials (the job the standalone `dsh-codearts-resign-bridge` plugin used to do, so that plugin can be uninstalled): every `codeartsResignBridgeIntervalSeconds` (minimum 10 s) it reads `dsh-codearts`'s account store, maps each unexpired account onto the refs `billion-context` scans for re-signing, and writes `access_key_id` / `secret_access_key` / `security_token` / `expires_at` only when the value actually changed. bili matches credentials by the inbound AK, so each account needs its own ref; a static ref outlives the rotated key and the request is rejected with `403 signed_request_requires_resign`. Toggle, interval and a manual sync live in Settings.
 - The *free channel* tab recommends six plugins that add free models — CodeArts (`dsh-codearts`), WorkBuddy (`dsh-connect-workbuddy`), Trae (`dsh-connect-trae`), Qoder (`@dmh2002/dsh-connect-qoder`), Our Free Model (`dsh-our-free-model`), and Providers Hub (`dsh-providers-hub`, formerly `dsh-codearts-auth`, which reaches the accounts of more than twenty free channels through one plugin) — each with a one-line pitch, its facts, a copyable GitHub address, and an install button. Installing goes through `pluginManager.installBundle`, the same engine as the plugin market and `dsh plugin add`; a package that needs its install scripts approved comes back as a pending-build report rather than being approved for you. "Installed" is read from the profile dependencies and "providers online" from the live `llm` registry, so a channel that is installed but not logged in shows both facts separately. Trae and Qoder are dedicated connectors whose provider ids (`trae`, `trae-enterprise`, `trae-global`, `qoder`, `qoder-global`) overlap with the ones the aggregators register for the same accounts. A claim goes to a dedicated connector first (`codearts`, `workbuddy`, `trae`, `qoder`), then to the aggregators in card order — Our Free Model before Providers Hub — so Our Free Model keeps the bulk of what it already served and Providers Hub gets only what nobody claimed. Providers Hub's own provider pattern leaves out `codearts` and `workbuddy`, so those two ids stay on their dedicated cards whether or not it is installed, and no id is counted twice.
-- The six free-channel plugins all register providers whose ids collide — `qoder`, `qodercn`, `trae`, `cline`, `loomy`, `raccoon`, `minimax`, `zcode`, `gemini`, `codearts`, `workbuddy` — and the host keeps one adapter per provider, so whichever side registers last is either rejected with `DUPLICATE_ADAPTER` or swallowed silently. Each plugin therefore gets its own id prefix, applied on the **real registry** side by an llm facade inside a cordis `isolate` realm: `ofm-` (Our Free Model), `ca-` (`dsh-codearts`), `cw-` (WorkBuddy), `ct-` (Trae), `cq-` (Qoder), `caa-` (Providers Hub). The plugins themselves are untouched: the facade shows bare ids to its consumer and prefixed ids to the real registry, so the dialog lists `ofm-qoder` while group files, the config and the failed-model table keep saying `qoder`. A plugin without the facade still registers bare ids, and both views may coexist. Deployment is a facade row plus an `isolate` row per channel in `$DSH_HOME/cordis.patch.yml` (22 rows: Providers Hub also needs the 11 cordis service names below in its isolate); each pair must use the same label, and the facade entry must live in a package directory with **no `dsh.client` declaration** — `client-modules` merges bundles by package name, so a second client bundle under the same name makes the host fail to boot (that is what broke DSH last time). Providers Hub also collides on **cordis service names**, not just provider ids: it and Our Free Model both register `lobsteraiAuth`, `qoderAuth`, `qodercnAuth`, `traeAuth`, `clineAuth`, `loomyAuth`, `raccoonAuth`, `minimaxAuth`, `zcodeAuth`, `geminiAuth` and `accountPool` through `super(ctx, `${product.id}Auth`)`, and cordis throws on a duplicate service name — aborting the later plugin's whole `apply`, so none of its channel adapters register and it vanishes from the model tabs. Its `isolate` therefore lists those 11 names next to `llm` under the same label; recheck them after either side upgrades. All conversion is centralised in `provider-prefix.mjs`: `bareProvider()` for accounting keys, `providerEquals()` for channel identity (a bare id equals its own prefixed form, two different plugins never equal), and `liveProviderIdOf()` to hand the registry the id it actually knows, trying `ofm- → ca- → cw- → ct- → cq- → caa-` in card order.
+- The six free-channel plugins all register providers whose ids collide — `qoder`, `qodercn`, `trae`, `cline`, `loomy`, `raccoon`, `minimax`, `zcode`, `gemini`, `codearts`, `workbuddy` — and the host keeps one adapter per provider, so whichever side registers last is either rejected with `DUPLICATE_ADAPTER` or swallowed silently. Each plugin therefore gets its own id prefix, applied on the **real registry** side by an llm facade inside a cordis `isolate` realm: `ofm-` (Our Free Model), `ca-` (`dsh-codearts`), `cw-` (WorkBuddy), `ct-` (Trae), `cq-` (Qoder), `caa-` (Providers Hub). The plugins themselves are untouched: the facade shows bare ids to its consumer and prefixed ids to the real registry, so the dialog lists `ofm-qoder` while group files, the config and the failed-model table keep saying `qoder`. Both the id and the display name are prefixed (`ca-CodeArts`): the model picker titles groups by `group.provider.name` and the settings page titles rows by `entry.displayName`, so prefixing ids alone leaves two identical "CodeArts" headings side by side. Prefixing is idempotent, and the handle returned by `registerConfigurableProviders` also translates `replace()`, because channel plugins re-send the whole directory on settings changes (`dsh-connect-workbuddy`'s `syncRegionRegistration`) and would otherwise overwrite the prefixed entries with bare ids. A plugin without the facade still registers bare ids, and both views may coexist. Deployment is a facade row plus an `isolate` row per channel in `$DSH_HOME/cordis.patch.yml` (22 rows: Providers Hub also needs the 11 cordis service names below in its isolate); each pair must use the same label, and the facade entry must live in a package directory with **no `dsh.client` declaration** — `client-modules` merges bundles by package name, so a second client bundle under the same name makes the host fail to boot (that is what broke DSH last time). Providers Hub also collides on **cordis service names**, not just provider ids: it and Our Free Model both register `lobsteraiAuth`, `qoderAuth`, `qodercnAuth`, `traeAuth`, `clineAuth`, `loomyAuth`, `raccoonAuth`, `minimaxAuth`, `zcodeAuth`, `geminiAuth` and `accountPool` through `super(ctx, `${product.id}Auth`)`, and cordis throws on a duplicate service name — aborting the later plugin's whole `apply`, so none of its channel adapters register and it vanishes from the model tabs. Its `isolate` therefore lists those 11 names next to `llm` under the same label; recheck them after either side upgrades. All conversion is centralised in `provider-prefix.mjs`: `bareProvider()` for accounting keys, `providerEquals()` for channel identity (a bare id equals its own prefixed form, two different plugins never equal), and `liveProviderIdOf()` to hand the registry the id it actually knows, trying `ofm- → ca- → cw- → ct- → cq- → caa-` in card order.
+
+- **Compression is transparent to prefixes.** Every compression-path predicate normalises to the bare name first: `compressionGapOf` (the `compactionGuard` bypass list), `qoderShimCovers` / `traeShimCovers` (plus a `status.targets` check per route, so a partially adopted trae family is not reported as fully covered), and both shims' adapter claims, which bucket by bare name and keep **every** live route with that name (`ofm-qoder` and `caa-qoder` each carry their own encryptor copy). `isCodeartsFailure` uses `providerIdentity()` and accepts only a bare `codearts` with prefix `''` or `ca-`, deliberately excluding `caa-` (Providers Hub's route). `uncompressedProviders` is therefore written in bare ids. The one place that must **not** be prefixed is the account `provider` field in `$DSH_HOME/jet-hub/state.json`: billion-context enumerates resign credentials with a literal `provider === "codearts"`, so a prefixed value blinds the resign arm and compression degrades to a refusal (400/403). That file is Jet Hub's account store, not the DSH llm registry.
 - Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.

@@ -95,6 +95,14 @@ const QODER_SHIM_MODULE = './qoder-compress-shim.mjs'
 const QODER_SHIM_BUILD = '67'
 /** shim 只换得掉这两家的加密端点（QoderEncryptedInfer#prepareInfer 的使用者）。 */
 const QODER_SHIM_PROVIDERS = new Set(['qoder', 'qodercn'])
+// trae 压缩 shim（见 trae-compress-shim.mjs 顶部）：TRAE 走 SOLO wire，bili 的端点白名单
+// 里没有它，请求被 DIRECT 直发、一次也不压缩。shim 把 body 折成 OpenAI 先经 bili 压缩，
+// 收到压缩结果再还原 SOLO 发上游，回程把 OpenAI SSE 重建为 SOLO 事件交给 adapter。
+const TRAE_SHIM_MODULE = './trae-compress-shim.mjs'
+/** 构建号：改动 trae-compress-shim.mjs 后必须 +1，否则 ESM 缓存仍用旧模块。 */
+const TRAE_SHIM_BUILD = '3'
+/** 接管的渠道（裸 id）；前缀由 llm 门面加在注册表侧，shim 自己剥前缀。 */
+const TRAE_SHIM_PROVIDERS = new Set(['trae', 'trae-enterprise', 'trae-global'])
 
 export const name = 'model-failover-manager'
 export const inject = ['timer']
@@ -118,7 +126,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v96'
+const HOST_VERSION = 'v119'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -415,6 +423,19 @@ export function apply(ctx, config = {}) {
   }
   const qoderShimWasmPath = typeof config.qoderShimWasmPath === 'string' && config.qoderShimWasmPath.trim() ? config.qoderShimWasmPath.trim() : undefined
 
+  // trae 压缩 shim：默认**开启**（装不上时只告警，TRAE 照常直发、功能不降级）。
+  // 与 qoder shim 不同，它不依赖任何第三方内部模块，只需要 llm 注册表里有一个活 adapter。
+  const traeShimRaw = config.traeShim
+  const traeShimEnabled = typeof traeShimRaw === 'boolean' ? traeShimRaw : true
+  if (traeShimRaw !== undefined && typeof traeShimRaw !== 'boolean') {
+    ctx.logger.warn(`[model-failover] config.traeShim=${JSON.stringify(traeShimRaw)} 非法（需布尔值），回退 true`)
+  }
+  const traeShimPortRaw = config.traeShimPort
+  const traeShimPort = Number.isInteger(traeShimPortRaw) && traeShimPortRaw > 0 && traeShimPortRaw < 65536 ? traeShimPortRaw : 47011
+  if (traeShimPortRaw !== undefined && traeShimPort !== traeShimPortRaw) {
+    ctx.logger.warn(`[model-failover] config.traeShimPort=${JSON.stringify(traeShimPortRaw)} 非法（需 1..65535 整数），回退 47011`)
+  }
+
   // CodeArts 凭据镜像（见 codearts-resign-bridge.mjs）：dsh-codearts 的 AK/SK 随刷新轮换，
   // 而 billion-context 改写请求体后必须用「入站 AK 对应的那份」凭据重签，否则 403
   // signed_request_requires_resign → 账号被连带 disable。默认开启：它只在装了 CodeArts
@@ -686,6 +707,10 @@ export function apply(ctx, config = {}) {
   let disposed = false
   // 压缩 shim 的句柄：声明在这里，因为「压缩旁路守卫」的路由判断要读它（见 qoderShimCovers）
   let qoderShimHandle = null
+  /** trae 压缩 shim 的句柄（见 trae-compress-shim.mjs） */
+  let traeShimHandle = null
+  /** 启动失败原因，随 /status.traeShim 回传 */
+  let traeShimStartError = null
   /** 一次性诊断：shim 装载时 llm 注册表长什么样 */
   let shimRegistryProbe = null
   /** shim 启动异常（详情进 /status，方便不翻日志） */
@@ -2780,7 +2805,8 @@ export function apply(ctx, config = {}) {
     if (!uncompressedProviders.has(id)) return null
     if (!biliCompactionActive()) return null
     // shim 已经把这家的请求改成明文 OpenAI 送进 bili，压缩照常发生，不再算旁路。
-    if (qoderShimCovers(id)) return null
+    // 两家 shim 覆盖的渠道不同（qoder/qodercn 与 trae 系），必须合起来判。
+    if (shimCovers(id)) return null
     return { provider: id }
   }
 
@@ -2806,6 +2832,46 @@ export function apply(ctx, config = {}) {
     } catch {
       return false
     }
+  }
+
+  /**
+   * trae 压缩 shim 此刻是否接管了该 provider（见 trae-compress-shim.mjs 顶部）。
+   *
+   * 与 qoder 的判据同形，但目标清单不同：trae 的接管清单是**注册表 id**
+   *（ct-trae / ofm-trae 各一条），而名单是裸名，所以按裸名比 —— 前缀只影响
+   * 「注册表里叫什么」，不影响「这是不是 trae 系」。
+   *
+   * @param {string} provider - provider id。
+   * @returns {boolean} 已接管则为 true。
+   */
+  function traeShimCovers(provider) {
+    if (!TRAE_SHIM_PROVIDERS.has(bareProvider(provider))) return false
+    if (traeShimHandle === null) return false
+    try {
+      const st = traeShimHandle.status()
+      if (st === null || st.effective !== true) return false
+      // effective 是全量判据（至少接管了一条）；这里再要求本 provider 的任一条路由
+      // 在 targets 里，否则「trae-global 没接管、trae 接管了」会被误判成全覆盖。
+      const targets = Array.isArray(st.targets) ? st.targets : []
+      const bare = bareProvider(provider)
+      return targets.some(id => bareProvider(id) === bare)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 任意压缩 shim 是否已把这家的请求改道成「明文先过 bili」。
+   *
+   * 两家 shim 的覆盖范围互不相交（qoder/qodercn 与 trae 系），合起来才对：
+   * 只查 qoder shim 会让 trae 在 uncompressedProviders 里时永远被判成旁路，
+   * 于是被降级到兜底候选 —— 而它其实一直有压缩。
+   *
+   * @param {string} provider - provider id。
+   * @returns {boolean} 任一 shim 已接管则为 true。
+   */
+  function shimCovers(provider) {
+    return qoderShimCovers(provider) || traeShimCovers(provider)
   }
 
   /** 最近一次压缩旁路的失败结论，随 /status 回传 */
@@ -2864,14 +2930,16 @@ export function apply(ctx, config = {}) {
       if (!compressionGapOf(bareProvider(m.provider))) continue
       degradedSessions.push({ sessionId, provider: m.provider, model: m.model })
     }
+    // 两家 shim 的覆盖名单合起来看：qoder/qodercn 与 trae 系互不相交，各自一条产线。
+    const shimProviders = [...new Set([...QODER_SHIM_PROVIDERS, ...TRAE_SHIM_PROVIDERS])]
     return {
       enabled: compactionGuard,
       biliActive: biliCompactionActive(),
       uncompressedProviders: [...uncompressedProviders],
       // 已被压缩 shim 改道、因此不算旁路的 provider（此时路由不会再降级它们）
-      shimCovered: [...QODER_SHIM_PROVIDERS].filter((id) => uncompressedProviders.has(id) && qoderShimCovers(id)),
+      shimCovered: shimProviders.filter((id) => uncompressedProviders.has(id) && shimCovers(id)),
       // shim 挂上了补丁但还没接管运行时（多半是注入口写进文件后宿主没重启）
-      shimPending: [...QODER_SHIM_PROVIDERS].filter((id) => uncompressedProviders.has(id) && !qoderShimCovers(id)),
+      shimPending: shimProviders.filter((id) => uncompressedProviders.has(id) && !shimCovers(id)),
       downgradedModels: downgradedModels.slice(0, 50),
       degradedSessions,
       lastDiagnosis: lastCompressionDiagnosis,
@@ -3767,6 +3835,8 @@ export function apply(ctx, config = {}) {
         hostVersion: HOST_VERSION,
         // qoder 压缩 shim：截获 prepareInfer 的明文请求 + 经 bili 转发回来的压缩结果
         qoderShim: { ...describeQoderShim(), registryProbe: shimRegistryProbe, startError: shimStartError },
+        // trae 压缩 shim：接管了哪些 adapter、压缩前后正文变化、回程重建情况
+        traeShim: describeTraeShim(),
         // CodeArts 凭据镜像：谁被镜像到哪几个 ref、上次成功/失败在什么时候
         resignBridge: describeResignBridge(),
         // codearts 自救是否具备执行条件：loader 可见 + 找得到运行中的条目。
@@ -4410,6 +4480,39 @@ export function apply(ctx, config = {}) {
     })()
   }
 
+  /* ==================== trae 压缩 shim ==================== */
+  //
+  // TRAE 的推理请求走 SOLO wire（/api/agent/v3/llm_utils_chat），bili 不认这个路径，
+  // 于是它被 DIRECT 直发、拿不到任何压缩；而 bili 生效又会关掉宿主的 compaction-basic。
+  // shim 把「协议差异」挪到压缩两端：上行折成 OpenAI 让 bili 压缩，回程把 OpenAI SSE
+  // 重建为 SOLO 事件交给 adapter（实测 bili 的返回腿会丢弃 SOLO 的 event: 行）。
+  /** /status 用；shim 还没起来时也要能说明原因 */
+  function describeTraeShim() {
+    if (traeShimHandle !== null) return { enabled: true, ...traeShimHandle.status() }
+    return {
+      enabled: false, installed: false, effective: false, port: traeShimPort,
+      startError: traeShimStartError,
+      reason: traeShimEnabled ? '启动中或启动失败（见日志）' : 'config traeShim=false',
+    }
+  }
+  if (traeShimEnabled) {
+    void (async () => {
+      try {
+        const shimModule = await import(TRAE_SHIM_MODULE + '?v=' + TRAE_SHIM_BUILD)
+        traeShimHandle = await shimModule.startTraeCompressShim({ ctx, logger: ctx.logger, port: traeShimPort })
+        const st = traeShimHandle.status()
+        if (st.effective === true) {
+          ctx.logger.info(`[model-failover] trae 压缩 shim 就绪：127.0.0.1:${st.port} 已接管 ${(st.targets ?? []).join('/')}（明文经 bili 压缩后还原 SOLO 发往上游）`)
+        } else {
+          ctx.logger.warn(`[model-failover] trae 压缩 shim 未接管任何 adapter：${(st.notes ?? []).join('; ') || '未知原因'}（TRAE 请求仍按未压缩直发）`)
+        }
+      } catch (err) {
+        traeShimStartError = String(err && err.message ? err.message : err)
+        ctx.logger.warn(`[model-failover] trae 压缩 shim 启动失败：${traeShimStartError}`)
+      }
+    })()
+  }
+
   /* ==================== CodeArts 凭据镜像 ==================== */
   //
   // 把 dsh-codearts 账号库里的 AK/SK/token 持续写进 bili 重签用的 credentials ref。
@@ -4467,7 +4570,7 @@ export function apply(ctx, config = {}) {
     })()
   }
 
-  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + codearts resign bridge + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe)`)
+  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + trae compress shim + codearts resign bridge + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe)`)
 
   /* ==================== 清理 ==================== */
   ctx.effect(() => () => {
@@ -4481,6 +4584,7 @@ export function apply(ctx, config = {}) {
     disposeAgentError()
     disposeStop()
     if (qoderShimHandle) qoderShimHandle.stop()
+    if (traeShimHandle) traeShimHandle.stop()
     if (resignBridgeHandle) resignBridgeHandle.stop()
     if (routeDisposer) routeDisposer()
     // 兜底闹钟随插件一起结束：卸载后既没人投递，也不该再留定时器

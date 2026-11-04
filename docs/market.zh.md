@@ -69,6 +69,12 @@ Providers Hub 的安装 spec 用插件市场里这条的包名 `dsh-providers-hu
 
 安装 spec 一律用 npm 包名：`github:` 源要拉整个仓库的 tarball（Our Free Model 那份 83MB），pnpm 每次安装 profile 都会重拉一遍，GitHub 一慢就把插件市场的更新拖过 15 分钟上限。
 
+## 多个同名渠道并存时
+
+六个渠道插件会往注册表注册同名的 provider，所以每个插件各带一个前缀（`ofm-` / `ca-` / `cw-` / `ct-` / `cq-` / `caa-`），id 与显示名一起加：模型页签里会显示成 `ca-CodeArts`、`ofm-Qoder` 这种，一眼能看出是哪条路由。插件自身的代码不用改，分组文件、配置与失败表里仍是裸 id。
+
+压缩链路对前缀是透明的——守卫、qoder / trae 压缩 shim、CodeArts 自救都先把 id 剥成裸名再判定，所以打了前缀的模型照样有上下文压缩。唯一不能加前缀的是 Jet Hub 账户库（`jet-hub/state.json`）里的 `provider` 字段，那里必须留裸 `codearts`，否则 billion-context 找不到重签凭据。
+
 ## 完整文档
 
 配置项、`/api/model-failover` 接口、失败切换的判定顺序、qoder 压缩 shim 的取舍与排障方法，见仓库里的 [README](README.md)。

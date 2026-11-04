@@ -1,6 +1,6 @@
 {
   "name": "model-failover-manager",
-  "version": "2.25.6",
+  "version": "2.26.0",
   "description": "模型选择弹窗＋路由分组：模型失败后自动换到组内下一个可用模型并继续本轮；另含数据看板、免费渠道页签。",
   "license": "Apache-2.0",
   "type": "module",
@@ -24,6 +24,7 @@
     "host.mjs",
     "provider-prefix.mjs",
     "qoder-compress-shim.mjs",
+    "trae-compress-shim.mjs",
     "codearts-resign-bridge.mjs",
     "client.js",
     "cordis.patch.yml",

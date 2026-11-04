@@ -2707,6 +2707,138 @@ ok('㊲ POST /resign-bridge/sync 手动触发一轮并回传现场',
   syncCall.status === 200 && syncCall.body.ok === true && syncCall.body.resignBridge !== undefined,
   JSON.stringify(syncCall.body.resignBridge || syncCall.body))
 
+// ── ㊷ 前缀供应商仍被压缩链路认得：门面加前缀、守卫按裸名归一 ──────────────
+// 两件事必须一起立住，否则「加前缀」会把压缩链路的判据打挂：
+//   ① 门面（llm-prefix-facade）把 id **和显示名**都加前缀，且 consumer 侧仍看到裸形态；
+//   ② 压缩旁路守卫（host.mjs 的 compressionGapOf / describeCompressionGuard）按裸名
+//      归一，所以 ofm-qoder / ct-trae 这类注册表 id 与名单里的 qoder / trae 对得上。
+// 显示名那条不是外观问题：模型选择器与设置页只用 name 当标题，id 加了名字没加，
+// 界面里就会并排出现多个同名提供商。
+// 门面是**独立部署**的包目录（见 README「门面部署」），不在本仓库内：干净 clone 出来
+// 只有本插件，没有 ../model-failover-provider-prefix/。所以按可选依赖处理 —— 装了就跑
+// 这几条断言，没装就明说跳过，别让自检在 clone 上第一步就 import 失败。
+const prefixFacadeModule = await import('../model-failover-provider-prefix/llm-prefix-facade.mjs')
+  .catch(() => null)
+
+if (prefixFacadeModule === null) {
+  console.log('SKIP  ㊷ 门面未部署（找不到 ../model-failover-provider-prefix/），跳过 9 条断言（门面的 id/显示名翻译与压缩守卫的前缀归一共两类）')
+} else {
+  const {
+    createPrefixedLlmFacade,
+    prefixedProviderName,
+    baseProviderName,
+  } = prefixFacadeModule
+
+  ok('㊷ 显示名加前缀是幂等的（重复套门面不会变成 ca-ca-CodeArts）',
+    prefixedProviderName('ca-', 'CodeArts', 'codearts') === 'ca-CodeArts'
+    && prefixedProviderName('ca-', 'ca-CodeArts', 'codearts') === 'ca-CodeArts'
+    && baseProviderName('ca-', 'ca-CodeArts') === 'CodeArts'
+    && baseProviderName('ca-', 'CodeArts') === 'CodeArts',
+    [prefixedProviderName('ca-', 'CodeArts', 'codearts'), baseProviderName('ca-', 'ca-CodeArts')].join(' / '))
+  ok('㊷ 显示名缺失时退回裸 id 再前缀（宿主要求 displayName 非空，空串会让整批目录注册失败）',
+    prefixedProviderName('ca-', '', 'codearts') === 'ca-codearts'
+    && prefixedProviderName('ca-', undefined, 'codearts') === 'ca-codearts',
+    prefixedProviderName('ca-', '', 'codearts'))
+
+  // 假 realLlm：只实现门面会用到的那几个成员，注册表用 Map 记账替身。
+  const prefixRegistrations = new Map()
+  const prefixDirectory = []
+  const prefixRealLlm = {
+    registerAdapter(providers, adapter) {
+      for (const provider of providers) prefixRegistrations.set(provider, adapter)
+      return () => { for (const provider of providers) prefixRegistrations.delete(provider) }
+    },
+    registerConfigurableProviders(entries) {
+      prefixDirectory.push(entries.map(entry => ({ ...entry })))
+      const handle = () => {}
+      handle.replace = (next) => { prefixDirectory.push(next.map(entry => ({ ...entry }))) }
+      return handle
+    },
+    listConfigurableProviders: () => prefixDirectory.at(-1) ?? [],
+    // 真实 llm 的 name 取自 adapter.providerInfo（门面已加前缀）；这里照样造一份带
+    // 前缀的名字，才能验出 listProviders 把显示名也剥回裸形态。
+    listProviders: () => [...prefixRegistrations.keys()].map((id) => ({ id, name: 'ca-CodeArts' })),
+    listModels: async (provider) => [{ provider, id: 'deepseek-v4.1-flash-1017' }],
+    resolveModelInfo: async (provider, model) => ({ provider, id: model }),
+  }
+  const prefixFacade = createPrefixedLlmFacade(prefixRealLlm, { prefix: 'ca-' })
+  prefixFacade.registerAdapter(['codearts'], {
+    providerInfo: (provider) => ({ id: provider, name: 'CodeArts' }),
+    listModels: async (provider) => [{ provider, id: 'deepseek-v4.1-flash-1017' }],
+  })
+  ok('㊷ 门面把 id 与显示名一起加前缀（注册表里是 ca-codearts / ca-CodeArts）',
+    prefixRegistrations.has('ca-codearts')
+    && prefixRegistrations.get('ca-codearts').providerInfo('ca-codearts').name === 'ca-CodeArts',
+    JSON.stringify([...prefixRegistrations.keys()].map((id) => id + '=' + prefixRegistrations.get(id).providerInfo(id).name)))
+
+  const prefixDirectoryHandle = prefixFacade.registerConfigurableProviders([
+    { provider: 'codearts', displayName: 'CodeArts', settingsNs: 'llm-codearts', settingsPath: [], declared: false },
+  ])
+  ok('㊷ 设置页目录条目同样带前缀（provider 与 displayName 都翻译）',
+    prefixDirectory[0]?.[0]?.provider === 'ca-codearts' && prefixDirectory[0]?.[0]?.displayName === 'ca-CodeArts',
+    JSON.stringify(prefixDirectory[0]))
+  // 渠道插件会用 replace 重发整张目录（dsh-connect-workbuddy 的 syncRegionRegistration 就是），
+  // 门面不翻译就会用裸 id 覆盖掉带前缀的那份 —— 模型设置页随即出现两个同名提供商。
+  prefixDirectoryHandle.replace([
+    { provider: 'codearts', displayName: 'CodeArts', settingsNs: 'llm-codearts', settingsPath: [], declared: false },
+    { provider: 'codearts-cn', displayName: 'CodeArts 中国', settingsNs: 'llm-codearts', settingsPath: [], declared: false },
+  ])
+  const prefixReplaced = prefixDirectory.at(-1)
+  ok('㊷ 目录 replace 也翻译（否则渠道插件一次设置变更就把前缀覆盖回裸 id）',
+    prefixReplaced.length === 2
+    && prefixReplaced.every((entry) => entry.provider.startsWith('ca-') && entry.displayName.startsWith('ca-')),
+    JSON.stringify(prefixReplaced.map((entry) => entry.provider + '/' + entry.displayName)))
+  ok('㊷ consumer 侧看到的仍是自己写的那份（provider 与 displayName 都剥回裸形态）',
+    prefixFacade.listConfigurableProviders().every((entry) => !entry.provider.startsWith('ca-') && !entry.displayName.startsWith('ca-'))
+    && prefixFacade.listProviders().every((info) => info.id === 'codearts' && info.name === 'CodeArts'),
+    JSON.stringify({ directory: prefixFacade.listConfigurableProviders().map((entry) => entry.provider + '/' + entry.displayName), providers: prefixFacade.listProviders() }))
+
+  // 压缩旁路守卫：名单是裸名，注册表 id 带前缀 —— 两侧必须能对上，否则 ofm-qoder 会被
+  // 当成「有压缩的正常渠道」送进路由，实际却没有压缩。
+  // bili 的生效判据是 host.mjs 读的 globalThis 标记；这里直接置位，读完再清掉。
+  const BILI_VERDICT_KEY = '__BILI_DSH_COMPACTION_VERDICT__'
+  const previousVerdict = globalThis[BILI_VERDICT_KEY]
+  globalThis[BILI_VERDICT_KEY] = 'active'
+  await api('POST', '/groups', { id: 'gpre', name: 'GPRE', models: [
+    { provider: 'ofm-qoder', model: 'q1', priority: 1 },
+    { provider: 'ct-trae', model: 't1', priority: 2 },
+    { provider: 'p', model: 'm1', priority: 3 },
+  ] })
+  const ctx4 = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
+  let routeHandler4 = null
+  ctx4.get = baseGet
+  ctx4.on = (event, fn, options) => ctx.on(event, fn, options)
+  ctx4.inject = (_n, cb) => cb({
+    webServer: { register(spec) { routeHandler4 = spec.handler; return () => {} } },
+    effect() {}, interval() { return () => {} },
+  })
+  // 名单里同时放 trae：守卫的 shim 覆盖清单必须是「qoder 与 trae 的并集」，
+  // 只查 qoder 会让 trae 永远被判成旁路（它其实有 shim）。
+  applyTwice(ctx4, { dataDir: dir, uncompressedProviders: ['qoder', 'trae'] })
+  const res4 = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
+  const req4 = new EventEmitter()
+  req4.method = 'GET'; req4.url = '/api/model-failover/status'
+  routeHandler4(req4, res4)
+  req4.emit('end')
+  await new Promise(r => setTimeout(r, 30))
+  const guardNow = JSON.parse(res4.body || '{}').compressionGuard ?? {}
+  const guardDowngraded = (guardNow.downgradedModels ?? []).map((row) => row.provider).sort()
+  ok('㊷ 带前缀的注册表 id 仍被守卫认出（ofm-qoder / ct-trae 都被降为兜底候选）',
+    guardDowngraded.includes('ofm-qoder') && guardDowngraded.includes('ct-trae'),
+    JSON.stringify(guardDowngraded))
+  ok('㊷ 裸 id 渠道不受牵连（前缀只影响归属判定，不改名单匹配）',
+    !guardDowngraded.includes('p'),
+    JSON.stringify(guardDowngraded))
+  ok('㊷ shim 覆盖清单是 qoder 与 trae 的并集（只查 qoder 会让 trae 永远显示「待接管」）',
+    JSON.stringify([...(guardNow.shimPending ?? [])].sort()) === '["qoder","trae"]'
+    && (guardNow.shimCovered ?? []).length === 0,
+    JSON.stringify({ pending: guardNow.shimPending, covered: guardNow.shimCovered }))
+  // 恢复现场：bili 标记是全局的，留着会让后续断言以为压缩代理正在生效。
+  if (previousVerdict === undefined) delete globalThis[BILI_VERDICT_KEY]
+  else globalThis[BILI_VERDICT_KEY] = previousVerdict
+  routeHandler4({ method: 'DELETE', url: '/api/model-failover/groups/gpre', on() {}, emit() {} }, { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } })
+}
+
 // ── ㊳ 插件市场：截图清单、卡片图标、50 字描述 ─────────────────────────────
 // 市场读的是仓库根这一个文件与 locale 里的短描述，改完推送即生效；这里守的是
 // 「不会因为路径写错/漏进 files 而在市场里变空图」与「描述不超字数、两处同句」。
