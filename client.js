@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v29'
+    var VERSION = 'v30'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -149,6 +149,28 @@ window.__ModuleLoader__.load({
       channelOk: { fontSize: '11px', color: 'var(--dsw-alias-state-business-primary)' },
       channelWarn: { fontSize: '11px', color: 'var(--dsw-alias-state-warn-label)' },
       channelError: { fontSize: '11px', color: 'var(--dsw-alias-state-error-primary)' },
+      // 局域网页签：顶部总开关 + 端口，下面每条路由一张卡（别名、开关、地址、最近请求）
+      lanPane: { display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px 2px', overflowY: 'auto', flex: 1, minHeight: 0 },
+      lanBar: {
+        display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
+        padding: '8px 12px', border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: 'var(--dsw-radius-md)', background: 'var(--dsw-alias-bg-layer-1)',
+      },
+      lanAddr: {
+        fontFamily: 'var(--dsw-alias-font-family-mono, monospace)', fontSize: '12px',
+        color: 'var(--dsw-alias-label-primary)', wordBreak: 'break-all',
+      },
+      lanRow: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' },
+      lanAlias: {
+        width: '160px', boxSizing: 'border-box', fontSize: '12px', padding: '3px 8px',
+        background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
+        border: '0.5px solid var(--dsw-alias-border-l4)', borderRadius: 'var(--dsw-radius-sm)', outline: 'none',
+      },
+      lanPort: {
+        width: '80px', boxSizing: 'border-box', fontSize: '12px', padding: '3px 8px',
+        background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
+        border: '0.5px solid var(--dsw-alias-border-l4)', borderRadius: 'var(--dsw-radius-sm)', outline: 'none',
+      },
       btn: {
         padding: '3px 10px', fontSize: '11px', cursor: 'pointer',
         border: '0.5px solid var(--dsw-alias-border-l3)',
@@ -743,6 +765,14 @@ window.__ModuleLoader__.load({
       var channelBusyPair = React.useState(null); var channelBusy = channelBusyPair[0]; var setChannelBusy = channelBusyPair[1]
       /** 安装回执：{ id, ok, text }，只保留最近一条 */
       var channelMsgPair = React.useState(null); var channelMsg = channelMsgPair[0]; var setChannelMsg = channelMsgPair[1]
+      /** 局域网页签的现场：/status.lanGateway（总开关、端口、地址、各路由累计与最近请求） */
+      var lanPair = React.useState(null); var lanGw = lanPair[0]; var setLanGw = lanPair[1]
+      /** 端口输入框的本地草稿：null = 没在改，显示生效端口（状态每 3 秒轮询，不能直接绑） */
+      var lanPortPair = React.useState(null); var lanPortDraft = lanPortPair[0]; var setLanPortDraft = lanPortPair[1]
+      /** 别名输入框的本地草稿：按分组 id 存，避免每敲一个字符就被轮询回写 */
+      var lanAliasPair = React.useState({}); var lanAliasDraft = lanAliasPair[0]; var setLanAliasDraft = lanAliasPair[1]
+      /** 最近一次局域网操作的回执：{ ok, text } */
+      var lanMsgPair = React.useState(null); var lanMsg = lanMsgPair[0]; var setLanMsg = lanMsgPair[1]
       /** 最近一次复制回执：{ id, ok }，1.5 秒后自动清掉，按钮文字回到默认 */
       var copiedPair = React.useState(null); var copied = copiedPair[0]; var setCopied = copiedPair[1]
       /** 并发输入框的本地草稿（按模型 key），避免每敲一个字符就被轮询回写覆盖 */
@@ -946,6 +976,58 @@ window.__ModuleLoader__.load({
         return function () { clearTimeout(t) }
       }, [copied])
 
+      /**
+       * 局域网现场：直接复用 /status.lanGateway。网关状态与路由开关都随 status 走，
+       * 所以停在这个页签时按看板同样的节奏刷新——局域网那边刚失败一次，这里几秒内就能看到。
+       */
+      React.useEffect(function () {
+        if (!open || tab !== 'lan') return
+        function tick() {
+          loadStatus().then(function (d) { if (d) { setStatus(d); setLanGw(d.lanGateway || null) } })
+        }
+        tick()
+        var t = setInterval(tick, 3000)
+        return function () { clearInterval(t) }
+      }, [open, tab])
+
+      /**
+       * 改总开关或端口：POST /lan-gateway。端口只在失焦/回车时提交，
+       * 否则每敲一位都会重启一次监听。
+       */
+      function lanSetGateway(patch) {
+        setLanMsg(null)
+        apiSend(API + '/lan-gateway', 'POST', patch)
+          .then(function (res) {
+            if (res && res.lanGateway) setLanGw(res.lanGateway)
+            setLanMsg(
+              res && res.ok
+                ? { ok: true, text: patch.enabled === false ? '局域网转发已关闭' : '局域网转发已更新' }
+                : { ok: false, text: (res && res.error) || '操作失败' }
+            )
+            refreshStatus()
+          })
+          .catch(function (err) {
+            setLanMsg({ ok: false, text: '请求失败：' + String((err && err.message) || err) })
+            refreshStatus()
+          })
+      }
+
+      /**
+       * 改某组的局域网别名与开关：走 POST/PUT /groups 的 lanAlias / lanEnabled 字段。
+       * 别名留空即「用分组名」——清空不是错误，是回到缺省。
+       */
+      function lanSetGroup(groupId, patch) {
+        setLanMsg(null)
+        apiSend(API + '/groups', 'PUT', Object.assign({ id: groupId }, patch))
+          .then(function (res) {
+            setLanMsg(res && res.ok ? { ok: true, text: '已保存' } : { ok: false, text: (res && res.error) || '保存失败' })
+            refreshStatus()
+          })
+          .catch(function (err) {
+            setLanMsg({ ok: false, text: '保存失败：' + String((err && err.message) || err) })
+            refreshStatus()
+          })
+      }
       // 免费渠道只在停留时读一次；安装按钮与「刷新状态」自己会再读，没有轮询的必要
       React.useEffect(function () {
         if (!open || tab !== 'channels') return
@@ -1373,6 +1455,135 @@ window.__ModuleLoader__.load({
           .catch(function (e) { setGroupNotice({ ok: false, text: '移除失败：' + String(e && e.message ? e.message : e) }) })
       }
 
+      /**
+       * 局域网页签：把路由分组以 OpenAI 兼容接口开放给局域网。
+       *
+       * 三件事必须一眼看全：开没开（总开关 + 监听地址）、每条路由叫什么（model 字段
+       * 填它）、以及它最近接了什么请求。地址旁边直接给可复制的 baseUrl，
+       * 因为客户端要配的是完整前缀，不是端口号。
+       */
+      function lanTab() {
+        var gw = lanGw && lanGw.port !== undefined ? lanGw : (status && status.lanGateway) || null
+        if (!gw) return e('div', { style: S.pane }, e('div', { style: S.hint }, '正在读取局域网转发状态…'))
+        var on = gw.enabled === true && gw.running === true
+        var configured = gw.configured || {}
+        var wantOn = typeof configured.enabled === 'boolean' ? configured.enabled : false
+        var portText = lanPortDraft !== null ? lanPortDraft : String(gw.port ?? configured.port ?? '')
+        var addresses = Array.isArray(gw.addresses) ? gw.addresses : []
+        var baseUrl = gw.baseUrl || (addresses.length > 0 ? addresses[0] : null)
+        var stats = gw.stats || {}
+        var byRoute = {}
+        ;(stats.byRoute || []).forEach(function (row) { if (row && row.route) byRoute[row.route] = row })
+        return e('div', { style: S.lanPane },
+          e('div', { style: S.lanBar },
+            e('button', {
+              style: wantOn ? Object.assign({}, S.toggle, S.toggleOn) : S.toggle,
+              title: wantOn ? '关闭后局域网里立刻打不通（分组开关与别名都保留）' : '开启后本机会在 0.0.0.0 上监听，局域网内可直接调用',
+              onClick: function () { lanSetGateway({ enabled: !wantOn }) },
+            }, e('span', { style: wantOn ? Object.assign({}, S.toggleKnob, S.toggleKnobOn) : S.toggleKnob })),
+            e('span', { style: { fontSize: '12px', fontWeight: 600 } }, '局域网转发'),
+            e('span', { style: { fontSize: '11px', opacity: .6 } }, on ? '监听中' : (wantOn ? '未启动' : '已关闭')),
+            e('span', { style: { flex: 1 } }),
+            e('span', { style: S.channelFact }, '端口'),
+            e('input', {
+              style: S.lanPort,
+              value: portText,
+              placeholder: '47021',
+              onChange: function (ev) { setLanPortDraft(ev.target.value) },
+              onBlur: function () {
+                var v = String(portText).trim()
+                setLanPortDraft(null)
+                if (v === '' || v === String(gw.port ?? '')) return
+                lanSetGateway({ port: v })
+              },
+              onKeyDown: function (ev) { if (ev.key === 'Enter') ev.target.blur() },
+            }),
+            e('button', { style: S.btn, title: '按当前设置重新监听（改完端口后想立刻生效就用它）', onClick: function () { lanSetGateway({ restart: true }) } }, '重启')),
+          e('div', { style: S.lanRow },
+            e('span', { style: S.channelFact }, on ? '接口地址' : '开启后接口地址'),
+            baseUrl
+              ? e('span', { style: S.lanAddr }, baseUrl)
+              : e('span', { style: S.channelFact }, '尚未监听'),
+            baseUrl && e('button', { style: S.btn, onClick: function () { copyText(baseUrl, 'lan-base') } },
+              copied && copied.id === 'lan-base' ? (copied.ok ? '已复制' : '复制失败') : '复制'),
+            addresses.length > 1 && e('span', { style: S.channelFact }, '（本机有多个网卡：' + addresses.slice(1).join('  ') + '）')),
+          e('div', { style: S.channelFact },
+            '客户端把 model 字段填下面某条路由名即可；兼容 OpenAI 的 /v1/chat/completions 与 /v1/models，不校验密钥。'),
+          gw.startError && e('div', { style: S.channelError }, '上次启动失败：' + gw.startError),
+          !wantOn && e('div', { style: S.hint }, '总开关关着。打开它，再打开下面至少一个分组，局域网就能调用。'),
+          e('div', { style: S.channelFact }, '累计：请求 ' + (stats.requests ?? 0) + ' · 成功 ' + (stats.ok ?? 0)
+            + ' · 失败 ' + (stats.failed ?? 0) + ' · 静默换路由 ' + (stats.retried ?? 0) + ' 次'
+            + (stats.active ? ' · 进行中 ' + stats.active : '')),
+          lanMsg && e('div', { style: lanMsg.ok ? S.channelOk : S.channelError }, lanMsg.text),
+          routeGroups.length === 0 && e('div', { style: S.hint }, '还没有路由分组，先去「路由分组」页签建一个。'),
+          routeGroups.map(function (g) {
+            var open = g.enabled !== false && g.lanEnabled === true
+            var alias = (g.lanAlias === null || g.lanAlias === undefined ? '' : String(g.lanAlias))
+            var routeName = alias || String(g.name)
+            var draft = lanAliasDraft[g.id]
+            var shownAlias = draft !== undefined ? draft : alias
+            var row = byRoute[routeName] || null
+            var total = row ? row.requests : 0
+            return e('div', { key: g.id, style: S.channelCard },
+              e('div', { style: S.channelHead },
+                e('button', {
+                  style: open ? Object.assign({}, S.toggle, S.toggleOn) : S.toggle,
+                  title: open ? '关闭后这条路由立刻从 /v1/models 消失，调用返回 404' : '打开后这条分组以路由名对外开放',
+                  onClick: function () { lanSetGroup(g.id, { lanEnabled: !open }) },
+                }, e('span', { style: open ? Object.assign({}, S.toggleKnob, S.toggleKnobOn) : S.toggleKnob })),
+                e('span', { style: S.channelTitle }, g.name),
+                e('span', { style: S.channelFact }, (g.models || []).length + ' 个模型'),
+                !open && e('span', { style: S.channelWarn }, g.enabled === false ? '分组本身已停用' : '未对外开放'),
+                e('span', { style: { flex: 1 } }),
+                e('span', { style: S.channelFact }, 'model：'),
+                e('span', { style: Object.assign({}, S.lanAddr, { fontSize: '12px', fontWeight: 600 }) }, routeName),
+                e('button', { style: S.btn, onClick: function () { copyText(routeName, 'lan-' + g.id) } },
+                  copied && copied.id === 'lan-' + g.id ? (copied.ok ? '已复制' : '复制失败') : '复制')),
+              e('div', { style: S.lanRow },
+                e('span', { style: S.channelFact }, '路由名'),
+                e('input', {
+                  style: S.lanAlias,
+                  value: shownAlias,
+                  placeholder: String(g.name),
+                  title: '留空即用分组名；改过之后老的调用继续用分组 id 也仍然打得到',
+                  onChange: function (ev) {
+                    var next = {}
+                    Object.keys(lanAliasDraft).forEach(function (k) { next[k] = lanAliasDraft[k] })
+                    next[g.id] = ev.target.value
+                    setLanAliasDraft(next)
+                  },
+                  onBlur: function () {
+                    var v = String(shownAlias).trim()
+                    var next = {}
+                    Object.keys(lanAliasDraft).forEach(function (k) { next[k] = lanAliasDraft[k] })
+                    delete next[g.id]
+                    setLanAliasDraft(next)
+                    if (v === alias) return
+                    lanSetGroup(g.id, { lanAlias: v })
+                  },
+                  onKeyDown: function (ev) { if (ev.key === 'Enter') ev.target.blur() },
+                }),
+                e('span', { style: S.channelFact }, '留空 = 用分组名'),
+                total > 0 && e('span', { style: S.channelFact }, '接口调用 ' + total + ' 次'
+                  + (row.ok ? ' · 成功 ' + row.ok : '') + (row.failed ? ' · 失败 ' + row.failed : '')),
+                row && row.active > 0 && e('span', { style: S.channelOk }, '进行中 ' + row.active)),
+              open && !on && e('div', { style: S.channelWarn }, '总开关没开，这条路由现在调不通。'),
+              open && on && baseUrl && e('div', { style: S.channelFact }, '调用：POST ' + baseUrl.replace(/\/v1$/, '') + '/v1/chat/completions，body 里 model 填「' + routeName + '」'))
+          }),
+          e('div', { style: S.channelFact }, '最近请求'),
+          (!stats.recent || stats.recent.length === 0) && e('div', { style: S.hint }, '还没有局域网请求。'),
+          (stats.recent || []).map(function (req, i) {
+            var at = req.at ? new Date(req.at) : null
+            var pad = function (n) { return n < 10 ? '0' + n : String(n) }
+            var time = at ? pad(at.getHours()) + ':' + pad(at.getMinutes()) + ':' + pad(at.getSeconds()) : '--:--:--'
+            return e('div', { key: i, style: Object.assign({}, S.channelFact, { fontSize: '11px' }) },
+              time + ' · ' + req.route + ' · ' + (req.ok ? '成功' : '失败')
+              + (req.candidate ? ' · ' + req.candidate : '')
+              + (typeof req.ms === 'number' ? ' · ' + req.ms + 'ms' : '')
+              + (req.code ? ' · ' + req.code : '')
+              + (req.attempts > 1 ? ' · 换了 ' + (req.attempts - 1) + ' 次' : ''))
+          }))
+      }
       function groupTab() {
         var avail = poolOf(catalog, status)
         return e('div', { style: S.pane },
@@ -2675,6 +2886,9 @@ window.__ModuleLoader__.load({
         } else if (tab === 'channels') {
           // 免费渠道是卡片列表，同样不需要提供商列
           right = channelTab()
+        } else if (tab === 'lan') {
+          // 局域网转发按路由卡片排版，也不需要提供商列
+          right = lanTab()
         } else {
           right = failedTab()
         }
@@ -2689,7 +2903,7 @@ window.__ModuleLoader__.load({
               e('button', { style: S.btn, onClick: function () { setOpen(false); setQuery('') } }, '关闭')),
             e('div', { style: S.body },
               // 错误重试页由重试插件自己的页面渲染，规则表格更吃宽度，左栏让位
-              (tab === 'retry' || tab === 'channels') ? null : e('div', { style: S.left },
+              (tab === 'retry' || tab === 'channels' || tab === 'lan') ? null : e('div', { style: S.left },
                 e('div', { style: S.leftTitle }, '提供商'),
                 e('div', { style: S.leftList }, visible.map(function (g) {
                   var isActive = g.id === activeId
@@ -2710,7 +2924,8 @@ window.__ModuleLoader__.load({
                   e('button', { style: Object.assign({}, S.tab, tab === 'dashboard' ? S.tabActive : {}), onClick: function () { setTab('dashboard') } }, '数据看板'),
                   e('button', { style: Object.assign({}, S.tab, tab === 'failed' ? S.tabActive : {}), onClick: function () { setTab('failed') } }, '失败模型' + (failedList.length ? ' (' + failedList.length + ')' : '')),
                   e('button', { style: Object.assign({}, S.tab, tab === 'retry' ? S.tabActive : {}), onClick: function () { setTab('retry') } }, '错误重试'),
-                  e('button', { style: Object.assign({}, S.tab, tab === 'channels' ? S.tabActive : {}), onClick: function () { setTab('channels') } }, '免费渠道')),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'channels' ? S.tabActive : {}), onClick: function () { setTab('channels') } }, '免费渠道'),
+                  e('button', { style: Object.assign({}, S.tab, tab === 'lan' ? S.tabActive : {}), onClick: function () { setTab('lan') } }, '局域网')),
                 right))),
           // 编辑器提到弹窗根层级：从任意页签（含模型页签的 ＋ 快捷入组）触发都能显示
           editing && groupEditor(poolOf(catalog, status))),

@@ -45,6 +45,20 @@
 #   capacitySwitchRevertMs: minimum time a session stays on the substitute model
 #            before it may switch back to the original one (default: 30000), so
 #            two busy models cannot bounce a session back and forth.
+#   lanGateway: factory state of the LAN forwarding switch (default: false);
+#            the live value is settings.json's lanEnabled, null meaning "follow
+#            this". Listening on 0.0.0.0 is what exposes the machine, so it is
+#            off until the user turns it on.
+#   lanGatewayPort: LAN forwarding port (default: 47021; the UI override lives
+#            in settings.json as lanPort). Same block as the qoder shim (47001)
+#            and the trae shim (47011).
+#   lanSystemAsUserProviders: providers whose system prompt is sent as the
+#            first user message rather than the first system message when the
+#            LAN gateway forwards a request (default: [qoder, qodercn]). Their
+#            adapters only forward options.system into a top-level systemText
+#            payload field that the upstream ignores, so an instruction stated
+#            there is dropped; the same text in a conversation turn is obeyed.
+#            Bare ids: candidates are matched after stripping the plugin prefix.
 
 # Installing this bundle also installs dsh-llm-error-retry (declared under
 # "dependencies") and mounts its row here, so one install gives both plugins.

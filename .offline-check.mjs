@@ -2872,6 +2872,334 @@ ok('㊳ 市场描述点名了六个免费渠道与它们覆盖的平台，不是
 ok('㊳ 英文市场描述以句号结尾（awesome-dsh-plugin 的硬性要求）',
   typeof enMeta.description === 'string' && enMeta.description.trim().endsWith('.'),
   enMeta.description)
+// ── ㊸ 局域网转发：分组以 OpenAI 兼容接口开放给局域网 ─────────────────────
+//
+// 这一段的每一条都对应需求里的一句：可开可关、model 字段＝路由名、局域网调用的
+// 并发与界面会话一起统计、失败时静默切换（客户端看不到被换过）。
+const { request: httpRequest } = await import('node:http')
+
+// 总开关出厂关闭：局域网转发把模型能力暴露到本机之外，必须用户显式打开。
+const lanOff = (await api('GET', '/status')).body.lanGateway
+ok('㊸ 局域网总开关出厂关闭（不默认对外开放）',
+  lanOff?.enabled === false && lanOff?.running === false, JSON.stringify({ enabled: lanOff?.enabled, running: lanOff?.running }))
+// 排障现场：qoder 系收到的是 user 轮、别家是 system 行，名单必须能在 /status 里看到——
+// 否则「这条渠道为什么没听话」只能靠翻代码猜。
+ok('㊸ /status 回传生效的「system 挂成用户轮」名单（排障时不用翻代码）',
+  JSON.stringify(lanOff?.systemAsUserProviders) === JSON.stringify(['qoder', 'qodercn']),
+  JSON.stringify(lanOff?.systemAsUserProviders))
+
+// 三条测试路由：fail→ok（静默切换）、半截失败（已出字后不重来）、阻塞（并发现场）
+const mkLanGroup = async (name, provider, models) => (await api('POST', '/groups', {
+  name, models: models.map((m, i) => ({ provider, model: m, priority: i + 1 })),
+})).body.group
+const gLanA = await mkLanGroup('LAN-A', 'p', ['lmfail', 'lmok'])
+const gLanB = await mkLanGroup('LAN-B', 'p', ['lmhalf'])
+const gLanC = await mkLanGroup('LAN-C', 'p', ['lmblock'])
+const gLanT = await mkLanGroup('LAN-T', 'p', ['lmtool'])
+const gLanF = await mkLanGroup('LAN-F', 'p', ['lmfail2'])
+const gLanQ = await mkLanGroup('LAN-Q', 'ofm-qoder', ['lmok'])
+// LAN-QS：首个候选是普通渠道（lmfail 必失败），第二个是 qoder 系。
+// 一次请求里先后试到两类通道，形态必须按候选各换一次。
+// lmfail2 已被 LAN-F 记进当日失败表，这里要用一个还没被记账的名字。
+const gLanQS = await mkLanGroup('LAN-QS', 'p', ['lmfail3'])
+gLanQS.models.push({ provider: 'ofm-qoder', model: 'lmok', priority: 2 })
+await api('PUT', '/groups', { id: gLanQS.id, models: gLanQS.models })
+await api('PUT', '/groups', { id: gLanA.id, lanEnabled: true, lanAlias: 'lan-a' })
+await api('PUT', '/groups', { id: gLanB.id, lanEnabled: true, lanAlias: 'lan-b' })
+await api('PUT', '/groups', { id: gLanC.id, lanEnabled: true, lanAlias: 'lan-c' })
+await api('PUT', '/groups', { id: gLanT.id, lanEnabled: true, lanAlias: 'lan-t' })
+await api('PUT', '/groups', { id: gLanF.id, lanEnabled: true, lanAlias: 'lan-f' })
+await api('PUT', '/groups', { id: gLanQ.id, lanEnabled: true, lanAlias: 'lan-q' })
+await api('PUT', '/groups', { id: gLanQS.id, lanEnabled: true, lanAlias: 'lan-qs' })
+
+// 别名撞名必须拒绝：两条路由同名，其中一条永远打不到
+const dupAlias = await api('POST', '/groups', { name: 'LAN-DUP', lanAlias: 'lan-a', models: [{ provider: 'p', model: 'lmok' }] })
+ok('㊸ 别名撞名时拒绝保存（否则同名的另一条路由永远打不到）',
+  dupAlias.status === 409, JSON.stringify(dupAlias.body))
+if (dupAlias.body?.group) await api('DELETE', '/groups/' + encodeURIComponent(dupAlias.body.group.id))
+
+// 起网关：端口可能在别的进程手里，换一个再试（自检不能假设某个端口空闲）
+let lanPort = 0
+for (let attempt = 0; attempt < 6 && lanPort === 0; attempt += 1) {
+  const candidate = 47100 + Math.floor(Math.random() * 400)
+  const res = await api('POST', '/lan-gateway', { enabled: true, port: candidate })
+  if (res.body?.lanGateway?.running === true) lanPort = candidate
+}
+const lanOn = (await api('GET', '/status')).body.lanGateway
+ok('㊸ 总开关打开后立即监听（无需重启宿主）',
+  lanPort > 0 && lanOn?.enabled === true && lanOn?.running === true && lanOn?.port === lanPort,
+  JSON.stringify({ lanPort, running: lanOn?.running, port: lanOn?.port, startError: lanOn?.startError }))
+ok('㊸ 监听在 0.0.0.0 并给出可复制的 baseUrl 与局域网地址',
+  lanOn?.bindHost === '0.0.0.0' && String(lanOn?.baseUrl ?? '').startsWith('http://')
+  && String(lanOn?.baseUrl ?? '').endsWith('/v1'),
+  JSON.stringify({ bindHost: lanOn?.bindHost, baseUrl: lanOn?.baseUrl, addresses: lanOn?.addresses }))
+
+const lanCall = (method, path, body) => new Promise((resolve, reject) => {
+  const payload = body === undefined ? null : JSON.stringify(body)
+  const req = httpRequest({
+    host: '127.0.0.1', port: lanPort, path, method,
+    headers: payload === null ? {} : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+  }, (res) => {
+    const chunks = []
+    res.on('data', (chunk) => chunks.push(chunk))
+    res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8'), headers: res.headers }))
+  })
+  req.on('error', reject)
+  if (payload !== null) req.write(payload)
+  req.end()
+})
+const lanChat = (body) => lanCall('POST', '/v1/chat/completions', body)
+
+// 假 llm：按模型决定这段流怎么走。走的是 host 里 llm/stream 那条链路，
+// 所以并发闸门、失败记账、采样判定与界面会话完全同一套。
+let lanRelease = null
+const lanAttempts = []
+// 网关交给宿主的完整 options，按序留存：system/tools/stop 这类「翻译是否到位」
+// 只能在这里看——从响应反推会把模型的自由发挥误当成网关的行为。
+const lanOptions = []
+function lanUpstream(options) {
+  lanAttempts.push(options.model)
+  lanOptions.push(options)
+  const model = String(options.model)
+  return (async function* () {
+      // 名字以 lmfail 开头一律失败：lan-f 用的 lmfail2 需要一个尚未被记账的名字，
+      // 否则该组会先因「当日失败」变成 no_candidate，走不到 502 那条路。
+      if (model.startsWith('lmfail')) {
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: 'upstream 500', code: 'SERVER_ERROR' } } }
+        return
+      }
+      if (model === 'lmhalf') {
+        yield { type: 'text-delta', index: 0, text: 'PART' }
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: 'stream broke', code: 'STREAM_ERROR' } } }
+        return
+      }
+      if (model === 'lmblock') {
+        await new Promise((resolve) => { lanRelease = resolve })
+      }
+      if (model === 'lmtool') {
+        // 上游的块序号是跳号的（1、5），且两个调用的增量交错到达。
+        yield { type: 'tool-call-delta', index: 5, id: 'call_b', name: 'second', argumentsDelta: '{"b":' }
+        yield { type: 'tool-call-delta', index: 1, id: 'call_a', name: 'first', argumentsDelta: '{"a":' }
+        yield { type: 'tool-call-delta', index: 5, argumentsDelta: '1}' }
+        yield { type: 'tool-call-delta', index: 1, argumentsDelta: '2}' }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+        return
+      }
+      yield { type: 'text-delta', index: 0, text: 'OK' }
+      yield { type: 'usage', usage: { inputTokens: 5, outputTokens: 2, cacheReadTokens: 1 } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+  })()
+}
+// 宿主里 llm.stream() 就是 ctx.waterfall('llm/stream', …) 的入口，并发闸门与速度采样
+// 都挂在那条 waterfall 上。桩若直接返回自己的生成器，网关就绕开了闸门，局域网调用
+// 也就不进同一份并发账——这里照宿主的做法走一遍注册链，桩与真机行为才一致。
+llmStub = {
+  // ofm-qoder 是「只认用户轮」那一类的样本：网关对它的 system 投递形态与别家不同。
+  listProviders: () => [{ id: 'p' }, { id: 'ofm-qoder' }],
+  stream: (options) => streamHandler(options, () => lanUpstream(options)),
+}
+
+const models = JSON.parse((await lanCall('GET', '/v1/models')).text)
+const listed = (models.data ?? []).map((m) => m.id).sort()
+ok('㊸ /v1/models 只列已开放的分组，id 即调用方要填的 model 字段',
+  JSON.stringify(listed) === JSON.stringify(['lan-a', 'lan-b', 'lan-c', 'lan-f', 'lan-q', 'lan-qs', 'lan-t']), JSON.stringify(listed))
+ok('㊸ 没打开的分组不出现在 /v1/models（G1 与它自己的 id 都不在）',
+  !listed.includes('G1') && !listed.includes('g1'), JSON.stringify(listed))
+
+// ① 首个候选失败 → 静默换下一个，客户端只看到一份完整回答
+const switched = await lanChat({ model: 'lan-a', messages: [{ role: 'user', content: 'hi' }] })
+const switchedBody = JSON.parse(switched.text)
+ok('㊸ 首个候选失败时静默换到组内下一个，客户端拿到 200 与完整回答',
+  switched.status === 200
+  && switchedBody?.choices?.[0]?.message?.content === 'OK'
+  && switchedBody?.model === 'lan-a',
+  JSON.stringify({ status: switched.status, content: switchedBody?.choices?.[0]?.message?.content }))
+ok('㊸ 客户端看不到被换过：回答里没有前一个候选的残留，也没有重复内容',
+  switchedBody?.choices?.length === 1
+  && String(switchedBody.choices[0].message.content).split('OK').length === 2,
+  JSON.stringify(switchedBody?.choices))
+ok('㊸ 失败候选按现有语义记账（当日失败表里出现 lmfail）',
+  (await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'lmfail'),
+  JSON.stringify((await api('GET', '/status')).body.failed.map(f => f.model)))
+// system/developer 必须真的交给宿主：从响应猜「模型听没听」不可靠（模型的自由发挥
+// 会盖过指令），所以直接看网关递给 llm.stream 的 options。
+// lan-c 的流要等放行才出字，响应头也在那之后才 flush——先起请求、放行、再 await。
+const sysCall = lanChat({ model: 'lan-c', messages: [
+  { role: 'system', content: '第一条系统提示' },
+  { role: 'user', content: 'hi' },
+  { role: 'developer', content: '第二条系统提示' },
+] })
+await new Promise((r) => setTimeout(r, 30))
+if (typeof lanRelease === 'function') lanRelease()
+await sysCall
+const sysOpts = lanOptions.at(-1)
+// 系统提示必须走 messages 的首条 system 行，而不是 options.system：宿主自己的
+// agent-loop 就是只发一条 messages 序列（dsh-llm 的 GenerateOptions.system 是
+// 给一次性调用者的旁路），qoder 系适配器只认 messages 里的 system 行，
+// 走 options.system 会被静默丢弃（实测：指令完全不生效）。
+const sysRow = Array.isArray(sysOpts?.messages) ? sysOpts.messages[0] : undefined
+ok('㊸ system 与 developer 合并成首条 system 消息（多个按顺序合并）',
+  sysRow?.role === 'system'
+    && sysRow?.source?.kind === 'system-prompt'
+    && (sysRow?.content ?? []).map((b) => b.text).join('') === '第一条系统提示\n\n第二条系统提示',
+  JSON.stringify(sysRow?.content))
+ok('㊸ 不再用 options.system（宿主 loop 不发它，qoder 系也不读）',
+  sysOpts?.system === undefined, JSON.stringify(sysOpts?.system))
+ok('㊸ messages 里除首条外没有别的 system/developer 行',
+  Array.isArray(sysOpts?.messages) && sysOpts.messages.slice(1).every((m) => m.role !== 'system' && m.role !== 'developer'),
+  JSON.stringify((sysOpts?.messages ?? []).map((m) => m.role)))
+
+// qoder 系把 system 挂成首条 **user** 消息：它的适配器只把 options.system 转成
+// payload 顶层的 systemText，而那个字段的上游不读；同样的文字进对话轮才生效。
+// 形态按候选决定，所以同一次请求换到别家时仍要各自拿到自己认的那种。
+const qoderCall = lanChat({ model: 'lan-q', messages: [
+  { role: 'system', content: '第一条系统提示' },
+  { role: 'user', content: 'hi' },
+  { role: 'developer', content: '第二条系统提示' },
+] })
+await qoderCall
+const qoderOpts = lanOptions.at(-1)
+const qoderHead = Array.isArray(qoderOpts?.messages) ? qoderOpts.messages[0] : undefined
+ok('㊸ qoder 系的 system 提示挂成首条 user 消息（它的上游只读用户轮）',
+  qoderHead?.role === 'user'
+    && qoderHead?.source?.kind === 'user'
+    && (qoderHead?.content ?? []).map((b) => b.text).join('') === '第一条系统提示\n\n第二条系统提示'
+    && qoderOpts?.messages[1]?.role === 'user',
+  JSON.stringify((qoderOpts?.messages ?? []).map((m) => m.role)))
+ok('㊸ qoder 系不发 system 行，也不用 options.system',
+  Array.isArray(qoderOpts?.messages) && qoderOpts.messages.every((m) => m.role !== 'system')
+    && qoderOpts?.system === undefined,
+  JSON.stringify({ roles: (qoderOpts?.messages ?? []).map((m) => m.role), system: qoderOpts?.system }))
+// 同一次请求先后试到两类通道：形态按候选各换一次，而不是整条请求只定一次。
+const optionsBefore = lanOptions.length
+const switchForm = await lanChat({ model: 'lan-qs', messages: [
+  { role: 'system', content: '切换时的系统提示' },
+  { role: 'user', content: 'hi' },
+] })
+const switchOpts = lanOptions.slice(optionsBefore)
+ok('㊸ 一次请求内按候选切换投递形态：普通渠道发 system 行，换到 qoder 系改发 user 轮',
+  switchForm.status === 200
+    && switchOpts.length === 2
+    && switchOpts[0]?.messages?.[0]?.role === 'system'
+    && switchOpts[1]?.messages?.[0]?.role === 'user',
+  JSON.stringify({ status: switchForm.status, heads: switchOpts.map((o) => o?.messages?.[0]?.role) }))
+ok('㊸ 两种形态带的是同一段文本（切换不改变客户端写的内容）',
+  switchOpts.every((o) => (o?.messages?.[0]?.content ?? []).map((b) => b.text).join('') === '切换时的系统提示'),
+  JSON.stringify(switchOpts.map((o) => (o?.messages?.[0]?.content ?? []).map((b) => b.text).join(''))))
+
+// 形态不同、文本相同：换成别家（非 qoder）时同一段 system 文本仍以 system 行送出。
+ok('㊸ 两类通道拿到同一段文本，只是挂的角色不同（形态按候选切换）',
+  sysRow?.role === 'system'
+    && qoderHead?.role === 'user'
+    && (sysRow?.content ?? []).map((b) => b.text).join('') === (qoderHead?.content ?? []).map((b) => b.text).join(''),
+  JSON.stringify({ system: sysRow?.role, qoder: qoderHead?.role }))
+ok('㊸ purpose 标成 lan-gateway（宿主的采样与日志据此区分来源）',
+  sysOpts?.purpose === 'lan-gateway', String(sysOpts?.purpose))
+
+ok('㊸ usage 把缓存命中计入 prompt_tokens（与宿主 TokenUsage 口径一致）',
+  switchedBody?.usage?.prompt_tokens === 6 && switchedBody?.usage?.completion_tokens === 2,
+  JSON.stringify(switchedBody?.usage))
+
+// ①' 组内全部候选都失败：502 upstream_error（code 取最后一个候选的失败码），而不是伪装成成功或空回答
+const allFail = await lanChat({ model: 'lan-f', messages: [{ role: 'user', content: 'hi' }] })
+ok('㊸ 组内候选全失败时返回 502 而不是空回答',
+  allFail.status === 502 && JSON.parse(allFail.text)?.error?.type === 'upstream_error',
+  allFail.status + ' ' + allFail.text.slice(0, 140))
+// 候选全被当日失败表排除时是 503 no_candidate：与「试过但都失败」是两种不同的拒绝。
+const noCand = await lanChat({ model: 'lan-f', messages: [{ role: 'user', content: 'hi' }] })
+ok('㊸ 没有候选时返回 503 no_candidate（与 502 区分）',
+  noCand.status === 503 && JSON.parse(noCand.text)?.error?.code === 'no_candidate',
+  noCand.status + ' ' + noCand.text.slice(0, 120))
+
+// ② 分组 id 也能当 model：别名改掉后老调用不会立刻失效
+const byId = await lanChat({ model: gLanA.id, messages: [{ role: 'user', content: 'hi' }] })
+ok('㊸ 分组 id 同样能解析成路由（别名改名不影响老调用）',
+  byId.status === 200 && JSON.parse(byId.text)?.model === 'lan-a', String(byId.status))
+
+// ③ 已出字后失败：不能重来，只能如实报错；客户端看到的内容不重复
+const half = await lanChat({ model: 'lan-b', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+ok('㊸ 已出字后失败以 error 事件收尾，且内容只出现一次（不重来）',
+  half.status === 200
+  && (half.text.match(/PART/g) ?? []).length === 1
+  && half.text.includes('"error"'),
+  half.text.slice(0, 200))
+// OpenAI 客户端（含官方 SDK）靠 data: [DONE] 判断「正常结束」，少了它只能等连接关闭。
+// 出错那条路也要补：客户端不必靠断开去猜「没有后文了」。
+ok('㊸ 流式成功与出错都以 data: [DONE] 收尾（OpenAI 客户端据此判「结束」）',
+  half.text.trimEnd().endsWith('data: [DONE]'), JSON.stringify(half.text.slice(-40)))
+// lmblock 的流要等放行才出字，响应头也在那之后才 flush——先起请求、放行、再 await，
+// 直接 await 会把自检挂死在这里。
+const okStream = lanChat({ model: 'lan-c', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+await new Promise((r) => setTimeout(r, 30))
+if (typeof lanRelease === 'function') lanRelease()
+const okStreamDone = await okStream
+ok('㊸ 成功那条流同样以 [DONE] 收尾', okStreamDone.text.trimEnd().endsWith('data: [DONE]'),
+  JSON.stringify(okStreamDone.text.slice(-60)))
+
+// ④ 局域网调用的并发与界面会话一起统计：请求在跑时 /status 的 inflight 必须是 1
+const blocked = lanChat({ model: 'lan-c', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+let lanInflight = 0
+for (let i = 0; i < 50 && lanInflight === 0; i += 1) {
+  await new Promise((r) => setTimeout(r, 20))
+  const row = (await api('GET', '/status')).body.groups
+    .find(g => g.id === gLanC.id)?.models?.find(m => m.model === 'lmblock')
+  lanInflight = row?.inflight ?? 0
+}
+ok('㊸ 局域网请求占用的是同一份并发账（此刻 inflight = 1）',
+  lanInflight === 1, 'inflight=' + lanInflight)
+if (typeof lanRelease === 'function') lanRelease()
+const blockedDone = await blocked
+ok('㊸ 放行后局域网请求正常收尾，并发计数归零',
+  blockedDone.status === 200 && blockedDone.text.includes('OK'), blockedDone.text.slice(0, 120))
+
+// ④' 流式工具调用：index 必须是 0..n-1 的位置（上游块序号会跳号），
+// id 与函数名只在首片发一次，参数增量按同一个 index 拼得起来。
+const toolStream = await lanChat({ model: 'lan-t', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+const toolFrames = toolStream.text.split('\n')
+  .filter((l) => l.startsWith('data: '))
+  .map((l) => l.slice(6))
+  .filter((l) => l !== '[DONE]')
+  .map((l) => { try { return JSON.parse(l) } catch { return null } })
+  .filter(Boolean)
+const toolDeltas = toolFrames.flatMap((f) => f.choices?.[0]?.delta?.tool_calls ?? [])
+const toolIndexes = [...new Set(toolDeltas.map((d) => d.index))]
+ok('㊸ 流式 tool_calls 的 index 重排成 0..n-1（上游块序号会跳号，照抄会让客户端拼出洞）',
+  JSON.stringify(toolIndexes) === JSON.stringify([0, 1]), JSON.stringify(toolIndexes))
+const toolNames = toolDeltas.filter((d) => d.function?.name).map((d) => d.function.name)
+ok('㊸ 函数名只在首片发一次，不会重复下发', JSON.stringify(toolNames) === JSON.stringify(['second', 'first']), JSON.stringify(toolNames))
+const toolIds = toolDeltas.filter((d) => d.id).map((d) => d.id)
+ok('㊸ 调用 id 也只在首片发一次', JSON.stringify(toolIds) === JSON.stringify(['call_b', 'call_a']), JSON.stringify(toolIds))
+const assembled = [0, 1].map((at) => toolDeltas.filter((d) => d.index === at).map((d) => d.function?.arguments ?? '').join(''))
+ok('㊸ 两个调用的参数各自拼成合法 JSON（交错增量不会串味）',
+  assembled.every((a) => { try { JSON.parse(a); return true } catch { return false } }), JSON.stringify(assembled))
+ok('㊸ 工具调用的流仍以 [DONE] 收尾 + finish_reason=tool_calls',
+  toolStream.text.trimEnd().endsWith('data: [DONE]')
+  && toolFrames.at(-1)?.choices?.[0]?.finish_reason === 'tool_calls',
+  JSON.stringify(toolFrames.at(-1)?.choices?.[0]?.finish_reason))
+
+// ⑤ 关掉某组：立刻从 /v1/models 消失，调用 404（已建立的连接不受影响）
+await api('PUT', '/groups', { id: gLanA.id, lanEnabled: false })
+const closedCall = await lanChat({ model: 'lan-a', messages: [{ role: 'user', content: 'hi' }] })
+const listedAfter = (JSON.parse((await lanCall('GET', '/v1/models')).text).data ?? []).map((m) => m.id)
+ok('㊸ 关掉的分组立刻 404 且从 /v1/models 消失',
+  closedCall.status === 404 && !listedAfter.includes('lan-a'),
+  JSON.stringify({ status: closedCall.status, listed: listedAfter }))
+
+// ⑥ 总开关关掉：停止监听，端口不再响应
+const offRes = await api('POST', '/lan-gateway', { enabled: false })
+let refused = false
+try { await lanCall('GET', '/healthz') } catch { refused = true }
+ok('㊸ 关掉总开关即停止监听（端口不再响应，无需重启宿主）',
+  offRes.body?.lanGateway?.running === false && refused,
+  JSON.stringify({ running: offRes.body?.lanGateway?.running, refused }))
+
+// 收尾：临时分组、失败记账、llm 桩都清掉，后面几段还要用同一份 ctx
+for (const g of [gLanA, gLanB, gLanC, gLanT, gLanF, gLanQ, gLanQS]) await api('DELETE', '/groups/' + encodeURIComponent(g.id))
+await api('POST', '/failed/reset', {})
+llmStub = undefined
+ok('㊸ 自检用的临时分组已清掉',
+  (await api('GET', '/status')).body.groups.every(g => !g.name.startsWith('LAN-')))
+
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)
 process.exit(failed === 0 ? 0 : 1)

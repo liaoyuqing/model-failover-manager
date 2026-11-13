@@ -8,7 +8,7 @@
 
 ![模型页签](preview-model-selection.png)
 
-弹窗有六个页签，按你排障时的动线排列：
+弹窗有七个页签，按你排障时的动线排列：
 
 | 页签 | 做什么 |
 | --- | --- |
@@ -18,6 +18,7 @@
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 dsh-llm-error-retry 自己的配置页：规则、首字超时、Retry-After 上限、最大续写，保存即生效 |
 | **免费渠道** | Our Free Model / CodeArts / WorkBuddy / Trae / Qoder / Providers Hub 六个能直接补免费模型的插件，带 GitHub 地址（一键复制）与一键安装；Our Free Model 排第一张，Providers Hub 排最后一张 |
+| **局域网** | 把分组以 OpenAI 兼容接口开放给局域网：`model` 字段填路由名，总开关加每组开关，失败仍在服务端静默切换 |
 
 ![路由分组页签](preview-routing-groups.png)
 

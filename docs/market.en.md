@@ -10,7 +10,7 @@ The dialog's **Free channels** tab also gathers the six plugins that add free mo
 
 ![Models tab](preview-model-selection.png)
 
-Six tabs, ordered the way you actually triage:
+Seven tabs, ordered the way you actually triage:
 
 | Tab | What it does |
 | --- | --- |
@@ -20,6 +20,7 @@ Six tabs, ordered the way you actually triage:
 | **Failed models** | Today's exhausted models with the latest failure reason; restore one or all. |
 | **Error retry** | dsh-llm-error-retry's own configuration page: rules, first-token timeout, Retry-After cap, max continuations. Saving applies immediately. |
 | **Free channels** | Six plugins that add free models — Our Free Model / CodeArts / WorkBuddy / Trae / Qoder / Providers Hub — with a copyable GitHub address and one-click install; Our Free Model comes first and Providers Hub last. |
+| **LAN** | Publishes routing groups over an OpenAI-compatible API for the local network: the `model` field is the route name, a total switch plus per-group switches decide what is exposed, and failures still fail over silently on the server. |
 
 ![Routing groups tab](preview-routing-groups.png)
 

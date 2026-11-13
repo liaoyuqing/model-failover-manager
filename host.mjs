@@ -103,6 +103,11 @@ const TRAE_SHIM_MODULE = './trae-compress-shim.mjs'
 const TRAE_SHIM_BUILD = '3'
 /** 接管的渠道（裸 id）；前缀由 llm 门面加在注册表侧，shim 自己剥前缀。 */
 const TRAE_SHIM_PROVIDERS = new Set(['trae', 'trae-enterprise', 'trae-global'])
+// 局域网网关（见 lan-gateway.mjs）：把路由分组以 OpenAI 兼容接口开放给局域网。
+// 和两个 shim 一样用带构建号的动态 import：改网关后重载插件就能换上新代码。
+const LAN_GATEWAY_MODULE = './lan-gateway.mjs'
+/** 构建号：改动 lan-gateway.mjs 后必须 +1，否则 ESM 缓存仍用旧模块。 */
+const LAN_GATEWAY_BUILD = '5'
 
 export const name = 'model-failover-manager'
 export const inject = ['timer']
@@ -126,7 +131,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v119'
+const HOST_VERSION = 'v122'
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -134,6 +139,14 @@ const HOST_VERSION = 'v119'
  * bili 也不能解析密文正文；这两条链路在 DSH 的原生通道里拿不到任何压缩。
  */
 const DEFAULT_UNCOMPRESSED_PROVIDERS = ['qoder', 'qodercn']
+/**
+ * 局域网转发时，system 提示必须挂成**用户轮**而不是 system 消息的 provider（裸 id）。
+ *
+ * channel-pack 的 QoderAdapter 只把 `options.system` 转成 payload 顶层的
+ * `systemText`，而实测那个字段的上游根本不读：同样的文字放进一条独立的 user
+ * 消息就立刻生效。其余渠道都认 messages 里的 system 行，所以只对这几家特判。
+ */
+const DEFAULT_SYSTEM_AS_USER_PROVIDERS = ['qoder', 'qodercn']
 /**
  * CodeArts 凭据镜像的候选 ref 兜底名单。
  *
@@ -319,6 +332,24 @@ function failDayKey(failResetHour) {
 }
 
 export function apply(ctx, config = {}) {
+  // cordis core 4.0.0-rc.12（dsh 0.2.2-rc.3）把 ctx.root 实例属性改成了
+  // ctx[Context.root] = ctx[Symbol.for('cordis.root')]。仓库外插件仍用旧写法时
+  // 会抛 "cannot get property \"root\" without inject" —— 本次正是它打断了
+  // llm 前缀门面，四个免费渠道整批 pending、零 provider。这里恢复一个只读
+  // 别名作为兼容垫片：context.ts 的 extend() 用 Object.create 原型继承，root
+  // 实例上的属性对所有子 context（含 isolate realm）可见；reflect.ts 的 Proxy
+  // 对普通字符串属性走 Reflect.has(target, ...) 命中它。rc.2 及更早本来就有
+  // root，守卫会跳过，跨版本幂等。
+  // 注意：这不是修根因。门面自身已改用 ctx[Context.root]；此垫片只用于兜住
+  // 尚未适配的第三方插件（例如 dsh-mnemon 的同款报错）。
+  try {
+    const rootCtx = ctx[Symbol.for('cordis.root')]
+    if (rootCtx && !('root' in rootCtx)) {
+      Object.defineProperty(rootCtx, 'root', { get: () => rootCtx, configurable: true })
+    }
+  } catch (error) {
+    try { ctx.logger.warn('[model-failover] 恢复 ctx.root 兼容别名失败', error) } catch {}
+  }
   const dataDir = typeof config.dataDir === 'string' && config.dataDir.trim()
     ? config.dataDir
     : join(process.env['DSH_HOME'] || join(homedir(), '.dsh'), DATA_DIR_DEFAULT)
@@ -422,6 +453,29 @@ export function apply(ctx, config = {}) {
     ctx.logger.warn(`[model-failover] config.qoderShimPort=${JSON.stringify(qoderShimPortRaw)} 非法（需 1..65535 整数），回退 47001`)
   }
   const qoderShimWasmPath = typeof config.qoderShimWasmPath === 'string' && config.qoderShimWasmPath.trim() ? config.qoderShimWasmPath.trim() : undefined
+
+  // 局域网网关：把路由分组以 OpenAI 兼容接口开放给局域网（见 lan-gateway.mjs）。
+  // 出厂关闭：它把模型能力暴露到本机之外，属于用户显式打开的功能。
+  const lanGatewayRaw = config.lanGateway
+  const lanGatewayConfigEnabled = typeof lanGatewayRaw === 'boolean' ? lanGatewayRaw : false
+  if (lanGatewayRaw !== undefined && typeof lanGatewayRaw !== 'boolean') {
+    ctx.logger.warn(`[model-failover] config.lanGateway=${JSON.stringify(lanGatewayRaw)} 非法（需布尔值），回退 false`)
+  }
+  // 端口默认 47021：与 qoder shim（47001）、trae shim（47011）同段且不冲突。
+  const lanPortRaw = config.lanGatewayPort
+  const lanGatewayConfigPort = Number.isInteger(lanPortRaw) && lanPortRaw > 0 && lanPortRaw < 65536 ? lanPortRaw : 47021
+  if (lanPortRaw !== undefined && lanGatewayConfigPort !== lanPortRaw) {
+    ctx.logger.warn(`[model-failover] config.lanGatewayPort=${JSON.stringify(lanPortRaw)} 非法（需 1..65535 整数），回退 47021`)
+  }
+  // 网关发 system 提示时，哪些 provider 只认用户轮（见 DEFAULT_SYSTEM_AS_USER_PROVIDERS）。
+  // 写裸 id：候选在注册表里叫 ofm-qoder / cq-qoder，判据会先剥前缀再比。
+  const systemAsUserRaw = config.lanSystemAsUserProviders
+  const systemAsUserValid = Array.isArray(systemAsUserRaw) && systemAsUserRaw.every(v => typeof v === 'string' && v.trim())
+  const systemAsUserList = systemAsUserValid ? systemAsUserRaw.map(v => v.trim()) : DEFAULT_SYSTEM_AS_USER_PROVIDERS
+  if (systemAsUserRaw !== undefined && !systemAsUserValid) {
+    ctx.logger.warn(`[model-failover] config.lanSystemAsUserProviders=${JSON.stringify(systemAsUserRaw)} 非法（需字符串数组），回退 ${JSON.stringify(DEFAULT_SYSTEM_AS_USER_PROVIDERS)}`)
+  }
+  const systemAsUserProviders = new Set(systemAsUserList)
 
   // trae 压缩 shim：默认**开启**（装不上时只告警，TRAE 照常直发、功能不降级）。
   // 与 qoder shim 不同，它不依赖任何第三方内部模块，只需要 llm 注册表里有一个活 adapter。
@@ -664,6 +718,9 @@ export function apply(ctx, config = {}) {
   let settings = Object.assign({
     dialogMode: true, metricsSort: null, defaultConcurrency: null,
     resignBridgeEnabled: null, resignBridgeIntervalSeconds: null,
+    // 局域网网关的总开关与端口：null = 跟随 config 的出厂值（默认关闭 / 47021）。
+    // 存界面上改过的值，与 CodeArts 凭据镜像同一套「null 表示没覆盖」的语义。
+    lanEnabled: null, lanPort: null,
   }, readJson(settingsFile, {}))
 
   /**
@@ -2636,7 +2693,25 @@ export function apply(ctx, config = {}) {
         providers: owned.get(c.id) ?? [],
       }
     })
-    return { managerAvailable, channels }
+    // 显式诊断：装了却一条路由都没有，是「门面失效 / 插件 pending」的典型哑故障。
+    // 之前现场就是四张卡片 installed:true 但 providers:[]，接口看起来一切正常，
+    // 只能靠翻启动日志才发现。前端会轮询本接口，所以同一渠道只告警一次。
+    const degradedChannels = channels
+      .filter(c => c.installed === true && c.providers.length === 0)
+      .map(c => c.id)
+    if (degradedChannels.length > 0) {
+      const warned = describeFreeChannels._degradedWarned ??= new Set()
+      for (const id of degradedChannels) {
+        if (warned.has(id)) continue
+        warned.add(id)
+        try {
+          ctx.logger.warn('[model-failover] 渠道 ' + id
+            + ' 已安装但没有任何在线 provider；检查 llm 前缀门面是否生效'
+            + '（cordis 版本 / ctx.root / 门面 isolate 配置）')
+        } catch {}
+      }
+    }
+    return { managerAvailable, channels, degradedChannels }
   }
 
   /**
@@ -3753,6 +3828,47 @@ export function apply(ctx, config = {}) {
     res.end(JSON.stringify(body))
   }
 
+  /**
+   * 分组上的局域网字段：别名（空白 = 用分组名）与该组的单独开关。
+   *
+   * 只处理请求体里出现过的键：PUT 只带 models 时不该把用户先前设的别名抹掉。
+   * 别名必须唯一——网关按 model 字段找路由，两条路由同名就等于有一条永远打不到；
+   * 因此重名时拒绝保存并回清楚原因，而不是悄悄覆盖。
+   *
+   * @param {object} group - 已存在的分组对象（就地修改）。
+   * @param {object} body - 请求体。
+   * @returns {void}
+   */
+  function applyLanFields(group, body) {
+    if ('lanAlias' in body) {
+      const alias = typeof body.lanAlias === 'string' ? body.lanAlias.trim() : ''
+      if (alias) group.lanAlias = alias.slice(0, 120)
+      else delete group.lanAlias
+    }
+    if ('lanEnabled' in body) {
+      if (body.lanEnabled === true) group.lanEnabled = true
+      else delete group.lanEnabled
+    }
+  }
+
+  /**
+   * 该分组的局域网别名是否与别的分组撞名（含「别名 vs 对方的别名或分组名」）。
+   * @param {string} groupId - 正在保存的分组 id（新建时传空串）。
+   * @param {string} name - 正在保存的分组名。
+   * @param {string} alias - 正在保存的别名（空 = 用分组名）。
+   * @returns {string|null} 撞上的那条路由名；不冲突为 null。
+   */
+  function lanAliasConflict(groupId, name, alias) {
+    const mine = alias || String(name ?? '')
+    if (!mine) return null
+    for (const other of groups) {
+      if (other.id === groupId) continue
+      if (!lanGroupOpen(other)) continue
+      const theirs = lanAliasOf(other)
+      if (theirs === mine || String(other.name) === mine) return mine
+    }
+    return null
+  }
   function normalizeModels(list) {
     return (list || []).map(m => {
       const entry = {
@@ -3802,6 +3918,9 @@ export function apply(ctx, config = {}) {
       sendJson(res, 200, {
         groups: groups.map(g => ({
           id: g.id, name: g.name, enabled: g.enabled,
+          // 局域网路由名与每组的开放开关：别名缺省为 null（等于用分组名）
+          lanAlias: typeof g.lanAlias === 'string' ? g.lanAlias : null,
+          lanEnabled: g.lanEnabled === true,
           models: g.models.map(m => ({
             provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null,
             windows: m.windows ?? null, from: m.from ?? null, to: m.to ?? null, until: m.until ?? null,
@@ -3839,6 +3958,8 @@ export function apply(ctx, config = {}) {
         traeShim: describeTraeShim(),
         // CodeArts 凭据镜像：谁被镜像到哪几个 ref、上次成功/失败在什么时候
         resignBridge: describeResignBridge(),
+        // 局域网转发：监听地址、可复制给客户端的 baseUrl、各路由累计与最近请求
+        lanGateway: describeLanGateway(),
         // codearts 自救是否具备执行条件：loader 可见 + 找得到运行中的条目。
         // 这两项缺一就先在这里暴露出来，而不是等真失败时才发现救不了。
         codeartsSelfHeal: await describeCodeartsSelfHeal(),
@@ -4068,6 +4189,37 @@ export function apply(ctx, config = {}) {
       return
     }
 
+    /* ----- 局域网转发：总开关、端口、立即重启 ----- */
+    if (path === `${API_PATH}/lan-gateway` && req.method === 'POST') {
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        let changed = false
+        if ('enabled' in body) {
+          if (typeof body.enabled !== 'boolean') { sendJson(res, 400, { ok: false, error: 'enabled 需为布尔值' }); return }
+          settings.lanEnabled = body.enabled
+          changed = true
+        }
+        if ('port' in body) {
+          const raw = body.port
+          if (raw === null || raw === '') settings.lanPort = null
+          else {
+            const n = Number(raw)
+            if (!Number.isInteger(n) || n < 1 || n > 65535) { sendJson(res, 400, { ok: false, error: 'port 需为 1..65535 的整数' }); return }
+            settings.lanPort = n
+          }
+          changed = true
+        }
+        if (body.restart === true) changed = true
+        if (!changed) { sendJson(res, 200, { ok: true, lanGateway: describeLanGateway() }); return }
+        // 端口变了要换套接字；只是开关或强制重启则停下再按当前设置起——
+        // 同一端口重启时网关内部会接管旧套接字，调用方看不到闪断。
+        await stopLanGatewayNow()
+        saveSettings()
+        if (lanEffective().enabled) await startLanGatewayNow()
+        sendJson(res, 200, { ok: true, lanGateway: describeLanGateway() })
+      } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
+      return
+    }
     // 手动同步一次 CodeArts 凭据（设置页「立即同步」；排障时也用得上）
     if (path === `${API_PATH}/resign-bridge/sync` && req.method === 'POST') {
       if (resignBridgeHandle === null) { sendJson(res, 503, { ok: false, error: 'CodeArts 凭据镜像未挂载' }); return }
@@ -4086,7 +4238,10 @@ export function apply(ctx, config = {}) {
         const models = normalizeModels(body.models)
         // 允许先建空分组：模型可稍后从模型列表的 ＋ 快捷加入
         if (!body.name) { sendJson(res, 400, { ok: false, error: 'name 必填' }); return }
+        const clash = lanAliasConflict('', String(body.name), typeof body.lanAlias === 'string' ? body.lanAlias.trim() : '')
+        if (clash !== null) { sendJson(res, 409, { ok: false, error: '局域网路由名「' + clash + '」已被另一个分组占用：同一名字只能对应一条路由' }); return }
         const group = { id: body.id || randomUUID(), name: String(body.name), enabled: body.enabled !== false, models }
+        applyLanFields(group, body)
         groups.push(group); saveGroups(); sendJson(res, 200, { ok: true, group })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
       return
@@ -4100,7 +4255,11 @@ export function apply(ctx, config = {}) {
         if (!g) { sendJson(res, 404, { ok: false, error: '分组不存在' }); return }
         if (body.name !== undefined) g.name = String(body.name)
         if (body.enabled !== undefined) g.enabled = body.enabled !== false
+        const nextAlias = typeof body.lanAlias === 'string' ? body.lanAlias.trim() : (typeof g.lanAlias === 'string' ? g.lanAlias : '')
+        const clash = lanAliasConflict(g.id, String(g.name), nextAlias)
+        if (clash !== null) { sendJson(res, 409, { ok: false, error: '局域网路由名「' + clash + '」已被另一个分组占用：同一名字只能对应一条路由' }); return }
         if (body.models !== undefined) g.models = normalizeModels(body.models)
+        applyLanFields(g, body)
         saveGroups(); sendJson(res, 200, { ok: true, group: g })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
       return
@@ -4513,6 +4672,166 @@ export function apply(ctx, config = {}) {
     })()
   }
 
+  /* ==================== 局域网网关 ==================== */
+  //
+  // 把路由分组以 OpenAI 兼容接口开放给局域网（见 lan-gateway.mjs）。网关只做
+  // HTTP/JSON/SSE 的翻译，路由规则、候选挑选、失败记账全部回到这里——于是局域网
+  // 流量与界面里发起的请求共用同一份并发闸门（llm/stream 上的 guardedStream）、
+  // 同一份采样与同一份「当日失败」。
+  //
+  // 打开粒度是「总开关 + 每组开关」：只在两侧都开着时，那个分组才作为一条路由
+  // 出现在 /v1/models 并接受调用。
+  let lanHandle = null
+  /** 启动失败原因，随 /status.lanGateway 回传（界面据此说明为什么开不起来） */
+  let lanStartError = null
+
+  /** 总开关与端口的生效值：settings 里覆盖过就用它，否则跟随 config 出厂值 */
+  function lanEffective() {
+    const enabled = typeof settings.lanEnabled === 'boolean' ? settings.lanEnabled : lanGatewayConfigEnabled
+    const port = Number.isInteger(settings.lanPort) && settings.lanPort > 0 && settings.lanPort < 65536
+      ? settings.lanPort
+      : lanGatewayConfigPort
+    return { enabled, port }
+  }
+
+  /** 路由名：分组别名优先，缺省用分组名。空白别名等于没设。 */
+  function lanAliasOf(group) {
+    const alias = typeof group.lanAlias === 'string' ? group.lanAlias.trim() : ''
+    return alias || String(group.name)
+  }
+
+  /** 该分组此刻是否作为一条局域网路由对外开放 */
+  function lanGroupOpen(group) {
+    return group.enabled !== false && group.lanEnabled === true
+  }
+
+  /**
+   * 按名字找回一条对外开放的路由。
+   *
+   * 别名与分组名都可能被改，而调用方手里的模型名不会跟着改，所以分组 id 也认：
+   * 别名改过一次后，老脚本继续用 id 调用仍然打得到同一个分组。
+   *
+   * @param {string} name - 调用方传的 model 字段。
+   * @returns {{id: string, name: string, groupId: string}|null} 路由；找不到为 null。
+   */
+  function lanResolveRoute(name) {
+    const wanted = String(name ?? '').trim()
+    if (!wanted) return null
+    const open = groups.filter(lanGroupOpen)
+    const group = open.find(g => lanAliasOf(g) === wanted) ?? open.find(g => String(g.name) === wanted) ?? open.find(g => g.id === wanted)
+    if (group === undefined) return null
+    return { id: lanAliasOf(group), name: lanAliasOf(group), groupId: group.id }
+  }
+
+  /**
+   * /v1/models 与界面用的路由清单：只列此刻真的能调的那些。
+   * @returns {{id: string, name: string, groupId: string, models: number}[]} 路由清单。
+   */
+  function lanDescribeRoutes() {
+    return groups.filter(lanGroupOpen).map(g => ({
+      id: lanAliasOf(g),
+      name: lanAliasOf(g),
+      groupId: g.id,
+      models: (g.models || []).length,
+    }))
+  }
+
+  /**
+   * 局域网请求失败后的记账：与界面会话失败同一套口径。
+   *
+   * 三种处置互不相同，混用会让一个好模型整天不参与路由：
+   *  · 并发/容量类 —— 模型没坏，只是这一刻排不上，记一段短冷却；
+   *  · 请求被拒（上下文超限、参数不合法）—— 换模型有效，但模型本身没坏，不写当日失败；
+   *  · 其它 —— 真失败，写当日失败，之后的路由挑选会跳过它。
+   *
+   * @param {{provider: string, model: string}} candidate - 刚失败的候选。
+   * @param {{code?: string, message?: string}} failure - 失败事实。
+   * @returns {void}
+   */
+  function lanNoteFailure(candidate, failure) {
+    const provider = String(candidate.provider)
+    const model = String(candidate.model)
+    if (isCapacityFailure(failure)) {
+      markCapacity(provider, model, failure?.message ?? CAPACITY_TIMEOUT_CODE)
+      ctx.logger.warn(`[model-failover] 局域网转发：${provider}/${model} 并发已满（${failure?.code ?? 'unknown'}），临时冷却 ${Math.round(capacityCooldownMs / 1000)}s`)
+      return
+    }
+    if (isRequestRejectedFailure(failure)) {
+      ctx.logger.warn(`[model-failover] 局域网转发：${provider}/${model} 的失败是请求被拒（${failure?.code ?? 'unknown'}），不记当日失败，直接换模型`)
+      return
+    }
+    markFailed(provider, model, failure)
+    ctx.logger.warn(`[model-failover] 局域网转发：${provider}/${model} 彻底失败（${failure?.code ?? 'unknown'}），已标记为当日失败`)
+  }
+
+  /** 网关要的回调集合：这里注入，模块自己不认识任何路由规则。 */
+  const lanRuntime = {
+    llm: () => ctx.get('llm') ?? null,
+    attachments: () => ctx.get('attachments') ?? null,
+    liveProviderIdOf,
+    resolveRoute: lanResolveRoute,
+    firstCandidate: (groupId) => pickCandidate(sortedModels(groupId)),
+    nextCandidate: (groupId, exclude, skipped) => nextInGroup(groupId, exclude, skipped),
+    /** 该 provider 的 system 提示要不要挂成用户轮（qoder 系只认用户轮，见上面的名单）。 */
+    systemAsUserTurn: (provider) => systemAsUserProviders.has(bareProvider(provider)),
+    /** 已试过的候选集合用与记账同一口径的键，避免 provider 前缀写法不同时露过同一个模型。 */
+    keyOf: (candidate) => failKey(candidate.provider, candidate.model),
+    onFailure: lanNoteFailure,
+    describeRoutes: lanDescribeRoutes,
+  }
+
+  /** /status 用：网关此刻的监听状态、可复制地址、各路由累计与最近请求 */
+  function describeLanGateway() {
+    const eff = lanEffective()
+    const base = {
+      configured: eff,
+      configEnabled: lanGatewayConfigEnabled,
+      configPort: lanGatewayConfigPort,
+      startError: lanStartError,
+      // 排障用：qoder 系为什么收到的是 user 轮、或为什么没收到，看这份生效名单。
+      systemAsUserProviders: [...systemAsUserProviders],
+    }
+    if (lanHandle !== null) return { enabled: true, ...base, ...lanHandle.status() }
+    return {
+      enabled: false, running: false, listening: false, port: eff.port, bindHost: '0.0.0.0',
+      addresses: [], baseUrl: null, routes: lanDescribeRoutes(), startedAt: null, lastError: null,
+      stats: { requests: 0, ok: 0, failed: 0, retried: 0, active: 0, recent: [], byRoute: [] },
+      ...base,
+      reason: eff.enabled ? '启动中或启动失败（见日志）' : '总开关未开启',
+    }
+  }
+
+  /**
+   * 按当前设置启动网关。同端口重启时模块内部会接管旧套接字，端口不会闪断。
+   * @returns {Promise<void>} 启动完成或失败（失败只告警，不影响其它功能）。
+   */
+  async function startLanGatewayNow() {
+    const eff = lanEffective()
+    if (!eff.enabled) return
+    try {
+      const gatewayModule = await import(LAN_GATEWAY_MODULE + '?v=' + LAN_GATEWAY_BUILD)
+      lanHandle = await gatewayModule.startLanGateway({ port: eff.port, logger: ctx.logger, runtime: lanRuntime })
+      lanStartError = null
+      const st = lanHandle.status()
+      const where = (st.addresses ?? []).length > 0 ? st.addresses.join(' ') : st.baseUrl
+      ctx.logger.info(`[model-failover] 局域网转发已开启：${where}（${(st.routes ?? []).length} 条路由，model 字段填路由名）`)
+    } catch (err) {
+      lanStartError = String(err && err.message ? err.message : err)
+      ctx.logger.warn(`[model-failover] 局域网转发启动失败（端口 ${eff.port}）：${lanStartError}`)
+    }
+  }
+
+  /** 关掉网关。重复调用无害；关掉后端口立即可复用。 */
+  async function stopLanGatewayNow() {
+    if (lanHandle === null) return
+    const handle = lanHandle
+    lanHandle = null
+    try { await handle.stop() } catch (err) {
+      ctx.logger.warn(`[model-failover] 局域网转发停止时出错：${String(err && err.message ? err.message : err)}`)
+    }
+  }
+
+  if (lanEffective().enabled) void startLanGatewayNow()
   /* ==================== CodeArts 凭据镜像 ==================== */
   //
   // 把 dsh-codearts 账号库里的 AK/SK/token 持续写进 bili 重签用的 credentials ref。
@@ -4585,6 +4904,7 @@ export function apply(ctx, config = {}) {
     disposeStop()
     if (qoderShimHandle) qoderShimHandle.stop()
     if (traeShimHandle) traeShimHandle.stop()
+    void stopLanGatewayNow()
     if (resignBridgeHandle) resignBridgeHandle.stop()
     if (routeDisposer) routeDisposer()
     // 兜底闹钟随插件一起结束：卸载后既没人投递，也不该再留定时器
