@@ -13,6 +13,10 @@
  *     adapter…）就悄悄换下一个候选，客户端看不到任何痕迹；已经出字之后再失败
  *     只能报错——此时重来会让客户端收到半截重复内容。
  *  3. model 字段就是路由名（分组别名，缺省用分组名）。
+ *  4. 同一套候选循环服务两种方言：POST /v1/chat/completions（Chat Completions）
+ *     与 POST /v1/responses（Responses）。请求怎么读进来、响应怎么写出去各写一份，
+ *     候选挑选、静默切换、失败记账只有一份——同一个分组在两条接口上必须给出
+ *     一致的可用性，否则「换个接口就能用」会变成排障时的假线索。
  *
  * 监听 0.0.0.0：宿主的 webServer 只绑回环（dsh web 明确拒绝 --host 0.0.0.0），
  * 局域网转发必须自己开端口。服务不做鉴权（用户明确选择内网直用），因此这里
@@ -32,6 +36,8 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024
 const MAX_ATTEMPTS = 8
 /** /status 里保留的最近请求条数。 */
 const RECENT_LIMIT = 20
+/** 本文件的构建号：/healthz 回传它，用来确认端口上跑的到底是哪一版实现。 */
+export const GATEWAY_VERSION = '7'
 
 /**
  * 启动（或接管）局域网转发服务。
@@ -46,9 +52,13 @@ export async function startLanGateway({ port, logger, runtime }) {
   const previous = globalThis[STATE_KEY]
   if (previous !== undefined) {
     if (previous.port === port && previous.server !== null) {
-      // 同端口热替换：沿用旧套接字，只换实现与运行时回调，端口不会闪断
+      // 同端口热替换：沿用旧套接字，换掉运行时回调**和请求处理函数**，端口不会闪断。
+      // 处理函数必须一起换：server 的监听器是在上一个模块实例里创建的闭包，只换
+      // runtime 的话新模块里新增的端点（比如 /v1/responses）永远走不到——源码改了、
+      // 构建号也提了，端口上却还是旧路由表（实测：热替换后 POST /v1/responses 仍 404）。
       previous.runtime = runtime
       previous.logger = logger
+      previous.handler = handleRequest
       logger.info('[model-failover] 局域网转发已热替换实现（继续复用 0.0.0.0:' + port + '）')
       return { status: () => snapshot(previous), stop: previous.stop }
     }
@@ -71,12 +81,17 @@ export async function startLanGateway({ port, logger, runtime }) {
       byRoute: new Map(),
     },
     server: null,
+    /** 当前生效的请求处理函数：热替换时由新模块实例改写，见上。 */
+    handler: handleRequest,
     stop,
   }
 
   const server = createServer((req, res) => {
     const current = globalThis[STATE_KEY] ?? handle
-    Promise.resolve(handleRequest(req, res, current)).catch((err) => {
+    // 取 current.handler 而不是闭包里的 handleRequest：套接字归第 x 版所有，处理函数
+    // 要跟着最新那版走，否则热替换只换了统计数据、路由表还是老的。
+    const run = typeof current.handler === 'function' ? current.handler : handleRequest
+    Promise.resolve(run(req, res, current)).catch((err) => {
       handle.lastError = messageOf(err)
       if (!res.headersSent) {
         sendError(res, 500, '服务端错误：' + messageOf(err), 'server_error', 'server_error')
@@ -203,14 +218,23 @@ async function handleRequest(req, res, handle) {
 
   if (path === '/v1/models' && req.method === 'GET') { sendJson(res, 200, modelsPayload(handle)); return }
   if ((path === '/v1/chat/completions' || path === '/chat/completions') && req.method === 'POST') {
-    await handleChat(req, res, handle)
+    await handleGenerate(req, res, handle, 'chat')
+    return
+  }
+  if ((path === '/v1/responses' || path === '/responses') && req.method === 'POST') {
+    await handleGenerate(req, res, handle, 'responses')
+    return
+  }
+  if (path.startsWith('/v1/responses/') && req.method === 'GET') {
+    // Responses 的 GET /v1/responses/:id 依赖服务端存储；本网关 store 恒为 false
+    sendError(res, 404, '本网关不保存响应历史（store 恒为 false），不能按 id 取回：请把完整对话放进 input 重新请求', 'invalid_request_error', 'not_found')
     return
   }
   if (path === '/healthz' || path === '/' || path === '/v1') {
-    sendJson(res, 200, { ok: true, service: 'model-failover-manager LAN gateway', routes: handle.runtime.describeRoutes() })
+    sendJson(res, 200, { ok: true, service: 'model-failover-manager LAN gateway', build: GATEWAY_VERSION, routes: handle.runtime.describeRoutes() })
     return
   }
-  sendError(res, 404, '未知端点 ' + req.method + ' ' + path + '（可用：GET /v1/models、POST /v1/chat/completions）', 'invalid_request_error', 'not_found')
+  sendError(res, 404, '未知端点 ' + req.method + ' ' + path + '（可用：GET /v1/models、POST /v1/chat/completions、POST /v1/responses）', 'invalid_request_error', 'not_found')
 }
 
 /**
@@ -231,15 +255,20 @@ function modelsPayload(handle) {
   }
 }
 /**
- * POST /v1/chat/completions 的主流程：解析 → 选首个候选 → 逐个候选尝试
+ * 一次生成请求的主流程（两种方言共用）：解析 → 选首个候选 → 逐个候选尝试
  * （首个内容增量之前失败就静默换下一个）。
+ *
+ * chat 与 responses 只在「请求怎么读进来」「响应怎么写出去」上不同。候选挑选、
+ * 并发记账、已出字不再重来这些规则必须完全一致——两套接口对同一个分组给出
+ * 不同结果，用户就没法判断到底是分组坏了还是接口坏了。
  *
  * @param {import('node:http').IncomingMessage} req - 原始请求。
  * @param {import('node:http').ServerResponse} res - 原始响应。
  * @param {object} handle - 内部状态。
+ * @param {'chat'|'responses'} dialect - 请求/响应的方言。
  * @returns {Promise<void>} 响应写完即 resolve。
  */
-async function handleChat(req, res, handle) {
+async function handleGenerate(req, res, handle, dialect) {
   const { runtime, stats } = handle
   let body
   try {
@@ -265,7 +294,9 @@ async function handleChat(req, res, handle) {
 
   let prepared
   try {
-    prepared = await prepareRequest(body, runtime)
+    prepared = dialect === 'responses'
+      ? await prepareResponsesRequest(body, runtime)
+      : await prepareRequest(body, runtime)
   } catch (err) {
     sendError(res, 400, messageOf(err), 'invalid_request_error', 'invalid_request')
     return
@@ -281,11 +312,20 @@ async function handleChat(req, res, handle) {
   row.requests += 1
   row.active += 1
   const startedAt = Date.now()
-  const completionId = 'chatcmpl-' + randomUUID()
   const created = Math.floor(startedAt / 1000)
-  const sink = wantsStream
-    ? createSseSink(res, route.name, completionId, created, Boolean(body.stream_options?.include_usage))
-    : createBufferSink(res, route.name, completionId, created)
+  let sink
+  if (dialect === 'responses') {
+    const echo = responsesEcho(body)
+    const responseId = 'resp_' + randomUUID()
+    sink = wantsStream
+      ? createResponsesStreamSink(res, route.name, responseId, created, echo)
+      : createResponsesBufferSink(res, route.name, responseId, created, echo)
+  } else {
+    const completionId = 'chatcmpl-' + randomUUID()
+    sink = wantsStream
+      ? createSseSink(res, route.name, completionId, created, Boolean(body.stream_options?.include_usage))
+      : createBufferSink(res, route.name, completionId, created)
+  }
 
   let candidate = runtime.firstCandidate(route.groupId)
   if (candidate === null) {
@@ -933,6 +973,520 @@ function textOf(content) {
     if (part !== null && typeof part === 'object' && typeof part.text === 'string' && part.text) parts.push(part.text)
   }
   return parts.join('\n')
+}
+
+/* ─────────────────────── OpenAI Responses 方言 ─────────────────────── */
+
+/**
+ * Responses 请求体 → 与 prepareRequest 同形的中间结构。
+ *
+ * 与 chat 的差别只在这些输入形状上：
+ *  · 提示词在 instructions（而不是 messages 里的 system 行）；
+ *  · 对话在 input（字符串，或 input item 数组：message / function_call /
+ *    function_call_output / reasoning）；
+ *  · 工具是扁平的 {type:'function', name, parameters}，没有 function 包一层；
+ *  · 上限字段叫 max_output_tokens。
+ *
+ * 不支持的项（previous_response_id、item_reference、web_search_call…）在这里明确
+ * 报错而不是静默忽略：安静地少一段上下文，用户只会看到「模型答得不对」。
+ *
+ * @param {object} body - Responses 请求体。
+ * @param {object} runtime - host 注入的运行时回调。
+ * @returns {Promise<object>} 中间结构。
+ */
+async function prepareResponsesRequest(body, runtime) {
+  if (body.previous_response_id !== undefined && body.previous_response_id !== null) {
+    throw new Error('不支持 previous_response_id：本网关不保存响应历史，请把完整对话放进 input')
+  }
+
+  const systemTexts = []
+  const instructions = textOf(body.instructions)
+  if (instructions) systemTexts.push(instructions)
+
+  const jsonFormat = body?.text?.format
+  if (jsonFormat !== null && typeof jsonFormat === 'object' && jsonFormat.type === 'json_schema' && jsonFormat.schema) {
+    // 宿主 GenerateOptions 没有 response_format：把约束写成提示词，是这条链路上
+    // 唯一能保证「输出仍是 JSON」的做法（工具调用的 parameters 不受影响）。
+    const schema = safeJson(jsonFormat.schema)
+    if (schema) systemTexts.push('只输出一个符合下列 JSON Schema 的 JSON 值，不要用代码块包裹，也不要附加任何解释：' + '\n' + schema)
+  }
+
+  const messages = []
+  const input = body.input
+  if (typeof input === 'string') {
+    if (!input.trim()) throw new Error('input 必填：字符串或输入项数组')
+    messages.push({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: input }], source: { kind: 'user' } })
+  } else if (Array.isArray(input)) {
+    for (const item of input) await appendResponsesItem(item, messages, systemTexts, runtime)
+  } else {
+    throw new Error('input 必填：字符串或输入项数组')
+  }
+  if (messages.length === 0) throw new Error('input 里没有 user/assistant/工具结果内容')
+
+  const toolChoice = typeof body.tool_choice === 'string' ? body.tool_choice : ''
+  return {
+    messages,
+    systemText: systemTexts.length > 0 ? systemTexts.join('\n\n') : '',
+    tools: toolChoice === 'none' ? undefined : toToolSchemas(body.tools),
+    temperature: numberOf(body.temperature),
+    maxTokens: intOf(body.max_output_tokens),
+    stop: undefined,
+  }
+}
+
+/**
+ * 一个 input item → 宿主消息（就地追加到 messages；system 文本进 systemTexts）。
+ *
+ * @param {unknown} item - input 数组的一项。
+ * @param {object[]} messages - 已解析的消息。
+ * @param {string[]} systemTexts - system/developer 文本收集器。
+ * @param {object} runtime - host 注入的运行时回调。
+ * @returns {Promise<void>} 处理完即 resolve。
+ */
+async function appendResponsesItem(item, messages, systemTexts, runtime) {
+  if (item === null || typeof item !== 'object') throw new Error('input 里含非对象元素')
+  const type = typeof item.type === 'string' && item.type
+    ? item.type
+    : (typeof item.role === 'string' ? 'message' : '')
+
+  if (type === 'message') {
+    const role = typeof item.role === 'string' ? item.role : 'user'
+    if (role === 'system' || role === 'developer') {
+      const text = textOf(item.content)
+      if (text) systemTexts.push(text)
+      return
+    }
+    if (role !== 'user' && role !== 'assistant') {
+      throw new Error('不支持的消息角色「' + (role || '(空)') + '」（支持 system/developer/user/assistant，工具结果用 function_call_output）')
+    }
+    const blocks = await toBlocks(item.content, runtime, role)
+    messages.push(role === 'assistant'
+      ? { role, id: randomUUID(), content: blocks, source: { kind: 'model', provider: 'lan-gateway', model: 'lan-gateway' } }
+      : { role, id: randomUUID(), content: blocks, source: { kind: 'user' } })
+    return
+  }
+
+  if (type === 'function_call') {
+    const name = typeof item.name === 'string' ? item.name : ''
+    if (!name) throw new Error('function_call 项缺少 name')
+    const callId = typeof item.call_id === 'string' && item.call_id ? item.call_id : 'call_' + randomUUID()
+    const block = { type: 'tool-call', id: callId, name, arguments: argsTextOf(item.arguments) }
+    // 助手的「文字 + 这次调用」在 Responses 里是两条 item；宿主里是一条 assistant
+    // 消息（content 里带 tool-call 块），所以并回上一条 assistant。
+    const last = messages.length > 0 ? messages[messages.length - 1] : null
+    if (last !== null && last.role === 'assistant') { last.content.push(block); return }
+    messages.push({ role: 'assistant', id: randomUUID(), content: [block], source: { kind: 'model', provider: 'lan-gateway', model: 'lan-gateway' } })
+    return
+  }
+
+  if (type === 'function_call_output') {
+    const callId = typeof item.call_id === 'string' && item.call_id ? item.call_id : 'call_0'
+    const output = item.output
+    const content = typeof output === 'string'
+      ? (output.length > 0 ? [{ type: 'text', text: output }] : [])
+      : await toBlocks(output, runtime, 'tool')
+    messages.push({ role: 'tool', id: randomUUID(), toolCallId: callId, isError: false, source: { kind: 'tool', callId }, content })
+    return
+  }
+
+  // reasoning / item_reference / *_call 这类「对上一轮的补充说明」：宿主侧没有
+  // 对应物，且它们不影响本轮生成，跳过即等价。
+}
+
+/**
+ * Responses 请求里要原样回显给客户端的字段（客户端 SDK 会读，缺了会被判成
+ * 「不是合法的 Response」）。
+ * @param {object} body - Responses 请求体。
+ * @returns {object} 回显字段。
+ */
+function responsesEcho(body) {
+  return {
+    instructions: typeof body.instructions === 'string' ? body.instructions : null,
+    maxOutputTokens: intOf(body.max_output_tokens) ?? null,
+    temperature: numberOf(body.temperature) ?? 1,
+    toolChoice: typeof body.tool_choice === 'string' && body.tool_choice ? body.tool_choice : 'auto',
+    tools: Array.isArray(body.tools) ? body.tools : [],
+    metadata: body.metadata !== null && typeof body.metadata === 'object' && !Array.isArray(body.metadata) ? body.metadata : {},
+  }
+}
+
+/**
+ * 组装一个 Response 对象（非流式响应体，也是流式里 response.created 用的快照）。
+ * @param {object} args - 组装参数。
+ * @returns {object} Response 对象。
+ */
+function responsesObject(args) {
+  const { id, model, createdAt, echo, status, output, usage, error, incompleteDetails } = args
+  return {
+    id,
+    object: 'response',
+    created_at: createdAt,
+    status,
+    model,
+    output,
+    output_text: outputTextOf(output),
+    error: error ?? null,
+    incomplete_details: incompleteDetails ?? null,
+    instructions: echo.instructions,
+    max_output_tokens: echo.maxOutputTokens,
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: false,
+    temperature: echo.temperature,
+    text: { format: { type: 'text' } },
+    tool_choice: echo.toolChoice,
+    tools: echo.tools,
+    top_p: 1,
+    truncation: 'disabled',
+    usage: usage ?? null,
+    metadata: echo.metadata,
+    user: null,
+  }
+}
+
+/**
+ * output 数组 → 便捷字段 output_text（官方 SDK 直接从它读正文）。
+ * @param {object[]} output - Response.output。
+ * @returns {string} 全部 output_text 拼接。
+ */
+function outputTextOf(output) {
+  const parts = []
+  for (const item of output) {
+    if (item?.type !== 'message' || !Array.isArray(item.content)) continue
+    for (const part of item.content) {
+      if (part?.type === 'output_text' && typeof part.text === 'string') parts.push(part.text)
+    }
+  }
+  return parts.join('')
+}
+
+/**
+ * 宿主 TokenUsage → Responses usage。口径与 chat 的 usageOf 一致：
+ * 缓存命中与缓存写入都算进 input_tokens。
+ * @param {object|null} usage - TokenUsage。
+ * @returns {object} usage。
+ */
+function responsesUsageOf(usage) {
+  const input = intOf(usage?.inputTokens) ?? 0
+  const cacheRead = intOf(usage?.cacheReadTokens) ?? 0
+  const cacheWrite = intOf(usage?.cacheWriteTokens) ?? 0
+  const output = intOf(usage?.outputTokens) ?? 0
+  const prompt = input + cacheRead + cacheWrite
+  return {
+    input_tokens: prompt,
+    input_tokens_details: { cached_tokens: cacheRead },
+    output_tokens: output,
+    output_tokens_details: { reasoning_tokens: intOf(usage?.reasoningTokens) ?? 0 },
+    total_tokens: intOf(usage?.totalTokens) ?? (prompt + output),
+  }
+}
+
+/**
+ * 一次尝试的累加器 → Response.output。
+ *
+ * 顺序固定为「推理 → 正文 → 工具调用」：宿主可能交错吐这三种块，但 Responses 的
+ * output 是一个有序数组，交错写进去会让客户端按位置解读时错位。
+ * @param {object} acc - 本次尝试的累加器。
+ * @returns {object[]} output 数组。
+ */
+function responsesOutputOf(acc) {
+  const output = []
+  if (acc.reasoning.length > 0) {
+    output.push({ id: 'rs_' + randomUUID(), type: 'reasoning', summary: [{ type: 'summary_text', text: acc.reasoning }] })
+  }
+  if (acc.text.length > 0 || acc.tools.size === 0) {
+    output.push({
+      id: 'msg_' + randomUUID(),
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: acc.text, annotations: [], logprobs: [] }],
+    })
+  }
+  for (const entry of acc.tools.values()) {
+    output.push({
+      id: 'fc_' + randomUUID(),
+      type: 'function_call',
+      status: 'completed',
+      arguments: entry.arguments || '{}',
+      call_id: entry.id || ('call_' + randomUUID()),
+      name: entry.name,
+    })
+  }
+  return output
+}
+
+/**
+ * 非流式 Responses 输出端。
+ *
+ * committed 恒为 false：在写出响应之前失败都能换候选，与非流式 chat 同理。
+ *
+ * @param {import('node:http').ServerResponse} res - 原始响应。
+ * @param {string} model - 对客户端呈现的模型名（路由名）。
+ * @param {string} id - resp_ id。
+ * @param {number} createdAt - 秒级时间戳。
+ * @param {object} echo - responsesEcho 的结果。
+ * @returns {object} sink。
+ */
+function createResponsesBufferSink(res, model, id, createdAt, echo) {
+  return {
+    committed: false,
+    text() {},
+    reasoning() {},
+    toolDelta() {},
+    finish(acc) {
+      const maxedOut = acc.finish?.kind === 'max-tokens'
+      sendJson(res, 200, responsesObject({
+        id,
+        model,
+        createdAt,
+        echo,
+        status: maxedOut ? 'incomplete' : 'completed',
+        output: responsesOutputOf(acc),
+        usage: responsesUsageOf(acc.usage),
+        error: null,
+        incompleteDetails: maxedOut ? { reason: 'max_output_tokens' } : null,
+      }))
+    },
+    fail(failure) {
+      sendError(res, 502, '上游失败：' + (failure.message ?? ''), 'upstream_error', failure.code ?? 'upstream_error')
+    },
+  }
+}
+
+/**
+ * 流式 Responses 输出端。
+ *
+ * 与 chat 的 SSE sink 共享同一个前提：**第一个内容增量之前不写响应头**，于是上游
+ * 失败时可以静默换候选。区别在于 Responses 的事件序列必须成对（created →
+ * output_item.added → *_delta → *_done → output_item.done → completed），所以这里
+ * 把已发生的事件先攒在队列里，commit 时按序一次写出。
+ *
+ * 收尾不发 data: [DONE]——Responses 协议用 response.completed 表示结束，官方 SDK
+ * 收到多余事件会当成未知类型。
+ *
+ * @param {import('node:http').ServerResponse} res - 原始响应。
+ * @param {string} model - 对客户端呈现的模型名（路由名）。
+ * @param {string} id - resp_ id。
+ * @param {number} createdAt - 秒级时间戳。
+ * @param {object} echo - responsesEcho 的结果。
+ * @returns {object} sink。
+ */
+function createResponsesStreamSink(res, model, id, createdAt, echo) {
+  let committed = false
+  let closed = false
+  let seq = 0
+  let usage = null
+  const queued = []
+  /** 已开出的 output 项；下标即 output_index。 */
+  const entries = []
+  let reasoning = null
+  let message = null
+  const toolEntries = new Map()
+
+  const liveItem = (item) => {
+    if (item.kind === 'reasoning') return { id: item.id, type: 'reasoning', summary: [] }
+    if (item.kind === 'message') return { id: item.id, type: 'message', status: 'in_progress', role: 'assistant', content: [] }
+    return { id: item.id, type: 'function_call', status: 'in_progress', arguments: '', call_id: item.callId || item.id, name: item.name }
+  }
+  const doneItem = (item) => {
+    if (item.kind === 'reasoning') {
+      return { id: item.id, type: 'reasoning', summary: item.text ? [{ type: 'summary_text', text: item.text }] : [] }
+    }
+    if (item.kind === 'message') {
+      return {
+        id: item.id,
+        type: 'message',
+        status: 'completed',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: item.text, annotations: [], logprobs: [] }],
+      }
+    }
+    return { id: item.id, type: 'function_call', status: 'completed', arguments: item.args || '{}', call_id: item.callId || item.id, name: item.name }
+  }
+  const snapshot = (status, done, extra) => responsesObject({
+    id,
+    model,
+    createdAt,
+    echo,
+    status,
+    output: entries.map(done ? doneItem : liveItem),
+    usage: done ? responsesUsageOf(usage) : null,
+    error: extra?.error ?? null,
+    incompleteDetails: extra?.incompleteDetails ?? null,
+  })
+
+  const send = (type, body) => {
+    if (closed) return
+    const payload = { type, sequence_number: seq, ...body }
+    seq += 1
+    res.write('event: ' + type + '\n' + 'data: ' + JSON.stringify(payload) + '\n\n')
+  }
+  const emit = (type, body) => {
+    if (closed) return
+    if (!committed) { queued.push([type, body]); return }
+    send(type, body)
+  }
+  const commit = () => {
+    if (committed) return
+    committed = true
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    })
+    if (typeof res.flushHeaders === 'function') res.flushHeaders()
+    const live = snapshot('in_progress', false)
+    send('response.created', { response: live })
+    send('response.in_progress', { response: live })
+    for (const [type, body] of queued) send(type, body)
+    queued.length = 0
+  }
+
+  const toolEntryOf = (key) => {
+    let item = toolEntries.get(key)
+    if (item !== undefined) return item
+    item = { kind: 'function_call', id: 'fc_' + randomUUID(), callId: '', name: '', args: '', sent: 0, announced: false, index: entries.length }
+    toolEntries.set(key, item)
+    entries.push(item)
+    return item
+  }
+  const announceTool = (item) => {
+    if (item.announced) return
+    item.announced = true
+    emit('response.output_item.added', { output_index: item.index, item: liveItem(item) })
+    item.sent = 0
+    if (item.args.length > 0) {
+      emit('response.function_call_arguments.delta', { item_id: item.id, output_index: item.index, delta: item.args })
+      item.sent = item.args.length
+    }
+  }
+
+  return {
+    get committed() { return committed },
+    text(delta) {
+      if (!delta) return
+      commit()
+      if (message === null) {
+        message = { kind: 'message', id: 'msg_' + randomUUID(), text: '', index: entries.length }
+        entries.push(message)
+        emit('response.output_item.added', { output_index: message.index, item: liveItem(message) })
+        emit('response.content_part.added', {
+          item_id: message.id,
+          output_index: message.index,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] },
+        })
+      }
+      message.text += delta
+      emit('response.output_text.delta', { item_id: message.id, output_index: message.index, content_index: 0, delta })
+    },
+    reasoning(delta) {
+      if (!delta) return
+      commit()
+      if (reasoning === null) {
+        reasoning = { kind: 'reasoning', id: 'rs_' + randomUUID(), text: '', index: entries.length }
+        entries.push(reasoning)
+        emit('response.output_item.added', { output_index: reasoning.index, item: liveItem(reasoning) })
+      }
+      reasoning.text += delta
+      emit('response.reasoning_text.delta', { item_id: reasoning.id, output_index: reasoning.index, content_index: 0, delta })
+    },
+    toolDelta(index, entry, argumentsDelta) {
+      commit()
+      const item = toolEntryOf(index)
+      if (entry.id && !item.callId) item.callId = entry.id
+      if (entry.name && !item.name) item.name = entry.name
+      const delta = typeof argumentsDelta === 'string' ? argumentsDelta : ''
+      if (delta) item.args += delta
+      if (!item.announced) {
+        // 名字还没到就先把 added 发出去，客户端会拿到一个没有函数名的调用；攒到名字
+        // 到齐再 announce，届时把已收到的入参整段补成 delta。
+        if (!item.name) return
+        announceTool(item)
+        return
+      }
+      if (delta) {
+        emit('response.function_call_arguments.delta', { item_id: item.id, output_index: item.index, delta })
+        item.sent = item.args.length
+      }
+    },
+    finish(acc) {
+      commit()
+      usage = acc.usage ?? null
+      if (reasoning !== null) {
+        emit('response.reasoning_text.done', { item_id: reasoning.id, output_index: reasoning.index, content_index: 0, text: reasoning.text })
+        emit('response.output_item.done', { output_index: reasoning.index, item: doneItem(reasoning) })
+      }
+      if (message !== null) {
+        emit('response.output_text.done', { item_id: message.id, output_index: message.index, content_index: 0, text: message.text })
+        emit('response.content_part.done', {
+          item_id: message.id,
+          output_index: message.index,
+          content_index: 0,
+          part: { type: 'output_text', text: message.text, annotations: [] },
+        })
+        emit('response.output_item.done', { output_index: message.index, item: doneItem(message) })
+      }
+      // 工具调用以 block-end 放进 acc 的最终入参为准（适配器会把校验过的 JSON 放回来）
+      for (const [key, final] of acc.tools) {
+        const item = toolEntryOf(key)
+        if (final.id && !item.callId) item.callId = final.id
+        if (final.name && !item.name) item.name = final.name
+        if (!item.announced) announceTool(item)
+        const finalArgs = typeof final.arguments === 'string' && final.arguments.length > 0
+          ? final.arguments
+          : (item.args || '{}')
+        if (finalArgs.length > item.sent && finalArgs.startsWith(item.args)) {
+          emit('response.function_call_arguments.delta', { item_id: item.id, output_index: item.index, delta: finalArgs.slice(item.sent) })
+        }
+        item.args = finalArgs
+        item.sent = finalArgs.length
+        emit('response.function_call_arguments.done', { item_id: item.id, output_index: item.index, arguments: finalArgs })
+        emit('response.output_item.done', { output_index: item.index, item: doneItem(item) })
+      }
+      const maxedOut = acc.finish?.kind === 'max-tokens'
+      emit('response.completed', {
+        response: snapshot(maxedOut ? 'incomplete' : 'completed', true, {
+          incompleteDetails: maxedOut ? { reason: 'max_output_tokens' } : null,
+        }),
+      })
+      if (!closed) { closed = true; res.end() }
+    },
+    fail(failure) {
+      if (!committed) {
+        sendError(res, 502, '上游失败：' + (failure.message ?? ''), 'upstream_error', failure.code ?? 'upstream_error')
+        closed = true
+        return
+      }
+      // 已经出字：按 Responses 的形状宣告失败，客户端据此进入错误分支而不是等超时
+      emit('response.failed', {
+        response: snapshot('failed', false, {
+          error: { code: failure.code ?? 'upstream_error', message: failure.message ?? '上游失败' },
+        }),
+      })
+      if (!closed) { closed = true; res.end() }
+    },
+  }
+}
+
+/** 任意值 → JSON 文本；不可序列化时返回空串。 */
+function safeJson(value) {
+  try {
+    const text = JSON.stringify(value)
+    return typeof text === 'string' ? text : ''
+  } catch {
+    return ''
+  }
+}
+
+/** function_call 的 arguments 统一成字符串（宽松收对象）。 */
+function argsTextOf(value) {
+  if (typeof value === 'string') return value.length > 0 ? value : '{}'
+  if (value === undefined || value === null) return '{}'
+  return safeJson(value) || '{}'
 }
 
 /**

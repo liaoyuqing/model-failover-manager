@@ -107,7 +107,7 @@ const TRAE_SHIM_PROVIDERS = new Set(['trae', 'trae-enterprise', 'trae-global'])
 // 和两个 shim 一样用带构建号的动态 import：改网关后重载插件就能换上新代码。
 const LAN_GATEWAY_MODULE = './lan-gateway.mjs'
 /** 构建号：改动 lan-gateway.mjs 后必须 +1，否则 ESM 缓存仍用旧模块。 */
-const LAN_GATEWAY_BUILD = '5'
+const LAN_GATEWAY_BUILD = '7'
 
 export const name = 'model-failover-manager'
 export const inject = ['timer']
@@ -131,7 +131,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v122'
+const HOST_VERSION = 'v125' // bili 限流闸门回绝记为临时失败（带到期时刻自动恢复，不写当日失败）
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -1025,6 +1025,134 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * billion-context 的 429 限流闸门回绝（#4204）的状态码。
+   *
+   * 上游连续 429 后 bili 不再放大重试，改为在**本机**把请求挡下，零 egress：
+   *  · `bili_throttle_hold`（429）：`… is holding outbound sends until <ISO> (~Ns, exponential backoff) …`
+   *  · `bili_throttle_terminal`（424）：连续次数打满，`… resend manually once the provider recovers
+   *    (a background probe keeps checking at most every Ns)`。
+   */
+  const BILI_THROTTLE_HOLD_CODES = new Set(['bili_throttle_hold', 'bili_throttle_terminal'])
+  /** 临时失败的时限下限/上限：解析出的时刻越界时夹进这个区间。 */
+  const TEMPORARY_FAILURE_MIN_MS = 1_000
+  const TEMPORARY_FAILURE_MAX_MS = 60 * 60_000
+  /** terminal 分支不写到期时刻，只承诺「最多每 N 秒探一次」，取这个默认值。 */
+  const BILI_THROTTLE_PROBE_MS = 30_000
+
+  /**
+   * 这次失败是不是 bili 的限流闸门回绝，是的话返回它的到期时刻。
+   *
+   * 判据必须是**文案**而不只是错误码：适配器会把 bili 的响应压成自己的
+   * `RATE_LIMIT`/`429`，`bili_throttle_*` 往往传不到插件这一层。两条文案分别是
+   * 「holding outbound sends until <ISO>」与「stops amplifying after N consecutive」。
+   *
+   * 时刻优先取报文里的绝对时间（`until 2026-11-23T22:01:49.355Z`），取不到再用
+   * 相对秒数（`~591s` / `every 30s`）按收到失败的这一刻折算。
+   *
+   * @param {{code?: string, status?: number, message?: string}|undefined} failure - 宿主给出的失败事实。
+   * @returns {{until: number, reason: string}|null} 到期时刻与原文；不是闸门回绝则为 null。
+   */
+  function biliThrottleHoldOf(failure) {
+    if (!failure) return null
+    const message = String(failure.message ?? '')
+    const byCode = BILI_THROTTLE_HOLD_CODES.has(String(failure.code ?? ''))
+    const byText = /bili is holding outbound sends until\s+\S+/i.test(message)
+      || /bili stops amplifying after\s+\d+\s+consecutive rate limits/i.test(message)
+    if (!byCode && !byText) return null
+    const now = Date.now()
+    let until = null
+    const absolute = /holding outbound sends until\s+(\S+)/i.exec(message)
+    if (absolute !== null) {
+      const parsed = Date.parse(absolute[1].replace(/[),.;]+$/, ''))
+      if (Number.isFinite(parsed)) until = parsed
+    }
+    if (until === null) {
+      const relative = /~(\d+)s\b/.exec(message) ?? /every\s+(\d+)s\b/i.exec(message)
+      const seconds = relative === null ? NaN : Number(relative[1])
+      if (Number.isFinite(seconds) && seconds >= 0) until = now + seconds * 1000
+    }
+    if (until === null) until = now + BILI_THROTTLE_PROBE_MS
+    const clamped = Math.min(Math.max(until, now + TEMPORARY_FAILURE_MIN_MS), now + TEMPORARY_FAILURE_MAX_MS)
+    return { until: clamped, reason: message.trim().slice(0, 400) }
+  }
+
+  /**
+   * 临时失败：带到期时刻的「失败」，到期自动从失败列表里恢复。
+   *
+   * 与 failedList（当日失败，按北京时间的日界重置）刻意分开，因为两者的**原因寿命**
+   * 完全不同：当日失败是「这个模型今天不能用」，要人工恢复或等日界；这里的失败是
+   * 「上游说你限流了，N 秒后再来」——上游自己会恢复，把它写成当日失败等于凭一条
+   * 限流报文停用模型一整天。
+   *
+   * 单独成表还有一个必须的理由：bili 的限流闸门是按**账号+主机**记的（`holdKey`），
+   * 换到同渠道另一个账号拿到的还是同一条 hold，所以「换号重试」在这一类失败上无效，
+   * 只能临时退避再回来。
+   *
+   * modelKey -> { until, at, code, reason, provider, model }
+   */
+  const temporaryFailures = new Map()
+
+  /**
+   * 该模型此刻是否处于临时失败中。
+   *
+   * 到期即删：这就是「到时间自动从失败列表恢复」，不需要定时器扫全表，
+   * 也不需要用户点恢复。
+   *
+   * @param {string} provider - provider id（裸名）。
+   * @param {string} model - model id。
+   * @returns {{until: number, at: number, code: string|null, reason: string, provider: string, model: string}|null} 未到期则返回记录。
+   */
+  function temporaryFailureOf(provider, model) {
+    const key = failKey(provider, model)
+    const entry = temporaryFailures.get(key)
+    if (entry === undefined) return null
+    if (Date.now() >= entry.until) { temporaryFailures.delete(key); return null }
+    return entry
+  }
+
+  /**
+   * 记一次临时失败。
+   *
+   * @param {string} provider - provider id（裸名）。
+   * @param {string} model - model id。
+   * @param {{until: number, reason: string}} hold - `biliThrottleHoldOf` 的结果。
+   * @param {string|null} code - 上游给的错误码，仅用于展示。
+   * @returns {void}
+   */
+  function markTemporaryFailure(provider, model, hold, code) {
+    temporaryFailures.set(failKey(provider, model), {
+      until: hold.until,
+      at: Date.now(),
+      code: code === null || code === undefined ? null : String(code).slice(0, 32),
+      reason: hold.reason,
+      provider,
+      model,
+    })
+  }
+
+  /**
+   * 清掉该模型的临时失败（成功轮与手动恢复都要清）。
+   *
+   * @param {string} provider - provider id。
+   * @param {string} model - model id。
+   * @returns {boolean} 是否真的清掉了一条。
+   */
+  function clearTemporaryFailure(provider, model) {
+    return temporaryFailures.delete(failKey(provider, model))
+  }
+
+  /** 全部临时失败（已过期的先剔掉），供 /status 与失败页展示。 */
+  function listTemporaryFailures() {
+    const now = Date.now()
+    const live = []
+    for (const [key, entry] of temporaryFailures) {
+      if (now >= entry.until) { temporaryFailures.delete(key); continue }
+      live.push(entry)
+    }
+    return live
+  }
+
+  /**
    * 上游用来表达「这条请求本身有问题」的机器码。
    *
    * 各家名字不一样：宿主会给出 CONTEXT_WINDOW_EXCEEDED / INVALID_ARGS，而上游可能
@@ -1659,6 +1787,8 @@ export function apply(ctx, config = {}) {
   function routable(m) {
     if (m.disabled === true) return false
     if (isFailed(m.provider, m.model)) return false
+    // 临时失败（bili 限流闸门等）：到期就自动恢复，不用等到日界，也不用人工点恢复。
+    if (temporaryFailureOf(m.provider, m.model) !== null) return false
     if (m.until && beijingDayKey() > String(m.until)) return false
     if (Array.isArray(m.windows) && m.windows.length > 0) {
       const h = beijingHour()
@@ -1778,7 +1908,12 @@ export function apply(ctx, config = {}) {
         const k = failKey(m.provider, m.model)
         if (seen.has(k)) continue
         seen.add(k)
-        out.push({ provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null, failed: isFailed(m.provider, m.model) })
+        out.push({
+          provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null,
+          failed: isFailed(m.provider, m.model),
+          // 临时失败（bili 限流闸门等）：界面据此显示「N 秒后自动恢复」，与当日失败分开
+          temporaryFailureUntil: temporaryFailureOf(m.provider, m.model)?.until ?? null,
+        })
       }
     }
     return out
@@ -2084,7 +2219,10 @@ export function apply(ctx, config = {}) {
       const member = groupMember(group.id, cur.provider, cur.model)
       // 并发冷却中的模型不算「可用」：这正是「触发到并发时临时切换到组内其它模型」。
       const capacityBlocked = capacityCooldownOf(cur.provider, cur.model) !== null
-      const usable = !capacityBlocked && (member ? routable(member) : !isFailed(cur.provider, cur.model))
+      // 临时失败（bili 限流闸门）同样不算可用：它会到点自动放行，那时才切回来。
+      const temporarilyFailed = temporaryFailureOf(cur.provider, cur.model) !== null
+      const usable = !capacityBlocked && !temporarilyFailed
+        && (member ? routable(member) : !isFailed(cur.provider, cur.model))
       if (usable) {
         await revertCapacitySwitchIfDue(agent, id, group, cur)
         return
@@ -2328,6 +2466,15 @@ export function apply(ctx, config = {}) {
    * 失败，必须继续走分组路由。
    */
   const CODEARTS_POOL_EMPTY = /codearts\s*当前没有可用账号（全部被禁用或冷却中）/
+  /**
+   * 「bili 拒绝转发签名请求」的标记。
+   *
+   * 为什么不能只靠池状态里的 slot.detail 判断：dsh-codearts 的 `classify()` 把这类
+   * 403/400 归成 `client`（不是 `session_dead`），账号因此**不会**被 disable，slots
+   * 全部停在 `ok` 且没有 detail —— 只看 slots 就永远看不出「是签名中间层拒收」。
+   * 失败文案里的这两个标记是 dsh-codearts 自己写进去的原文，最可靠。
+   */
+  const CODEARTS_RESIGN_REFUSAL = /signed_request_requires_resign|bili_resign_unavailable|本地代理\s*billion-context\s*拦下了这条签名请求/
   /** 两次自救之间的最短间隔：重启是重操作，且失败会重复触发 */
   const CODEARTS_REVIVE_COOLDOWN_MS = 30_000
   /** 重启后等 dsh-codearts 适配器重新注册的上限；它的 apply 会走一次模型发现 */
@@ -2501,17 +2648,28 @@ export function apply(ctx, config = {}) {
    *
    * 只在确认为 codearts 失败后调用，用于把「429 没有可用账号」翻译成真正的原因。
    *
+   * @param {{message?: string, code?: string}|undefined} failure - 本次失败的事实；只用来补「签名被拒」的证据。
    * @returns {Promise<{reachable: boolean, slots: Array<{id: string, state: string, detail?: string}>, blockedBySignature: boolean}>}
    */
-  async function readCodeartsPoolState() {
+  async function readCodeartsPoolState(failure) {
     const out = { reachable: false, slots: [], blockedBySignature: false }
+    // 失败文案本身就是最直接的证据，且不依赖状态接口是否可达。
+    out.blockedBySignature = CODEARTS_RESIGN_REFUSAL.test(`${failure?.message ?? ''} ${failure?.code ?? ''}`)
     try {
-      const res = await fetch('http://127.0.0.1:3080/api/codearts/status', { headers: { accept: 'application/json' } })
+      // 本机 /api 一律要鉴权：不带浏览器会话 cookie 时这个接口固定回 401，于是
+      // slots 恒空、blockedBySignature 恒假 —— A0（闸门自愈）与 A（签名拒绝诊断）
+      // 两条分支永远不会触发，B 分支又因 slots 恒空而每次失败都去重启账号池。
+      const cookie = await mintLocalSessionCookie()
+      const headers = { accept: 'application/json' }
+      if (cookie !== null) headers.cookie = cookie
+      const res = await fetch('http://127.0.0.1:3080/api/codearts/status', { headers })
       if (!res.ok) return out
       const body = await res.json()
       out.reachable = true
       out.slots = Array.isArray(body?.usage?.slots) ? body.usage.slots : []
-      out.blockedBySignature = out.slots.some(s => String(s?.detail ?? '').includes('bili_resign_unavailable'))
+      // 两条证据取并集：slot.detail 是账号被停用时的记录，失败文案是每次失败都有的原文。
+      out.blockedBySignature = out.blockedBySignature
+        || out.slots.some(s => CODEARTS_RESIGN_REFUSAL.test(String(s?.detail ?? '')))
     } catch { /* 状态接口不可达时按未知处理 */ }
     return out
   }
@@ -2766,7 +2924,7 @@ export function apply(ctx, config = {}) {
     // 只接管「池里挑不出号」这一类：正常的模型级失败（额度用完、TPM 超限、模型下线）
     // 仍然要落给下面的分组路由，否则 codearts 就再也不会切模型了。
     const poolEmpty = CODEARTS_POOL_EMPTY.test(String(failure?.message ?? ''))
-    const state = await readCodeartsPoolState()
+    const state = await readCodeartsPoolState(failure)
     const disabled = state.slots.filter(s => s.state === 'disabled').length
     const cooling = state.slots.filter(s => s.state === 'cooling').length
     // capped = 账号没坏，只是并发打满了（每个账号 active 已达 max）。它和 disabled/cooling
@@ -3089,7 +3247,18 @@ export function apply(ctx, config = {}) {
     }
     // 请求被拒不写当日失败：这个模型换个请求还能用，停用一整天是错的。
     // 但它必须参与「别的模型为何被跳过」的判断，所以只记 errorTurns 并继续切模型。
-    if (!capacityFailure && !requestRejected) {
+    //
+    // bili 的 429 限流闸门回绝（#4204）同样不能写成当日失败：报文本身就说清了到期
+    // 时刻（`holding outbound sends until <ISO>`），上游到点自己会放行。写进当日失败
+    // 等于凭一条 591 秒的限流把模型停用到下一个日界。改为「临时失败」：带到期时刻，
+    // 到期自动回到候选（temporaryFailureOf 到期即删），期间不参与路由挑选。
+    const throttleHold = biliThrottleHoldOf(failure)
+    if (throttleHold !== null) {
+      markTemporaryFailure(provider, model, throttleHold, failure?.code ?? null)
+      const waitSeconds = Math.max(1, Math.round((throttleHold.until - Date.now()) / 1000))
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 被 bili 限流闸门回绝，临时失败 ${waitSeconds}s 后自动恢复（不写当日失败）`)
+    }
+    if (!capacityFailure && !requestRejected && throttleHold === null) {
       markFailed(provider, model, failure)
       ctx.logger.warn(`[model-failover] ${provider}/${model} 彻底失败（${failure?.code ?? 'unknown'}），已标记为当日失败`)
     }
@@ -3178,13 +3347,17 @@ export function apply(ctx, config = {}) {
   function llmFailureOf(error) {
     const message = typeof error?.message === 'string' ? error.message : ''
     const code = typeof error?.code === 'string' && error.code.length > 0 ? error.code : null
+    const raw = error?.failure
+    // 携带结构化 failure 的错误也是模型链路失败：适配器常在 LlmError 外面再包一层
+    // （例如 AggregateError 里挂着原始 LlmError），只认 name 会把它们整类漏掉，
+    // 用户看到的就是「模型报错但一次都没路由」。
+    const carried = raw !== null && typeof raw === 'object' && typeof raw.code === 'string' ? raw : null
     // name 是 LlmError 自己设的；兜底再认一次 pi-ai 的原话，防止错误被包装过一层
     const isLlmError = error?.name === 'LlmError' && code !== null
-    if (!isLlmError && !/has no configured model/i.test(message)) return null
-    if (code === 'ABORTED') return null
-    const failure = error?.failure
-    if (failure !== null && typeof failure === 'object' && typeof failure.code === 'string') {
-      return { code: failure.code, message: typeof failure.message === 'string' ? failure.message : message }
+    if (!isLlmError && carried === null && !/has no configured model/i.test(message)) return null
+    if (code === 'ABORTED' || carried?.code === 'ABORTED') return null
+    if (carried !== null) {
+      return { code: carried.code, message: typeof carried.message === 'string' ? carried.message : message }
     }
     return { code: code ?? 'UNKNOWN', message }
   }
@@ -3260,9 +3433,14 @@ export function apply(ctx, config = {}) {
       })
       // 只有「重建账号池成功」才值得同一步重试；selection 没变，retry 是安全的。
       if (verdict === 'retry') return { kind: 'retry' }
-      // fallthrough：不是「池挑不出号」，继续走下面的换号 / 分组路由。
-      if (verdict !== 'fallthrough') {
-        // 签名中间层拦截 / 无法自救：重试与换模型都没有意义，直接交给宿主报错。
+      // signature-blocked：bili 拒签与这个**模型**无关，换离 codearts 正是绕开它的唯一
+      // 办法，所以仍然交给分组路由。旧版在这里 endTurn()，用户看到的就是「选了路由，
+      // 但模型报错没有正确路由，会话直接停住」。修 bili 凭据仍是根治手段（诊断里写着），
+      // 但路由不能因此被跳过。
+      if (verdict === 'signature-blocked') {
+        ctx.logger.warn(`[model-failover] ${provider}/${model} 被 bili 拒签，交给分组路由换离 codearts（根治办法见 failureLog 的 detail）`)
+      } else if (verdict !== 'fallthrough') {
+        // unrecoverable：重启账号池也没成功，且没有签名证据，重试与换模型都无意义。
         return endTurn()
       }
     }
@@ -3275,6 +3453,9 @@ export function apply(ctx, config = {}) {
     // routeAfterModelFailure，这里只需要它们来决定要不要走换号分支。
     const capacityFailure = isCapacityFailure(failure)
     const requestRejected = isRequestRejectedFailure(failure)
+    // bili 的限流闸门按「账号+主机」记 hold（dsh-native.js 的 holdKey），换到同渠道另一个
+    // 账号拿到的还是同一条 hold，换号只会白等一轮、还把另一个账号也记上一次失败。
+    const throttleHold = biliThrottleHoldOf(failure)
 
     // Our Free Model 的模型：不论错误类型，一律先试换账号重试。
     // 换的是同一 provider/model 背后的凭据，selection 没变，所以同一步 retry 安全。
@@ -3283,7 +3464,7 @@ export function apply(ctx, config = {}) {
     //
     // 并发类失败不换号：账号池打满时换号拿到的还是同一个池，换模型才有意义。
     // 请求被拒也不换号：模型上限/参数问题与凭据无关，换号只会白等一轮。
-    const handedTo = (capacityFailure || requestRejected)
+    const handedTo = (capacityFailure || requestRejected || throttleHold !== null)
       ? null
       : await handoffToFreeModelAccount(rawProvider, model, failure)
     if (handedTo) {
@@ -3556,6 +3737,11 @@ export function apply(ctx, config = {}) {
       model = active?.model ?? header?.config?.model
     } catch { return }
     if (!provider || !model) return
+    // 临时失败只是「上游让你等一会儿」：本轮成功就说明它已经放行了，立刻清掉，
+    // 不必等那个到期时刻。
+    if (clearTemporaryFailure(provider, model)) {
+      ctx.logger.info(`[model-failover] ${provider}/${model} 本轮成功，已清除临时失败`)
+    }
     if (isFailed(provider, model)) {
       resetFailed(provider, model)
       ctx.logger.info(`[model-failover] ${provider}/${model} 本轮成功，已重置失败状态`)
@@ -3925,6 +4111,11 @@ export function apply(ctx, config = {}) {
             provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null,
             windows: m.windows ?? null, from: m.from ?? null, to: m.to ?? null, until: m.until ?? null,
             disabled: m.disabled === true, failed: isFailed(m.provider, m.model),
+            // 临时失败（bili 限流闸门等）：非 null 表示它此刻被上游要求退避，到期自动恢复
+            temporaryFailure: (() => {
+              const tf = temporaryFailureOf(m.provider, m.model)
+              return tf === null ? null : { until: tf.until, code: tf.code, reason: tf.reason }
+            })(),
             // 生效的并发上限（含 defaultConcurrency）；null = 不限。
             // 想区分「显式配置」与「跟随默认」，查顶层的 modelConcurrency。
             concurrency: (() => {
@@ -3940,6 +4131,11 @@ export function apply(ctx, config = {}) {
           })),
         })),
         failed: failedList.filter(f => f.day === todayKey()).map(f => ({ provider: f.provider, model: f.model, count: f.count, code: f.code ?? null, reason: f.reason ?? null, at: f.at ?? null })),
+        // 临时失败（bili 限流闸门等）：带到期时刻，到点自动从列表消失。与当日失败分开展示，
+        // 因为「等 10 分钟」和「等明天」是两件完全不同的事，混在一张表里会误导处置。
+        temporaryFailures: listTemporaryFailures().map(e => ({
+          provider: e.provider, model: e.model, code: e.code, reason: e.reason, at: e.at, until: e.until,
+        })),
         allModels: getAllModels(),
         sessionGroups: [...sessionBindings.entries()].map(([sessionId, b]) => ({ sessionId, groupId: b.groupId, mode: b.mode })),
         defaultBinding: defaultBinding ? { groupId: defaultBinding.groupId, mode: defaultBinding.groupId ? defaultBinding.mode : null } : null,
@@ -4060,7 +4256,8 @@ export function apply(ctx, config = {}) {
             queued: (waitingByModel.get(key) ?? []).length,
             failed: isFailed(m.provider, m.model),
             disabled: m.disabled === true,
-            // 并发冷却现场：界面据此显示「并发冷却中，约 Ns 后恢复」
+            // 临时失败到期时刻：界面据此显示「限流退避中，约 Ns 后自动恢复」
+            temporaryUntil: temporaryFailureOf(m.provider, m.model)?.until ?? null,
             capacityUntil: cooldown === null ? null : cooldown.until,
             capacityReason: cooldown === null ? null : cooldown.reason,
             // 是否有会话正被从这个模型临时换走
@@ -4488,8 +4685,15 @@ export function apply(ctx, config = {}) {
     if (path === `${API_PATH}/failed/reset` && req.method === 'POST') {
       try {
         const body = JSON.parse((await readBody(req)) || '{}')
-        if (body.provider && body.model) resetFailed(body.provider, body.model)
-        else resetAllFailed()
+        if (body.provider && body.model) {
+          resetFailed(body.provider, body.model)
+          // 「立即重新参与路由」必须同时清临时失败，否则用户点了恢复、界面也显示成功，
+          // 模型却还卡在 bili 限流的到期时刻里。
+          clearTemporaryFailure(body.provider, body.model)
+        } else {
+          resetAllFailed()
+          temporaryFailures.clear()
+        }
         sendJson(res, 200, { ok: true })
       } catch (e) { sendJson(res, 400, { ok: false, error: String(e) }) }
       return

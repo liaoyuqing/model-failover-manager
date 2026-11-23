@@ -1125,6 +1125,30 @@ window.__ModuleLoader__.load({
         apiSend(API + '/groups', 'PUT', { id: groupId, models: models })
           .then(function () { setAddMenu(null); refreshStatus() })
       }
+      /**
+       * 从分组里剔除：`＋` 菜单里已经打勾的那条再点一次就是它。
+       *
+       * 只动这一个分组的模型清单，组内其余模型与它们的优先级都不变——
+       * 与看板的「移除」同一条语义（都是分组级的动作），区别只是入口在模型页签。
+       * 模型同时属于多个分组时要逐个剔除，这是「一个模型可以在多个分组里」的
+       * 直接后果，不在这里替用户一次性删光。
+       */
+      function removeFromGroup(groupId, providerId, modelId) {
+        var g = routeGroups.find(function (x) { return x.id === groupId })
+        if (!g) return
+        var models = g.models || []
+        var rest = models.filter(function (m) { return !(providerSame(m.provider, providerId) && m.model === modelId) })
+        if (rest.length === models.length) { setAddMenu(null); return }
+        apiSend(API + '/groups', 'PUT', { id: groupId, models: rest })
+          .then(function (res) {
+            setAddMenu(null)
+            // 剔除后分组可能空了：留在模型页签看着「已剔除」却找不到原因，不如直接说清。
+            if (res && res.ok && rest.length === 0) {
+              setGroupNotice({ ok: true, text: '「' + g.name + '」里已没有模型，这个分组现在不参与路由' })
+            }
+            return refreshStatus()
+          })
+      }
       function reenable(providerId, modelId) {
         apiSend(API + '/failed/reset', 'POST', { provider: providerId, model: modelId })
           .then(function () { return loadStatus() })
@@ -1221,8 +1245,11 @@ window.__ModuleLoader__.load({
                 var inGroup = (g.models || []).some(function (x) { return x.provider === providerGroup.id && x.model === m.id })
                 return e('div', {
                   key: g.id,
+                  // 已在组内的条目改成「再点一次剔除」：同一个菜单项承担加入与剔除，
+                  // 用户不必先记住自己是怎么加进去的、再去别处找删除入口。
                   style: Object.assign({}, S.addMenuItem, inGroup ? { color: 'var(--dsw-alias-label-dimmed)' } : {}),
-                  onClick: function () { if (!inGroup) addToGroup(g.id, providerGroup.id, m.id) },
+                  title: inGroup ? '再点一次从「' + g.name + '」剔除' : '加入「' + g.name + '」',
+                  onClick: function () { if (inGroup) removeFromGroup(g.id, providerGroup.id, m.id); else addToGroup(g.id, providerGroup.id, m.id) },
                 }, (inGroup ? '✓ ' : '') + g.name + '（' + (g.models || []).length + ' 个模型）')
               }),
               e('div', {
@@ -1508,7 +1535,7 @@ window.__ModuleLoader__.load({
               copied && copied.id === 'lan-base' ? (copied.ok ? '已复制' : '复制失败') : '复制'),
             addresses.length > 1 && e('span', { style: S.channelFact }, '（本机有多个网卡：' + addresses.slice(1).join('  ') + '）')),
           e('div', { style: S.channelFact },
-            '客户端把 model 字段填下面某条路由名即可；兼容 OpenAI 的 /v1/chat/completions 与 /v1/models，不校验密钥。'),
+            '客户端把 model 字段填下面某条路由名即可；兼容 OpenAI 的 /v1/chat/completions、/v1/responses 与 /v1/models，不校验密钥。'),
           gw.startError && e('div', { style: S.channelError }, '上次启动失败：' + gw.startError),
           !wantOn && e('div', { style: S.hint }, '总开关关着。打开它，再打开下面至少一个分组，局域网就能调用。'),
           e('div', { style: S.channelFact }, '累计：请求 ' + (stats.requests ?? 0) + ' · 成功 ' + (stats.ok ?? 0)
@@ -1568,7 +1595,7 @@ window.__ModuleLoader__.load({
                   + (row.ok ? ' · 成功 ' + row.ok : '') + (row.failed ? ' · 失败 ' + row.failed : '')),
                 row && row.active > 0 && e('span', { style: S.channelOk }, '进行中 ' + row.active)),
               open && !on && e('div', { style: S.channelWarn }, '总开关没开，这条路由现在调不通。'),
-              open && on && baseUrl && e('div', { style: S.channelFact }, '调用：POST ' + baseUrl.replace(/\/v1$/, '') + '/v1/chat/completions，body 里 model 填「' + routeName + '」'))
+              open && on && baseUrl && e('div', { style: S.channelFact }, '调用：POST ' + baseUrl.replace(/\/v1$/, '') + '/v1/chat/completions 或 /v1/responses，body 里 model 填「' + routeName + '」'))
           }),
           e('div', { style: S.channelFact }, '最近请求'),
           (!stats.recent || stats.recent.length === 0) && e('div', { style: S.hint }, '还没有局域网请求。'),
@@ -1618,6 +1645,11 @@ window.__ModuleLoader__.load({
                 var cd = m.capacityCooldown || null
                 var cdLeft = cd && typeof cd.until === 'number' ? Math.max(0, Math.round((cd.until - Date.now()) / 1000)) : 0
                 var cooling = cdLeft > 0
+                // 临时失败（bili 限流闸门）：上游让你等一会儿，到期自动恢复。
+                // 与 failed（当日失败）分开渲染——「等 10 分钟」和「等明天」是两件事。
+                var tf = m.temporaryFailure || null
+                var tfLeft = tf && typeof tf.until === 'number' ? Math.max(0, Math.round((tf.until - Date.now()) / 1000)) : 0
+                var throttled = tfLeft > 0
                 // 已失效的块整体压暗；两类原因分别标注，便于分辨
                 var chipStyle = Object.assign({}, S.chip, f ? S.chipFailed : {}, off ? S.chipDisabled : {})
                 return e('span', {
@@ -1627,6 +1659,7 @@ window.__ModuleLoader__.load({
                     f ? '当日失败（不参与路由）' : '',
                     off ? '已手动禁用（不参与路由）' : '',
                     cooling ? '并发已满，临时不参与路由（约 ' + cdLeft + 's 后自动恢复）' + (cd.reason ? '：' + cd.reason : '') : '',
+                    throttled ? '上游限流，临时不参与路由（约 ' + tfLeft + 's 后自动恢复，不写当日失败）' + (tf.reason ? '：' + tf.reason : '') : '',
                   ]
                     .filter(Boolean).join('；') || '点击右侧按钮可标记失败或禁用',
                 },
@@ -1640,6 +1673,13 @@ window.__ModuleLoader__.load({
                       color: 'var(--dsw-alias-state-warn-label)',
                     },
                   }, '并发 ' + cdLeft + 's'),
+                  throttled && e('span', {
+                    style: {
+                      fontSize: '10px', padding: '0 4px', borderRadius: '3px',
+                      background: 'var(--dsw-alias-state-warn-tertiary)',
+                      color: 'var(--dsw-alias-state-warn-label)',
+                    },
+                  }, '限流 ' + tfLeft + 's'),
                   f && e('span', { style: { fontSize: '10px', opacity: .8 } }, '✕'),
                   // 上移/下移：一步一位。首/末位没有可去的方向，按钮压暗并禁用，
                   // 而不是点了没反应——那样看起来像坏了
@@ -2776,7 +2816,23 @@ window.__ModuleLoader__.load({
 
       function failedTab() {
         var reasonLimit = 90
+        // 临时失败（bili 限流闸门等）：带到期时刻，到点自动从列表消失，不需要用户操作。
+        // 与当日失败分开成两块——把它们混进同一张表会让人以为要等日界才恢复。
+        var tempList = (status && status.temporaryFailures) || []
+        var tempRows = tempList.map(function (t) {
+          var left = typeof t.until === 'number' ? Math.max(0, Math.round((t.until - Date.now()) / 1000)) : 0
+          return e('div', { key: 'tmp-' + keyOf(t.provider, t.model), style: S.row }, 
+            e('span', { style: { flex: 1, fontSize: '12px' } },
+              t.provider + '/' + t.model + (left > 0 ? '（约 ' + left + 's 后自动恢复）' : '（即将恢复）')),
+            t.code && e('span', {
+              style: { fontSize: '10px', fontFamily: 'monospace', padding: '1px 5px', borderRadius: '3px', border: '0.5px solid var(--dsw-alias-border-l2)', opacity: .8 },
+              title: '错误码',
+            }, String(t.code)))
+        })
         return e('div', { style: S.pane },
+          tempRows.length > 0 && e('div', { style: { marginBottom: '10px' } },
+            e('div', { style: S.hint }, '上游限流退避（bili 限流闸门等）：这类失败自带到期时刻，到时间自动恢复并重新参与路由，不计入当日失败，也不需要手动恢复。'),
+            tempRows),
           e('div', { style: S.hint }, '当日（按北京时间）彻底失败（所有重试耗尽）的模型不会参与路由；每天 ' + dayBoundaryText(status) + ' 自动重置，或点「恢复」立即重新启用。下面记录最近一次失败的原因（重启后保留，仅当日可见）。'),
           failedList.length === 0 && e('div', { style: S.hint }, '当日暂无失败模型。'),
           failedList.length > 0 && e('button', {

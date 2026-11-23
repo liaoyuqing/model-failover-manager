@@ -20,6 +20,16 @@
  */
 
 const PENDING_TTL_MS = 120_000
+/**
+ * 归还 wasm 上下文前的宽限期。
+ *
+ * adapter 遇到 409 `duplicate_request`（`qoder-adapter.js` 的 `duplicateRetried`
+ * 分支）会 `continue` 重发**同一条加密请求** —— 也就是同一个 rid 第二次打进来。
+ * 若第一次转发后就 free 掉 context，那次重发必然撞上已释放的实例：wasm 直接
+ * trap，本 shim 回 502，adapter 把它归成不可重试的失败。所以释放推迟一小段，
+ * 期间同一条 rid 再进来还能正常重新加密。
+ */
+const RELEASE_GRACE_MS = 5_000
 const PENDING_MAX = 256
 
 /**
@@ -221,6 +231,14 @@ export function resolveQoderWasmPath(explicit) {
 const STATE_KEY = '__mfQoderShim'
 
 /**
+ * 挂在加密器实例上的「被推迟的释放」回调。
+ *
+ * 用 Symbol 而不是普通属性名：实例来自别人的包，普通属性可能与上游字段冲突。
+ * 存在即表示本 shim 曾把一次 `dispose()` 推迟到用完为止。
+ */
+const RELEASE_KEY = Symbol.for('mf.qoder.deferredRelease')
+
+/**
  * 取一条消息的正文文本（字符串或分段数组都摊平成字符串）。
  *
  * @param message 一条 OpenAI message
@@ -299,7 +317,255 @@ function contentCharsOf(messages) {
 }
 
 
+/**
+ * 修 pack.js 里 `withStrings` 释放**输入**字符串的缺陷 —— 这是 `ofm-qoder` 请求
+ * 报「unreachable」的真正成因，与账号、网络、模型无关。
+ *
+ * `writeString` 走 `__wbindgen_export2` 分配内存，把指针交给 Rust 侧导出函数作输入，
+ * 所有权在**调用时**已转移给 Rust。JS 再从 `finally` 里用 `__wbindgen_export4(ptr,len,1)`
+ * 释放一遍，会把 Rust 堆的分配元数据写坏：当场未必报错，**下一次** wasm 调用才 trap 出
+ * `RuntimeError: unreachable`（或 `memory access out of bounds`）。
+ *
+ * 同一份 wasm 二进制（SHA-256 与 pack.js 附带的那份完全一致）在 Providers Hub 的 glue
+ * `qoder-wasm.js` 里对此有明确记载：「绝不可拿它对 `qodercontext_new` 的输入字符串调用
+ * ……手工释放会当场 trap `unreachable`（实测）」。该实现从不释放输入串，只释放 result。
+ * 所以 `caa-qoder` 能跑而 `ofm-qoder` 几乎全废 —— 两处是同渠道、不同 glue。
+ *
+ * 补的是**别人的包**，所以只在能唯一定位那一段时动手；上游自更新会整份覆盖 pack.js，
+ * 故每次装载都核对一次（与 `ensurePackHook` 同一套机制）。
+ *
+ * @param packPath pack.js 的绝对路径
+ * @returns {{state: string, detail: string}} state 取 ok / repaired / skipped / failed
+ */
+function ensurePackStringFix(packPath) {
+  const MARK = '输入串所有权在调用时已归 Rust'
+  let text
+  try {
+    text = readFileSync(packPath, 'utf8')
+  } catch (err) {
+    return { state: 'skipped', detail: '读不到 pack.js：' + (err && err.code ? err.code : String(err)) }
+  }
+  if (text.includes(MARK)) return { state: 'ok', detail: '输入串释放已修（标记已在）' }
+  // 这份构建没有 `withStrings` 辅助函数（`prepareInfer` 里内联 writeString），
+  // 因此不存在「在 finally 里释放输入串」这个缺陷。这一条必须与「找不到待修片段」
+  // 区分开：前者是**不需要修**，报告成 skipped 会让人以为补丁没生效。
+  if (!text.includes('withStrings')) {
+    const frees = (text.match(/__wbindgen_export4/g) ?? []).length
+    // 唯一合法的调用是 callString 里释放 Rust 新分配的输出串。
+    if (frees <= 1) {
+      return { state: 'ok', detail: '本构建没有 withStrings，输入串本就不释放（无需修补）' }
+    }
+  }
+  const bad = '      for (let i = 0; i < pointers.length; i++) freeString(pointers[i], lengths[i]);'
+  const count = text.split(bad).length - 1
+  if (count !== 1) {
+    return { state: 'skipped', detail: '待修片段出现 ' + count + ' 次（无法唯一定位）' }
+  }
+  // 整段重写而不是只删那一行：留着空的 `try/finally` 会让这个函数读起来像还在释放，
+  // 下一个人很容易把释放加回去。新写法的契约写在注释里。
+  const block = [
+    '  const withStrings = (texts, invoke) => {',
+    '    const pointers = [];',
+    '    const lengths = [];',
+    '    try {',
+    '      for (const text of texts) {',
+    '        pointers.push(writeString(text));',
+    '        lengths.push(lastLength);',
+    '      }',
+    '      return invoke(pointers, lengths);',
+    '    } finally {',
+    bad,
+    '    }',
+    '  };',
+  ].join('\n')
+  const good = [
+    '  const withStrings = (texts, invoke) => {',
+    '    const pointers = [];',
+    '    const lengths = [];',
+    '    for (const text of texts) {',
+    '      pointers.push(writeString(text));',
+    '      lengths.push(lastLength);',
+    '    }',
+    '    // ' + MARK + '（writeString → __wbindgen_export2）；JS 再释放一遍会打坏',
+    '    // Rust 堆的分配元数据，下一次 wasm 调用即 trap `unreachable`。故不在输入侧释放。',
+    '    // 本段由 model-failover-manager 的 qoder shim 补丁写入；上游发布包会整份覆盖它。',
+    '    return invoke(pointers, lengths);',
+    '  };',
+  ].join('\n')
+  const whole = text.split(block).length - 1
+  const patched = whole === 1 ? text.replace(block, good) : text.replace(bad, good.slice(good.indexOf('    // '), good.indexOf('    return invoke')))
+  try {
+    writeFileSync(packPath, patched, 'utf8')
+  } catch (err) {
+    return { state: 'failed', detail: '写入失败：' + (err && err.message ? err.message.slice(0, 80) : String(err)) }
+  }
+  return { state: 'repaired', detail: '已修输入串释放，从下一次宿主启动起生效（重载插件前需重启）' }
+}
+
 /** 停服宽限：先停止监听，既有连接自然收尾；超时再强拆，避免端口长期被占。 */
+/**
+ * 从 pack.js 文本里摘掉一段本模块装过的 `} finally { ... }` 归还块。
+ *
+ * 不能写成 `[\s\S]*?` 从文件头扫：`buildRequest` 之前还有别的 `} finally {`，
+ * 惰性量词会把整个文件前段吞进去。这里以标记行为锚，先向上找到紧邻的
+ * `} finally {`，再向下找到与它配对的 `}`（按缩进判定 `      }`），只摘这一段。
+ *
+ * @param text pack.js 全文
+ * @param mark 块内注释里的标记行文案（不含 `// ` 前缀）
+ * @returns 摘掉该块后的文本；无法唯一定位时返回 null
+ */
+function stripContextBlock(text, mark) {
+  const MARK_LINE = '        // ' + mark + '：本类没有 dispose'
+  const at = text.indexOf(MARK_LINE)
+  if (at < 0) return null
+  if (text.indexOf(MARK_LINE, at + 1) >= 0) return null
+  const head = '      } finally {\n'
+  const headAt = text.lastIndexOf(head, at)
+  if (headAt < 0) return null
+  const tail = '\n      }\n'
+  const tailAt = text.indexOf(tail, at)
+  if (tailAt < 0) return null
+  // 头尾之间不该再夹另一个 `} finally {`（那说明锚到了别的块）。
+  if (text.slice(headAt + head.length, tailAt).includes(head)) return null
+  return text.slice(0, headAt) + text.slice(tailAt + tail.length)
+}
+
+/**
+ * 让 pack.js 在每次推理后归还 wasm 的 `QoderContext`。
+ *
+ * `QoderEncryptedInfer` 这个内联类**没有 dispose**（类体只有 constructor / static create /
+ * prepareInfer），而 `buildRequest` 每次推理都 `create()` 一个新上下文。不归还就是每次
+ * 推理泄漏一个上下文（实测 40 KB 正文约 8.5 KB/次，线性增长）。
+ *
+ * 只释放 context，绝不动 `create` 的输入字符串：那些所有权已归 Rust，手工释放会当场
+ * trap `unreachable` —— 这正是本文件另一处补丁（`ensurePackStringFix`）在修的反向错误。
+ *
+ * 补的是别人的包，所以只在能唯一定位那一小段时动手；上游整份覆盖 pack.js 后,
+ * 每次装载都会重新核对一次。
+ *
+ * @param packPath pack.js 的绝对路径
+ * @returns {{state: string, detail: string}} state 取 ok / repaired / skipped / failed
+ */
+function ensurePackContextFree(packPath) {
+  const MARK = 'QoderContext 延迟归还（__wbg_qodercontext_free）'
+  /** v1 的标记：它在 `buildRequest` 的 finally 里立刻归还，会让 shim 的二次加密 trap。 */
+  const MARK_V1 = 'QoderContext 归还（__wbg_qodercontext_free）'
+  let text
+  try {
+    text = readFileSync(packPath, 'utf8')
+  } catch (err) {
+    return { state: 'skipped', detail: '读不到 pack.js：' + (err && err.code ? err.code : String(err)) }
+  }
+  if (text.includes(MARK)) return { state: 'ok', detail: 'context 延迟归还已装（标记已在）' }
+  const bad = '        business: { type: "agent" }\n      });\n    };'
+  // 补丁要把 `return client.prepareInfer({` 一起包进 try，否则 finally 无处可挂。
+  const openOld = '      return client.prepareInfer({'
+  const openNew = '      try {\n        return client.prepareInfer({'
+  // v1 已就地装过：整段退回原样（含它加的那个 `try {`），否则 `bad` 定位不到，
+  // 而残留的 `try` 没有 finally 就是语法错误。必须先退回、再定位。
+  // 两份 pack 构建对那段注释的折行不同，所以按「标记 → 就近的 finally 起头」定位，
+  // 不能用 `[\s\S]*?` 从文件头扫：buildRequest 之前还有别的 `} finally {`。
+  if (text.includes(MARK_V1)) {
+    const rolled = stripContextBlock(text, MARK_V1)
+    if (rolled === null) {
+      return { state: 'skipped', detail: 'v1 归还块出现多次或格式漂移，无法安全改写' }
+    }
+    text = rolled.split(openNew).join(openOld)
+  }
+  const count = text.split(bad).length - 1
+  if (count !== 1) {
+    return { state: 'skipped', detail: '待修片段出现 ' + count + ' 次（无法唯一定位）' }
+  }
+  const good = [
+    '        business: { type: "agent" }',
+    '      });',
+    '      } finally {',
+    '        // ' + MARK + '：本类没有 dispose，context 只能在真正用完时还回去。',
+    '        // ⚠️ 不能在这里立刻归还：本实例会被 qoder shim 借出，等 bili 压缩完再用**同一实例**',
+    '        // 重新 prepareInfer；context 一释放，那次调用就 trap `unreachable`（实测）。',
+    '        // 故把归还挂到实例上（Symbol.for 与 shim 的 RELEASE_KEY 同一个键），由 release() 执行；',
+    '        // 独立使用 pack（没有 shim）时不会执行 —— 与本类原本从不释放的行为一致，不算回归。',
+    '        try {',
+    "          const releaseKey = Symbol.for('mf.qoder.deferredRelease')",
+    '          if (client.context && client[releaseKey] === void 0) {',
+    '            const owned = client.context',
+    '            client[releaseKey] = () => { try { client.g.exports.__wbg_qodercontext_free(owned, 0) } catch { /* 已释放过 */ } }',
+    '          }',
+    '        } catch { /* 冻结实例：退回不释放，与本类原行为一致 */ }',
+    '      }',
+    '    };',
+  ].join('\n')
+  if (text.split(openOld).length - 1 !== 1) {
+    return { state: 'skipped', detail: '找不到唯一的 `return client.prepareInfer({`' }
+  }
+  const patched = text.replace(openOld, openNew).replace(bad, good)
+  try {
+    writeFileSync(packPath, patched, 'utf8')
+  } catch (err) {
+    return { state: 'failed', detail: '写入失败：' + (err && err.message ? err.message.slice(0, 80) : String(err)) }
+  }
+  return { state: 'repaired', detail: '已装 context 延迟归还，从下一次宿主启动起生效（重载插件前需重启）' }
+}
+
+/**
+ * 让 pack.js 归还每次推理的 `requestresult` 结构。
+ *
+ * `prepareInfer` 拿到 Rust 新分配的 `result` 后只读 url/headers/body，**从不释放它**。
+ * 那个结构体的所有权在导出调用返回时已交给 JS，不还回去就是每次推理泄漏一整个
+ * result —— 实测 40 KB 正文约 55 KB/次，比 context 泄漏大一个量级。
+ *
+ * 与 `ensurePackContextFree` 是一对：那个还 context（较小），这个还 result（较大）。
+ * 两者都只释放 Rust 新分配的对象，绝不碰 `create` 的输入串。
+ *
+ * @param packPath pack.js 的绝对路径
+ * @returns {{state: string, detail: string}} state 取 ok / repaired / skipped / failed
+ */
+function ensurePackResultFree(packPath) {
+  const MARK = 'requestresult 归还（__wbg_requestresult_free）'
+  let text
+  try {
+    text = readFileSync(packPath, 'utf8')
+  } catch (err) {
+    return { state: 'skipped', detail: '读不到 pack.js：' + (err && err.code ? err.code : String(err)) }
+  }
+  if (text.includes(MARK)) return { state: 'ok', detail: 'result 归还已装（标记已在）' }
+  const openOld = '    return {\n      // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反'
+  const count = text.split(openOld).length - 1
+  if (count !== 1) {
+    return { state: 'skipped', detail: '待修片段出现 ' + count + ' 次（无法唯一定位）' }
+  }
+  const openNew = [
+    '    try {',
+    '      return {',
+    '      // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反',
+  ].join('\n')
+  const closeOld = [
+    '      body: readResultString((stack, ptr) => g.exports.requestresult_body(stack, ptr))',
+    '    };',
+    '  }',
+  ].join('\n')
+  if (text.split(closeOld).length - 1 !== 1) {
+    return { state: 'skipped', detail: '找不到唯一的 result 读取块结尾' }
+  }
+  const closeNew = [
+    '      body: readResultString((stack, ptr) => g.exports.requestresult_body(stack, ptr))',
+    '    };',
+    '    } finally {',
+    '      // ' + MARK + '：Rust 新分配的结构，所有权已交给 JS，不还会每次推理泄漏一个。',
+    '      // 只释放 result，不碰 create 的输入串（那些所有权已归 Rust）。',
+    '      try { if (result) g.exports.__wbg_requestresult_free(result, 0) } catch { /* 释放失败不影响本次请求 */ }',
+    '    }',
+    '  }',
+  ].join('\n')
+  const patched = text.replace(openOld, openNew).replace(closeOld, closeNew)
+  try {
+    writeFileSync(packPath, patched, 'utf8')
+  } catch (err) {
+    return { state: 'failed', detail: '写入失败：' + (err && err.message ? err.message.slice(0, 80) : String(err)) }
+  }
+  return { state: 'repaired', detail: '已装 result 归还，从下一次宿主启动起生效（重载插件前需重启）' }
+}
+
 /**
  * 在 dsh-our-free-model 的打包产物里补回「暴露加密器」那一行。
  *
@@ -502,11 +768,71 @@ function createImpl(context) {
   // 换一张空表会让它们全部命中 410。
   const pending = context.pending instanceof Map ? context.pending : new Map()
 
+  /**
+   * 借出未归还的加密器实例（WeakSet，不阻止 GC）。
+   *
+   * adapter 的 `buildRequest` 一旦 `return client.prepareInfer(...)` 就会在 `finally`
+   * 里 `client.dispose()`，而本 shim 要等 bili 压缩完（一次网络往返）才重新加密。
+   * 这中间那个 wasm `QoderContext` 不能被释放，所以 prepare 时把它登记为「借出」，
+   * 由 `release()` 归还时才真正 dispose。
+   */
+  const borrowed = context.borrowed instanceof WeakSet ? context.borrowed : new WeakSet()
+  /**
+   * 推迟释放：登记借出。
+   *
+   * dispose 本身已被 `startQoderShim` 里的包装换成「借出中就推迟」，本函数只记账。
+   *
+   * @param instance 正在被本 shim 使用的加密器实例
+   */
+  const retain = (instance) => {
+    if (instance === null || typeof instance !== 'object') return
+    borrowed.add(instance)
+  }
+  /**
+   * 归还并真正释放。
+   *
+   * 幂等：被 dispose 包装推迟过的那次释放会被重放一次，重复调用无害
+   *（`QoderEncryptedInfer.dispose` 自带 `disposed` 护栏）。
+   *
+   * @param instance 已用完的加密器实例
+   */
+  const release = (instance) => {
+    if (instance === null || typeof instance !== 'object') return
+    borrowed.delete(instance)
+    const deferred = instance[RELEASE_KEY]
+    if (typeof deferred === 'function') {
+      try { deferred() } catch { /* 清理失败不影响本次请求的结论 */ }
+    }
+  }
+
   const sweep = () => {
     const now = Date.now()
     for (const [rid, entry] of pending) {
-      if (now - entry.at > PENDING_TTL_MS || pending.size > PENDING_MAX) pending.delete(rid)
+      if (now - entry.at > PENDING_TTL_MS || pending.size > PENDING_MAX) {
+        pending.delete(rid)
+        // 过期条目的加密器实例再也不会被 handle 用到：现在归还，否则它的
+        // wasm `QoderContext` 会一直占着（adapter 那次 dispose 已被推迟）。
+        if (entry.releaseTimer !== undefined) clearTimeout(entry.releaseTimer)
+        release(entry.self)
+      }
     }
+  }
+
+  /**
+   * 延后归还：给 adapter 的 409 重发留一次重新加密的机会。
+   *
+   * 立刻 free 会让同一条 rid 的第二次请求撞上已释放的 context（wasm trap）。
+   * 定时器 `unref()`，不因此把进程留住。
+   *
+   * @param entry pending 表里的条目
+   */
+  const releaseLater = (entry) => {
+    if (entry.releaseTimer !== undefined) clearTimeout(entry.releaseTimer)
+    entry.releaseTimer = setTimeout(() => {
+      entry.releaseTimer = undefined
+      release(entry.self)
+    }, RELEASE_GRACE_MS)
+    if (typeof entry.releaseTimer.unref === 'function') entry.releaseTimer.unref()
   }
 
   /**
@@ -655,6 +981,9 @@ function createImpl(context) {
     try {
       const body = askToOpenAiBody(ask)
       if (!Array.isArray(body.messages) || body.messages.length === 0) throw new Error('empty messages')
+      // 从这里到 handle 里 `release()` 之间，adapter 的 finally 可能随时 dispose 这个
+      // 实例；先登记为借出，那一次 dispose 会被包装推迟到我们用完为止。
+      retain(self)
       rid = randomUUID()
       pending.set(rid, {
         self, ask, original, at: Date.now(), used: 0,
@@ -683,6 +1012,8 @@ function createImpl(context) {
       }
     } catch (err) {
       if (rid !== null) pending.delete(rid)
+      // 登记了借出但没能走到 handle（没有 bili 往返），现在就该归还。
+      release(self)
       stats.fallback += 1
       stats.lastError = 'prepareInfer 直通：' + (err && err.message ? err.message : String(err))
       return original.call(self, ask)
@@ -712,6 +1043,11 @@ function createImpl(context) {
       }
       // 不删条目：adapter 遇到 409 duplicate_request / 排队后会原样重发，rid 必须还能命中。
       entry.used += 1
+      // 上一轮已经排了延后归还：这次还要用同一个实例重新加密，先撤销。
+      if (entry.releaseTimer !== undefined) {
+        clearTimeout(entry.releaseTimer)
+        entry.releaseTimer = undefined
+      }
       let body = null
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { body = null }
       const messages = body !== null && Array.isArray(body.messages) ? body.messages : null
@@ -764,10 +1100,23 @@ function createImpl(context) {
       })
       if (stats.recentExchanges.length > 6) stats.recentExchanges.splice(0, stats.recentExchanges.length - 6)
       const nextAsk = body === null ? null : applyCompressedBody(entry.ask, body)
+      // ⚠️ 不能在 `entry.self` 上重新加密：adapter 的 `buildRequest` 用 try/finally
+      // 包着 `client.prepareInfer(...)`，`finally` 里 `client?.dispose()` 把 wasm
+      // `QoderContext` 立刻释放了（那是它防止堆只增不减的正确做法）。而本 shim 的
+      // 「重新加密」发生在**之后**（要等 bili 压缩完把请求送回来），此时那个实例
+      // 必然已 disposed，`prepareInfer` 会直接抛
+      // `qoder: QoderEncryptedInfer 已 dispose，不能再次 prepareInfer`
+      // —— 这正是 /status 里 `intercepted:5 / forwarded:0 / fallback:5` 的成因。
+      //
+      // 修法不是「另造一个实例」（`create()` 需要 uid/machineId，而它们只在 wasm
+      // context 里，实例上取不到），而是**把 dispose 推迟到本 shim 用完**：
+      // `prepare` 时把实例登记为在用，`release()` 时才让它真正 free（见 startQoderShim
+      // 里对 dispose 的包装）。这样 adapter 的 finally 照常调用 dispose，只是不生效。
       let real = null
       try {
         real = entry.original.call(entry.self, nextAsk === null ? entry.ask : nextAsk)
       } catch (err) {
+        releaseLater(entry)
         stats.fallback += 1
         stats.lastError = '重新加密失败：' + (err && err.message ? err.message : String(err))
         res.writeHead(502, { 'content-type': 'application/json' })
@@ -776,11 +1125,14 @@ function createImpl(context) {
       }
       stats.forwarded += 1
       stats.lastAt = Date.now()
+      // 转发结束后才允许真正释放：`forward` 已经把 real 的字节全部读进内存了。
+      // 用延后归还而不是立刻释放，给 adapter 的 409 重发留一次机会。
+      releaseLater(entry)
       forward(real, res)
     })
   }
 
-  return { origin, prepare, handle, pending }
+  return { origin, prepare, handle, pending, retained: borrowed, retain, release }
 }
 
 
@@ -893,28 +1245,78 @@ export async function startQoderShim(options) {
   // 的实际安装副本），宿主只 import 其中一份，所以全部核对：任何一份缺注入口，
   // 都可能在下次宿主重启后才轮到它生效。
   const hookChecks = []
+  // 两个独立的补丁都要核对：注入口（让本 shim 拿得到加密器）与输入串释放
+  //（让那个加密器本身不会把 wasm 堆打坏）。后者缺了，注入口再全也没用 ——
+  // 每次 prepareInfer 都会在下一次 wasm 调用 trap `unreachable`。
+  const stringChecks = []
+  // 第三处：每次推理新建的 wasm `QoderContext` 要归还，否则堆线性增长直到耗尽。
+  // 它与输入串释放是一对反向错误：一个漏放（泄漏），一个多放（trap），都要修。
+  const contextChecks = []
+  // 第四处：`requestresult` 结构本身也要归还，它是每次推理泄漏量最大的一处。
+  const resultChecks = []
   {
     const packs = resolvePackPaths()
     if (packs.length === 0) {
       hookChecks.push({ scope: '-', state: 'skipped', detail: '没找到 dsh-our-free-model/vendor/channel-pack/pack.js' })
+      stringChecks.push({ scope: '-', state: 'skipped', detail: '没找到 pack.js' })
+      contextChecks.push({ scope: '-', state: 'skipped', detail: '没找到 pack.js' })
+      resultChecks.push({ scope: '-', state: 'skipped', detail: '没找到 pack.js' })
     } else {
       for (const p of packs) {
         const result = ensurePackHook(p.path)
         hookChecks.push({ scope: p.scope, path: p.path, ...result })
+        const fixed = ensurePackStringFix(p.path)
+        stringChecks.push({ scope: p.scope, path: p.path, ...fixed })
+        const freed = ensurePackContextFree(p.path)
+        contextChecks.push({ scope: p.scope, path: p.path, ...freed })
+        const resultFreed = ensurePackResultFree(p.path)
+        resultChecks.push({ scope: p.scope, path: p.path, ...resultFreed })
       }
     }
   }
-  /** 取最严重的状态作为对外结论：repaired/failed 优先于 ok，ok 优先于 skipped。 */
-  const worst = (() => {
+  /**
+   * 输入串释放补丁的对外结论。
+   *
+   * 与 `hookRepair` 分开报：这两件事的修法不同（一个补一行注入，一个改一段 finally），
+   * 合成一条会让人以为「注入口 ok」就代表 qoder 能跑 —— 恰恰不是。
+   */
+  const worstOf = (checks) => {
     const rank = { failed: 5, 'pending-restart': 4, repaired: 3, stale: 2, skipped: 1, ok: 0 }
-    let pick = hookChecks[0]
-    for (const c of hookChecks) {
+    let pick = checks[0]
+    for (const c of checks) {
       if ((rank[c.state] ?? 0) > (rank[pick.state] ?? 0)) pick = c
     }
     return pick
-  })()
+  }
+  const stringRepair = {
+    state: stringChecks.length === 1 ? stringChecks[0].state : worstOf(stringChecks).state,
+    detail: stringChecks.map((c) => c.scope + ': ' + c.detail).join('；'),
+    copies: stringChecks.map((c) => ({ scope: c.scope, state: c.state })),
+  }
+  /**
+   * wasm 堆归还补丁的对外结论。
+   *
+   * 与输入串修复分开报：那个是「别多放」（多放会 trap），这个是「别漏放」（漏放会
+   * 线性增长到耗尽）。两者都 ok 才代表这个加密器长期可用。
+   */
+  const contextRepair = {
+    state: contextChecks.length === 1 ? contextChecks[0].state : worstOf(contextChecks).state,
+    detail: contextChecks.map((c) => c.scope + ': ' + c.detail).join('；'),
+    copies: contextChecks.map((c) => ({ scope: c.scope, state: c.state })),
+  }
+  /**
+   * `requestresult` 归还补丁的对外结论。
+   *
+   * 与 context 归还分开报：context 小（每次约 8.5 KB），result 大（实测 40 KB 正文约
+   * 55 KB/次）；只修一个，堆仍然会涨到耗尽。
+   */
+  const resultRepair = {
+    state: resultChecks.length === 1 ? resultChecks[0].state : worstOf(resultChecks).state,
+    detail: resultChecks.map((c) => c.scope + ': ' + c.detail).join('；'),
+    copies: resultChecks.map((c) => ({ scope: c.scope, state: c.state })),
+  }
   const hookRepair = {
-    state: hookChecks.length === 1 ? hookChecks[0].state : worst.state,
+    state: hookChecks.length === 1 ? hookChecks[0].state : worstOf(hookChecks).state,
     detail: hookChecks.map((c) => c.scope + ': ' + c.detail).join('；'),
     copies: hookChecks.map((c) => ({ scope: c.scope, state: c.state })),
   }
@@ -967,8 +1369,29 @@ export async function startQoderShim(options) {
   stats.targets = collected.targets.map((t) => t.label)
   stats.notes = collected.notes
   stats.hookRepair = hookRepair
+  stats.stringRepair = stringRepair
+  stats.contextRepair = contextRepair
+  stats.resultRepair = resultRepair
+  // 一个长期可用的 qoder 加密器需要**四个**补丁都在：注入口让它可见，输入串修复让它
+  // 不 trap（多放了会立刻炸），context 与 result 归还让它不漏（漏放了会线性增长到耗尽，
+  // result 比 context 大一个量级）。只报告其一，会让人以为「已接管」就等于「能用」。
+  const worst = worstOf([...stringChecks, ...contextChecks, ...resultChecks])
+  stats.wasmFixState = worst.state === 'repaired' || worst.state === 'pending-restart'
+    ? 'needs-restart'
+    : worst.state === 'failed'
+      ? 'failed'
+      : worst.state === 'ok'
+        ? 'ok'
+        : 'unknown'
   // 沿用上一轮的 pending：在途请求的 rid 属于上一轮的 prepare。
-  const impl = createImpl({ port, stats, pending: previous !== undefined && previous.impl !== undefined ? previous.impl.pending : null })
+  // `borrowed` 也要沿用：热替换发生在请求中途时，那些实例必须仍被认作「借出」，
+  // 否则 adapter 的 dispose 会在新 impl 里立刻生效，打成已释放的 context。
+  const impl = createImpl({
+    port,
+    stats,
+    pending: previous !== undefined && previous.impl !== undefined ? previous.impl.pending : null,
+    borrowed: previous !== undefined && previous.impl !== undefined ? previous.impl.retained : null,
+  })
 
   /**
    * 装 dispatcher（幂等）。dispatcher 不随重载更换：它只读全局状态槽，重载时换掉
@@ -986,6 +1409,49 @@ export async function startQoderShim(options) {
   }
 
   const patched = previous !== undefined && Array.isArray(previous.patched) ? previous.patched : []
+
+  /**
+   * 把目标原型上的 `dispose` 换成「借出中则推迟」版本（幂等）。
+   *
+   * adapter 的 `buildRequest` 是 `try { return client.prepareInfer(...) } finally
+   * { client?.dispose() }` —— `finally` 在 `return` 求值**之后**立刻跑，于是它把
+   * wasm `QoderContext` 释放掉了，而本 shim 要等 bili 压缩完才重新加密。那一步必然抛
+   * `qoder: QoderEncryptedInfer 已 dispose，不能再次 prepareInfer`。
+   *
+   * 直接改 adapter 不可行（它在别人的包里），但加密器的 `dispose` 在我们手上：借出期间
+   * 只把释放动作记到实例的 {@link RELEASE_KEY} 上，`release()` 时再真正执行。adapter
+   * 的清理语义因此保持不变（它仍然调用 dispose，只是我们决定了生效时机）。
+   *
+   * pack.js 内联的那份类**没有** dispose（它从不释放），所以这里可能无事可做 ——
+   * 那种情况下的泄漏由输入串修复后的正常单次分配能力覆盖，不需要额外处理。
+   *
+   * @param entry patched 里的一条记录（holder 为承载 prepareInfer 的原型对象）
+   */
+  const ensureDeferredDispose = (entry) => {
+    const holder = entry.holder
+    if (entry.disposeBox !== undefined) {
+      // holder 可能随重载换成新的原型对象：装到新对象上，但保留最初的实现。
+      if (holder.dispose === entry.disposeBox.fn) return
+      try { holder.dispose = entry.disposeBox.fn } catch { return }
+      return
+    }
+    let original
+    try { original = holder.dispose } catch { return }
+    if (typeof original !== 'function') return
+    const box = { original, fn: null }
+    box.fn = function mfQoderDeferredDispose(...args) {
+      const state = globalThis[STATE_KEY]
+      const retained = state === undefined || state.impl === undefined ? undefined : state.impl.retained
+      if (retained instanceof WeakSet && retained.has(this)) {
+        // 借出中：这次释放推迟到 release()，否则后面的重新加密会拿到已释放的 context。
+        try { this[RELEASE_KEY] = () => box.original.apply(this, args) } catch { /* 冻结对象：退回立即释放 */ }
+        try { if (this[RELEASE_KEY] !== undefined) return } catch { /* 同上是只读实例 */ }
+      }
+      return box.original.apply(this, args)
+    }
+    try { holder.dispose = box.fn } catch { return }
+    entry.disposeBox = box
+  }
 
   /**
    * 把一个目标挂上 dispatcher。重复调用安全：同一个 label 只保留一条记录。
@@ -1008,6 +1474,7 @@ export async function startQoderShim(options) {
     // 且最终 502。只有拿到的确实是别人实现的函数时才更新 box.original。
     if (original !== existing.fn) existing.box.original = original
     ensureDispatcher(existing)
+    ensureDeferredDispose(existing)
   }
   for (const t of collected.targets) patchTarget(t.label, t.holder, t.original)
 
@@ -1154,10 +1621,24 @@ export async function startQoderShim(options) {
     }
     for (const p of patched) {
       try { if (p.holder !== undefined && p.holder.prepareInfer === p.fn) p.holder.prepareInfer = p.box.original } catch { /* 还原失败不影响进程退出 */ }
+      // dispose 包装同样要撤：留着它会让「借出」之外的释放路径仍走我们的分支。
+      if (p.disposeBox !== undefined) {
+        try { if (p.holder.dispose === p.disposeBox.fn) p.holder.dispose = p.disposeBox.original } catch { /* 同上 */ }
+      }
     }
     if (reconcile.timer !== null) {
       try { clearInterval(reconcile.timer) } catch { /* 已停 */ }
       reconcile.timer = null
+    }
+    // 排了延后归还的条目在退场时要立刻结算：定时器 unref 过，但留着它们会让
+    // 已经没人用的 wasm 上下文一直占着内存。只结算定时器，不清 pending —— 退场
+    // 期间可能还有请求正在往返，137 条 410 会把它打回直发。
+    for (const [, entry] of impl.pending) {
+      if (entry.releaseTimer !== undefined) {
+        try { clearTimeout(entry.releaseTimer) } catch { /* 已停 */ }
+        entry.releaseTimer = undefined
+        impl.release(entry.self)
+      }
     }
     for (const restore of portals) { try { restore() } catch { /* 同上 */ } }
     try {

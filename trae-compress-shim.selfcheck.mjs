@@ -319,8 +319,142 @@ const runPortConflict = async () => {
   passed += 1
 }
 
+/**
+ * 压缩腿拒收（bili 前置压缩失败）必须回退直发，而不是把 413 交给 adapter。
+ *
+ * 这是线上真实失败：SOLO 正文到 ~2 MB 时 bili 回 413 `preflight_compress_failed`。
+ * 老代码把那个响应原样返回，adapter 当成上游 413 直接结束整轮 —— 用户看到的就是
+ * 「trae 渠道用不了」。回退直发是安全的：bili 在前置阶段就失败了，请求没到上游。
+ */
+const runCompressionRefusal = async () => {
+  const up = await startUpstream()
+  const port = 47022
+  const adapters = new Map()
+  let sawDirect = false
+  const adapter = {
+    fetchImpl: async (url, init) => {
+      const target = String(url)
+      // 回环（shim 发出的那条）：模拟 bili 拒收压缩。
+      if (target.includes('/trae/')) {
+        sawDirect = true
+        return new Response(JSON.stringify({ error: { type: 'server_error', code: 'preflight_compress_failed', message: 'outbound body too large' } }), {
+          status: 413,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      // 原始上游 URL（回退直发走的这条）：真实请求，必须能拿到 SOLO 事件流。
+      return fetch('http://127.0.0.1:' + up.port + '/api/agent/v3/llm_utils_chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: init.body })
+    },
+  }
+  adapters.set('caa-trae', { adapter })
+  const handle = await startTraeCompressShim({ port, ctx: { get: (name) => (name === 'llm' ? { adapters } : undefined) }, logger: { info: () => {}, warn: () => {} } })
+  const response = await adapter.fetchImpl('http://127.0.0.1:' + up.port + '/api/agent/v3/llm_utils_chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(baseSolo()),
+  })
+  // 关键断言：调用方拿到的是上游的正常事件流，不是那个 413。
+  assert.equal(response.status, 200, '压缩腿拒收后必须回退直发，不能把 413 交给 adapter')
+  const text = await response.text()
+  assert.ok(text.includes('event: output') || text.includes('event: token_usage'), '回退后必须是真正的 SOLO 事件流')
+  const st = handle.status()
+  assert.equal(st.fallback >= 1, true, '拒收必须计入 fallback')
+  assert.ok(String(st.lastError).includes('回退直发'), 'lastError 必须说明已回退')
+  await handle.stop()
+  await new Promise((resolve) => up.server.close(resolve))
+  console.log('  ok   e2e 压缩腿拒收（413 preflight）回退直发，不结束整轮')
+  passed += 1
+}
+
+/** 上游自己的 413 不能被误判成压缩腿拒收（否则会对着同一个错误重发一遍）。 */
+const runUpstreamErrorNotRefused = async () => {
+  const port = 47023
+  const adapters = new Map()
+  let calls = 0
+  const adapter = {
+    fetchImpl: async (url, init) => {
+      const target = String(url)
+      if (!target.includes('/trae/')) return new Response('{}', { status: 200 })
+      calls += 1
+      // 上游真正的错误：没有压缩腿的 code。
+      return new Response(JSON.stringify({ error: { message: 'payload too large for this model' } }), {
+        status: 413,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  }
+  adapters.set('caa-trae', { adapter })
+  const handle = await startTraeCompressShim({ port, ctx: { get: (name) => (name === 'llm' ? { adapters } : undefined) }, logger: { info: () => {}, warn: () => {} } })
+  const response = await adapter.fetchImpl('http://127.0.0.1:1/api/agent/v3/llm_utils_chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(baseSolo()),
+  })
+  assert.equal(response.status, 413, '上游 413 必须原样透出')
+  // 只调用了准备那一次；没有因为「看起来像拒收」而重发。
+  assert.equal(calls, 1, '上游错误不得触发重发')
+  await handle.stop()
+  console.log('  ok   e2e 上游自己的 413 不被误判成压缩腿拒收')
+  passed += 1
+}
+
+/**
+ * 大正文的失败形态：bili 已经提交 200 + text/event-stream，然后把错误塞进流里。
+ *
+ * 这是线上真正的形态 —— 实测 2 MB 就走这条，而真实 trae 会话正文达 18 MB。
+ * 若不识别，adapter 会收到一条「看起来像上游故障」的流，整轮失败。
+ */
+const runStreamRefusal = async () => {
+  const up = await startUpstream()
+  const port = 47024
+  const adapters = new Map()
+  let directCalls = 0
+  const adapter = {
+    fetchImpl: async (url, init) => {
+      const target = String(url)
+      if (target.includes('/trae/')) {
+        // 模拟 bili 的 emitPreflightError：200 + SSE，首帧是注释 + error 事件。
+        const stream = new ReadableStream({
+          start(controller) {
+            const enc = new TextEncoder()
+            controller.enqueue(enc.encode(': bili-preflight\n\n'))
+            controller.enqueue(enc.encode('event: error\ndata: {"code":-1,"message":"outbound body too large"}\n\n'))
+            controller.close()
+          },
+        })
+        return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      directCalls += 1
+      return fetch('http://127.0.0.1:' + up.port + '/api/agent/v3/llm_utils_chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: init.body })
+    },
+  }
+  adapters.set('caa-trae', { adapter })
+  const handle = await startTraeCompressShim({ port, ctx: { get: (name) => (name === 'llm' ? { adapters } : undefined) }, logger: { info: () => {}, warn: () => {} } })
+  // 正文必须超过探针阈值（1 MB），否则不会去探流 —— 那正是设计约束。
+  const big = baseSolo()
+  big.messages.push({ role: 'user', content: [{ type: 'text', text: 'x'.repeat(1200000) }] })
+  const response = await adapter.fetchImpl('http://127.0.0.1:' + up.port + '/api/agent/v3/llm_utils_chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(big),
+  })
+  assert.equal(response.status, 200, '流内拒收也要回退直发，不能把错误流交给 adapter')
+  assert.equal(directCalls, 1, '必须真的直发了一次')
+  const text = await response.text()
+  assert.ok(!text.includes('bili-preflight'), '回退后拿到的必须是上游真响应，不是 bili 的错误帧')
+  assert.ok(text.includes('event: output') || text.includes('event: token_usage'), '回退后必须是 SOLO 事件流')
+  assert.equal(handle.status().fallback >= 1, true)
+  await handle.stop()
+  await new Promise((resolve) => up.server.close(resolve))
+  console.log('  ok   e2e 大正交流内 preflight 拒收也能回退直发')
+  passed += 1
+}
+
 await runE2e()
 await runErrorPath()
 await runBypass()
 await runPortConflict()
+await runCompressionRefusal()
+await runUpstreamErrorNotRefused()
+await runStreamRefusal()
 console.log('\n通过 ' + passed + ' 项')

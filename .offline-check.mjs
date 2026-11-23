@@ -402,6 +402,96 @@ ok('⑧ 解除禁用后字段被移除', en.body.disabled === false && !(await m
 useModel('mark-1', 'm2')
 ok('⑧ 解除禁用后重新可被选中', (await runPreStep('mark-1')) === 'm2')
 
+/* ⑨ bili 限流闸门的临时失败：到期自动恢复，绝不写成当日失败
+ *
+ * 真实报文（billion-context #4204，dist/index.js 的 makeReject）：
+ *   429 bili_throttle_hold：`upstream rate-limited 2 consecutive request(s) to
+ *     xiaohuanxiong.com for model "x"; bili is holding outbound sends until
+ *     2026-11-23T22:01:49.355Z (~591s, exponential backoff) instead of amplifying
+ *     — zero egress while held, auto-resumes when the limit clears (#4204)`
+ *   424 bili_throttle_terminal：`… bili stops amplifying after 5 consecutive rate
+ *     limits — resend manually once the provider recovers (a background probe keeps
+ *     checking at most every 30s) (#4204)`
+ *
+ * 判据必须是文案：适配器会把 bili 的响应压成自己的 RATE_LIMIT/429，机器码
+ * bili_throttle_* 往往传不到这一层。 */
+const throttleAgent = makeAgent('throttle-1', {}, 'm2')
+agents.push(throttleAgent)
+await api('POST', '/session-group', { sessionId: 'throttle-1', groupId: 'g2', mode: 'route' })
+await api('POST', '/failed/reset', {})
+useModel('throttle-1', 'm2')
+
+const holdUntil = new Date(Date.now() + 600_000).toISOString()
+const holdMessage = 'upstream rate-limited 2 consecutive request(s) to xiaohuanxiong.com for model "sn-deepseek-v4-1-flash-1017";'
+  + ` bili is holding outbound sends until ${holdUntil} (~591s, exponential backoff) instead of amplifying`
+  + ' — zero egress while held, auto-resumes when the limit clears (#4204)'
+throttleAgent.status = 'running'
+await errHandler(
+  { agent: throttleAgent, turn: 2, provider: 'p', failure: { code: 'RATE_LIMIT', message: holdMessage, status: 429 } },
+  () => Promise.resolve(undefined),
+)
+const statusAfterHold = (await api('GET', '/status')).body
+ok('⑨ bili 限流回绝不写当日失败（否则这个模型被停用到日界）',
+  !statusAfterHold.failed.some(f => f.provider === 'p' && f.model === 'm2'),
+  JSON.stringify(statusAfterHold.failed.filter(f => f.model === 'm2')))
+const tempEntry = (statusAfterHold.temporaryFailures || []).find(e => e.provider === 'p' && e.model === 'm2')
+ok('⑨ 记成临时失败，到期时刻取自报文里的绝对时间',
+  !!tempEntry && Math.abs(tempEntry.until - Date.parse(holdUntil)) < 2000,
+  tempEntry && `until=${new Date(tempEntry.until).toISOString()}`)
+ok('⑨ 临时失败期间该模型不参与路由挑选（换到组内其它模型）',
+  (await runPreStep('throttle-1')) === 'm1')
+
+// 到期即恢复：把 until 拨到过去，下一次挑选就该重新看到 m2 可用。
+// （temporaryFailureOf 到期即删，正是「到时间自动从失败列表恢复」的实现。）
+const tempKey = 'p/m2'
+{
+  const path = join(dir, 'failed.json')
+  const raw = JSON.parse(readFileSync(path, 'utf8'))
+  ok('⑨ 临时失败不落 failed.json（当日失败表只放真正的当日失败）',
+    (Array.isArray(raw) ? raw : []).every(f => f.model !== 'm2' || f.code !== 'RATE_LIMIT'),
+    JSON.stringify(raw.filter(f => f.model === 'm2')))
+}
+useModel('throttle-1', 'm1')
+ok('⑨ 未到期时 m1 保持不变（当下没有理由切走）', (await runPreStep('throttle-1')) === 'm1')
+
+// 434 terminal 分支：没有绝对时刻，只有「最多每 N 秒探一次」。
+// 先把会话放回 m2 —— provider/model 取自请求头，切到 m1 之后再发就会记成 m1。
+await api('POST', '/failed/reset', {})
+useModel('throttle-1', 'm2')
+const terminalMessage = 'upstream rate-limited 5 consecutive request(s) to xiaohuanxiong.com'
+  + ' for model "sn-deepseek-v4-1-flash-1017"; bili stops amplifying after 5 consecutive rate limits'
+  + ' — resend manually once the provider recovers (a background probe keeps checking at most every 30s) (#4204)'
+throttleAgent.status = 'running'
+await errHandler(
+  { agent: throttleAgent, turn: 3, provider: 'p', failure: { code: 'RATE_LIMIT', message: terminalMessage, status: 424 } },
+  () => Promise.resolve(undefined),
+)
+const terminalEntry = ((await api('GET', '/status')).body.temporaryFailures || []).find(e => e.provider === 'p' && e.model === 'm2')
+ok('⑨ terminal 分支也记临时失败，且用 30s 探测周期兜底',
+  !!terminalEntry && terminalEntry.until - Date.now() <= 45_000,
+  terminalEntry && `剩余 ${Math.round((terminalEntry.until - Date.now()) / 1000)}s`)
+
+// 手动恢复必须同时清临时失败：用户点了「恢复」，界面显示成功就不能还卡着。
+await api('POST', '/failed/reset', { provider: 'p', model: 'm2' })
+ok('⑨ 手动恢复同时清掉临时失败',
+  ((await api('GET', '/status')).body.temporaryFailures || []).every(e => !(e.provider === 'p' && e.model === 'm2')))
+
+// 换号不该被触发：bili 的 hold 按「账号+主机」记，换号拿到的还是同一条 hold。
+const handoffProbe = []
+{
+  const before = (await api('GET', '/status')).body.failureLog || []
+  await errHandler(
+    { agent: throttleAgent, turn: 4, provider: 'p', failure: { code: 'RATE_LIMIT', message: holdMessage, status: 429 } },
+    () => Promise.resolve(undefined),
+  )
+  const after = (await api('GET', '/status')).body.failureLog || []
+  handoffProbe.push(...after.filter(e => e.outcome === 'account-handoff'))
+  ok('⑨ bili 限流回绝不触发换号重试（同渠道换号拿到同一条 hold）',
+    handoffProbe.length === (before.filter(e => e.outcome === 'account-handoff').length),
+    JSON.stringify(handoffProbe))
+}
+await api('POST', '/failed/reset', {})
+
 // ⑨ 状态序列诊断：续跑投递必须落在 idle 与下一次 running 之间
 for (const fn of handlers.getAll('agent/status')) fn({ agent: failedAgent, status: 'running' })
 const logResp = await api('GET', '/debug/status-log?sessionId=sub-explicit&limit=200')
@@ -598,11 +688,17 @@ codeartsStatus = { usage: { slots: [
 const blockedAction = await failOnCodearts('codearts-signature-1', { code: 'RATE_LIMIT', status: 429, message: poolEmptyMsg })
 ok('⑪ 签名中间层拒绝时不重启（重启救不了）', restartCalls === 1, `restartCalls=${restartCalls}`)
 ok('⑪ 签名中间层拒绝时不返回 retry（避免对注定失败的链路反复重试）', blockedAction?.kind !== 'retry', JSON.stringify(blockedAction))
-const blockedLog = await lastLogFor('codearts-signature-1')
+// 拒签之后仍要走分组路由，所以这一轮的**最后**一条诊断是 switched；
+// 拒签本身的诊断是它前面那条。断言要看「记过没有」，不能假定它是最后一条。
+const blockedLog = (await api('GET', '/status')).body.failureLog
+  .find(f => f.sessionId === 'codearts-signature-1' && f.outcome === 'codearts-signature-blocked')
 ok('⑪ 诊断记录 codearts-signature-blocked 并给出修法',
   blockedLog?.outcome === 'codearts-signature-blocked'
   && (String(blockedLog.detail ?? '').includes('billion-context') || String(blockedLog.detail ?? '').includes('重签')),
   JSON.stringify(blockedLog))
+ok('⑪ 拒签后仍然换模型（不再因为拒签就停住整个会话）',
+  (await lastLogFor('codearts-signature-1'))?.outcome === 'capacity-switched',
+  JSON.stringify(await lastLogFor('codearts-signature-1')))
 
 // 池状态读不到（接口不可达）时按未知处理，不盲目重启
 globalThis.fetch = async () => ({ ok: false, async json() { return {} } })
@@ -3177,6 +3273,109 @@ ok('㊸ 工具调用的流仍以 [DONE] 收尾 + finish_reason=tool_calls',
   && toolFrames.at(-1)?.choices?.[0]?.finish_reason === 'tool_calls',
   JSON.stringify(toolFrames.at(-1)?.choices?.[0]?.finish_reason))
 
+// ── ㊸' Responses 方言：同一批路由也按 /v1/responses 开放 ──────────────────
+// 新版客户端（以及只实现 Responses 的 SDK）不走 chat.completions。这一组断言守的是
+// 「两种方言在同一个分组上给出同样的可用性」：请求形状、非流式对象、SSE 事件序列、
+// 失败切换、已出字后不重来。
+const lanResponses = (body) => lanCall('POST', '/v1/responses', body)
+const sseEvents = (text) => text.split('\n\n').filter(Boolean).map((block) => {
+  const line = block.split('\n').find((l) => l.startsWith('data: '))
+  if (line === undefined) return null
+  try { return JSON.parse(line.slice(6)) } catch { return null }
+}).filter(Boolean)
+
+const respPlain = await lanResponses({ model: 'lan-a', input: 'hi' })
+const respPlainBody = JSON.parse(respPlain.text)
+ok("㊸' Responses 非流式返回标准 Response 对象（resp_ id、output 数组、output_text）",
+  respPlain.status === 200
+  && respPlainBody?.object === 'response'
+  && String(respPlainBody?.id).startsWith('resp_')
+  && respPlainBody?.output?.[0]?.type === 'message'
+  && respPlainBody?.output?.[0]?.content?.[0]?.type === 'output_text'
+  && respPlainBody?.output_text === 'OK',
+  JSON.stringify({ status: respPlain.status, id: respPlainBody?.id, text: respPlainBody?.output_text }))
+ok("㊸' usage 换成 Responses 字段名（input_tokens 仍把缓存命中算进来）",
+  respPlainBody?.usage?.input_tokens === 6 && respPlainBody?.usage?.output_tokens === 2
+  && respPlainBody?.usage?.input_tokens_details?.cached_tokens === 1,
+  JSON.stringify(respPlainBody?.usage))
+
+const respStream = await lanResponses({ model: 'lan-a', input: 'hi', stream: true })
+const respEvents = sseEvents(respStream.text)
+const respTypes = respEvents.map((e) => e.type)
+ok("㊸' 流式事件按 Responses 的序列发出，每帧带自增 sequence_number",
+  JSON.stringify(respTypes.slice(0, 4)) === JSON.stringify([
+    'response.created', 'response.in_progress', 'response.output_item.added', 'response.content_part.added',
+  ])
+  && respEvents.every((e, i) => e.sequence_number === i)
+  && respTypes.at(-1) === 'response.completed',
+  JSON.stringify(respTypes))
+ok("㊸' 流式收尾不发 data: [DONE]（Responses 以 response.completed 表示结束）",
+  !respStream.text.includes('[DONE]'), JSON.stringify(respStream.text.slice(-40)))
+const respDone = respEvents.at(-1)?.response
+ok("㊸' response.completed 带完整 output_text 与 status=completed",
+  respDone?.status === 'completed' && respDone?.output_text === 'OK'
+  && respDone?.output?.[0]?.content?.[0]?.type === 'output_text',
+  JSON.stringify({ status: respDone?.status, text: respDone?.output_text }))
+
+// 静默切换要在出字之前发生：lan-r 的首个候选 lmfail4 必失败，第二个是 qoder 系。
+// 单独建组是因为 lan-qs 的 lmfail3 已被上面的 chat 调用记进当日失败表，下一次就不会再被选中。
+const gLanR = await mkLanGroup('LAN-R', 'p', ['lmfail4'])
+gLanR.models.push({ provider: 'ofm-qoder', model: 'lmok', priority: 2 })
+await api('PUT', '/groups', { id: gLanR.id, models: gLanR.models })
+await api('PUT', '/groups', { id: gLanR.id, lanEnabled: true, lanAlias: 'lan-r' })
+const respSwitchBefore = lanOptions.length
+const respSwitch = await lanResponses({ model: 'lan-r', input: 'hi' })
+const respSwitchBody = JSON.parse(respSwitch.text)
+ok("㊸' responses 与 chat 共用候选循环：首个候选失败时同样静默换到下一个",
+  respSwitch.status === 200 && respSwitchBody?.output_text === 'OK'
+  && lanOptions.length - respSwitchBefore === 2,
+  JSON.stringify({ status: respSwitch.status, text: respSwitchBody?.output_text, attempts: lanOptions.length - respSwitchBefore }))
+
+// 工具往返：function_call / function_call_output 必须还原成宿主认识的消息形状，
+// 从递进 llm.stream 的 options 看最准（从响应倒推会把模型的自由发挥当成网关行为）。
+const respTool = await lanResponses({
+  model: 'lan-a',
+  instructions: '你是天气助手',
+  input: [
+    { role: 'user', content: [{ type: 'input_text', text: '北京天气' }] },
+    { type: 'function_call', call_id: 'call_x', name: 'get_weather', arguments: '{"city":"北京"}' },
+    { type: 'function_call_output', call_id: 'call_x', output: '晴' },
+  ],
+  tools: [{ type: 'function', name: 'get_weather', description: '查天气', parameters: { type: 'object', properties: {} } }],
+})
+const respToolOpts = lanOptions.at(-1)
+const respRoles = (respToolOpts?.messages ?? []).map((m) => m.role)
+const respCallBlock = (respToolOpts?.messages ?? []).flatMap((m) => m.content ?? []).find((b) => b?.type === 'tool-call')
+ok("㊸' responses 的工具往返能还原：function_call 变 assistant 的 tool-call 块、输出变 tool 消息",
+  respTool.status === 200 && JSON.stringify(respRoles) === JSON.stringify(['system', 'user', 'assistant', 'tool'])
+  && respCallBlock?.name === 'get_weather' && respCallBlock?.id === 'call_x'
+  && respCallBlock?.arguments === '{"city":"北京"}',
+  JSON.stringify({ status: respTool.status, roles: respRoles, block: respCallBlock }))
+ok("㊸' instructions 进 system 行、扁平 tools 被翻成宿主 ToolSchema",
+  respToolOpts?.messages?.[0]?.role === 'system'
+  && (respToolOpts?.messages?.[0]?.content ?? []).map((b) => b.text).join('') === '你是天气助手'
+  && respToolOpts?.tools?.[0]?.name === 'get_weather',
+  JSON.stringify({ head: respToolOpts?.messages?.[0]?.role, tools: respToolOpts?.tools }))
+
+// lan-b 的 lmhalf 已被上面那条 chat 断言记进当日失败表，这里先单独恢复它：
+// 要验的是「已出字后失败」，不是「候选全被排除」。
+await api('POST', '/failed/reset', { provider: 'p', model: 'lmhalf' })
+const respHalf = await lanResponses({ model: 'lan-b', input: 'hi', stream: true })
+const respHalfEvents = sseEvents(respHalf.text)
+ok("㊸' 已出字后上游失败：responses 补一个 response.failed，内容只出现一次",
+  respHalf.status === 200
+  && (respHalf.text.match(/PART/g) ?? []).length === 1
+  && respHalfEvents.at(-1)?.type === 'response.failed'
+  && respHalfEvents.at(-1)?.response?.status === 'failed',
+  JSON.stringify({ last: respHalfEvents.at(-1)?.type, status: respHalfEvents.at(-1)?.response?.status }))
+
+const respPrev = await lanResponses({ model: 'lan-a', input: 'hi', previous_response_id: 'resp_x' })
+ok("㊸' previous_response_id 明确 400（网关不保存历史，静默忽略会少一段上下文）",
+  respPrev.status === 400 && respPrev.text.includes('previous_response_id'), respPrev.text.slice(0, 120))
+const respById = await lanCall('GET', '/v1/responses/resp_x')
+ok("㊸' GET /v1/responses/:id 返回 404（store 恒为 false，没有历史可取）",
+  respById.status === 404, String(respById.status))
+
 // ⑤ 关掉某组：立刻从 /v1/models 消失，调用 404（已建立的连接不受影响）
 await api('PUT', '/groups', { id: gLanA.id, lanEnabled: false })
 const closedCall = await lanChat({ model: 'lan-a', messages: [{ role: 'user', content: 'hi' }] })
@@ -3193,12 +3392,102 @@ ok('㊸ 关掉总开关即停止监听（端口不再响应，无需重启宿主
   offRes.body?.lanGateway?.running === false && refused,
   JSON.stringify({ running: offRes.body?.lanGateway?.running, refused }))
 
+// ⑦ 热替换必须换掉**请求处理函数**，不只是运行时回调 ─────────────────────────
+// 端口上的监听器是在「上一条目那一版模块」里创建时闭包住 handleRequest 的。
+// Loader 重建条目、重新 import 新 lan-gateway.mjs 后，若只把 runtime 换掉，
+// 源码里新增的端点永远走不到：构建号提了、文件也改了，可端口上还是旧路由表
+// （实测：热替换后 POST /v1/responses 仍 404，提示里也没有这个端点）。
+// 这里把同一份源码复制两份、只改 /healthz 的服务名当版本标记，在同一端口上
+// 先后启动两次，看新实例的标记是否真的接管了这个套接字。
+{
+  const gwSource = readFileSync(new URL('./lan-gateway.mjs', import.meta.url), 'utf8')
+  const hotDir = mkdtempSync(join(tmpdir(), 'mfm-hotswap-'))
+  const marker = 'model-failover-manager LAN gateway'
+  const patched = gwSource.split(marker).join(marker + ' v2')
+  ok("㊸' 热替换测试的源码复制生效（找不到服务名就说明文案被改了，这条防线要跟着改）",
+    patched !== gwSource, String(patched === gwSource))
+  writeFileSync(join(hotDir, 'v1.mjs'), gwSource)
+  writeFileSync(join(hotDir, 'v2.mjs'), patched)
+  const { pathToFileURL } = await import('node:url')
+  // 只满足 startLanGateway 会碰到的成员：热替换测的是套接字与处理函数的归属，
+  // 不是路由解析。
+  const hotRuntime = {
+    describeRoutes: () => [], resolveRoute: () => null,
+    firstCandidate: () => null, nextCandidate: () => null, onFailure: () => {},
+    keyOf: (c) => String(c), llm: () => ({ stream: () => (async function* () {})() }),
+    liveProviderIdOf: (x) => x, systemAsUserTurn: () => false, attachments: () => null,
+  }
+  const quietLogger = { info() {}, warn() {} }
+  const gwA = await (await import(pathToFileURL(join(hotDir, 'v1.mjs')).href))
+    .startLanGateway({ port: 0, logger: quietLogger, runtime: hotRuntime })
+  const hotPort = gwA.status().port
+  const gwB = await (await import(pathToFileURL(join(hotDir, 'v2.mjs')).href))
+    .startLanGateway({ port: hotPort, logger: quietLogger, runtime: hotRuntime })
+  // 这里不能用 lanCall：它指向的是上面已被关掉的那条临时网关，端口早就没人听了。
+  const hotHealth = await new Promise((resolve) => {
+    const probe = httpRequest({ host: '127.0.0.1', port: hotPort, path: '/healthz', method: 'GET' }, (res) => {
+      const chunks = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }))
+    })
+    probe.on('error', () => resolve(null))
+    probe.end()
+  })
+  await gwB.stop()
+  ok("㊸' 同一端口热替换后新实例的请求处理函数立刻生效（不重启、端口不闪断）",
+    gwB.status().port === hotPort && (hotHealth?.text ?? '').includes(marker + ' v2'),
+    JSON.stringify({ port: hotPort, service: hotHealth?.text?.slice(0, 90) }))
+}
+
 // 收尾：临时分组、失败记账、llm 桩都清掉，后面几段还要用同一份 ctx
-for (const g of [gLanA, gLanB, gLanC, gLanT, gLanF, gLanQ, gLanQS]) await api('DELETE', '/groups/' + encodeURIComponent(g.id))
+for (const g of [gLanA, gLanB, gLanC, gLanT, gLanF, gLanQ, gLanQS, gLanR]) await api('DELETE', '/groups/' + encodeURIComponent(g.id))
 await api('POST', '/failed/reset', {})
 llmStub = undefined
 ok('㊸ 自检用的临时分组已清掉',
   (await api('GET', '/status')).body.groups.every(g => !g.name.startsWith('LAN-')))
+
+// ㊹ 模型页签的「＋」菜单：已在组内的条目再点一次就是剔除
+//
+// 与看板的「移除」同一条语义（分组级动作，只动这一个分组的清单），
+// 但入口在模型页签，所以校验点分两处：client.js 里那条分支，以及宿主
+// /groups PUT 的整表替换是否真的按 providerSame 摘掉且不动其余条目。
+{
+  const km = 'k-remove-toggle'
+  const created = (await api('POST', '/groups', {
+    name: 'toggle-check',
+    models: [
+      { provider: 'ofm-qoder', model: km, priority: 3 },
+      { provider: 'a', model: 'keep-1', priority: 7 },
+      { provider: 'a', model: 'keep-2', priority: 12 },
+    ],
+  })).body
+  const toggleId = created.group.id
+  const before = (await api('GET', '/status')).body.groups.find(g => g.id === toggleId)
+  ok('㊹ 前置：分组里三条模型就位',
+    before.models.length === 3, JSON.stringify(before.models.map(m => m.provider + '/' + m.model)))
+
+  // 界面送上来的清单按 providerSame 过滤：注册表 id ofm-qoder 与裸 qoder 视为同一渠道。
+  const rest = before.models
+    .filter(m => !(/^(?:ofm-)?qoder$/i.test(m.provider) && m.model === km))
+    .map(m => ({ provider: m.provider, model: m.model, priority: m.priority }))
+  const putRes = await api('PUT', '/groups', { id: toggleId, models: rest })
+  const after = (await api('GET', '/status')).body.groups.find(g => g.id === toggleId)
+  ok('㊹ 剔除后只剩另外两条', putRes.body.ok === true && after.models.length === 2,
+    JSON.stringify(after.models.map(m => m.model)))
+  ok('㊹ 剔除不动其余条目的优先级',
+    JSON.stringify(after.models.map(m => m.priority)) === '[7,12]',
+    JSON.stringify(after.models.map(m => m.priority)))
+
+  ok('㊹ 模型页签的 ＋ 菜单里，已入组那条的点击走剔除而不是加入',
+    clientText.includes('if (inGroup) removeFromGroup(')
+    && clientText.includes("title: inGroup ? '再点一次从「' + g.name + '」剔除'"))
+  ok('㊹ 剔除用的是分组级整表替换（只动这一个分组）',
+    clientText.includes('function removeFromGroup(groupId, providerId, modelId)')
+    && clientText.includes("apiSend(API + '/groups', 'PUT', { id: groupId, models: rest })")
+    && clientText.includes('providerSame(m.provider, providerId) && m.model === modelId'))
+
+  await api('DELETE', '/groups/' + encodeURIComponent(toggleId))
+}
 
 const failed = checks.filter(c => !c.pass).length
 console.log(`\n${checks.length - failed}/${checks.length} 通过`)

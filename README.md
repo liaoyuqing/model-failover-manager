@@ -10,13 +10,13 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 | 页签 | 做什么 |
 | --- | --- |
-| **模型** | 左栏供应商、右栏模型，点 ＋ 加进分组；顶部选路由分组、绑定模式与「新会话默认」 |
+| **模型** | 左栏供应商、右栏模型，点 ＋ 加进分组（已在组内的那条再点一次即剔除）；顶部选路由分组、绑定模式与「新会话默认」 |
 | **路由分组** | 每组一份有序模型清单（数字越小越先试），可配生效时段与截止日，就地用 ↑ ↓ 调优先级、✕ 移出分组，逐个开关失败/禁用 |
 | **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 `dsh-llm-error-retry` 自己的配置页，保存即生效 |
 | **免费渠道** | Our Free Model / CodeArts / WorkBuddy / Trae / Qoder / Providers Hub 六个能直接补免费模型的插件，带 GitHub 地址与一键安装（Our Free Model 排第一张，Providers Hub 排最后一张） |
-| **局域网** | 把分组以 OpenAI 兼容接口（`/v1/models`、`/v1/chat/completions`）开放给同一局域网内的其它程序；总开关 + 每组单独开关，`model` 字段填路由名 |
+| **局域网** | 把分组以 OpenAI 兼容接口（`/v1/models`、`/v1/chat/completions`、`/v1/responses`）开放给同一局域网内的其它程序；总开关 + 每组单独开关，`model` 字段填路由名 |
 
 ## 界面
 
@@ -615,6 +615,24 @@ curl http://192.168.0.100:47021/v1/chat/completions \
 
 支持的请求字段：`model`、`messages`（`system`/`developer` 会被拼成 system 提示）、`stream`、`tools`（旧的 `functions` 也认）、`temperature`、`max_tokens`/`max_completion_tokens`、`stop`。消息内容支持 `text`、`image_url`（远程图片会下载成附件，失败则降级为文字占位）、`input_file`（降级为文字占位）以及 assistant 的 `reasoning` 块；`tool_calls` 与 `role:"tool"` 双向都能还原。响应里的 `usage.prompt_tokens` 按 OpenAI 口径把缓存命中与缓存写入一起计入（宿主 `TokenUsage` 的 `inputTokens` 不含这两项）。
 
+### Responses 接口（`POST /v1/responses`）
+
+新版 OpenAI 客户端（以及只实现 Responses 的 SDK/Agent 框架）不再走 chat.completions。网关把同一批路由分组也按 Responses 的形状开放，`model` 仍填路由名：
+
+```bash
+curl http://192.168.0.100:47021/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"默认分组","input":"你好","stream":true}'
+```
+
+- **一份候选循环、两种方言**：responses 与 chat.completions 共用同一个处理函数，候选挑选、并发闸门、当日失败记账、已出字不再重来全部一致。同一个分组在两条接口上给出同样的可用性，排障时不会出现「换个接口就能用」的假线索。
+- **请求字段**：`model`、`input`（字符串或 input item 数组）、`instructions`、`tools`（扁平 `{type:"function", name, parameters}`，也兼容 chat 的 `{type:"function", function:{...}}`）、`tool_choice`（`none` 时不传工具）、`temperature`、`max_output_tokens`、`stream`、`metadata`、`text.format`（`json_schema` 会降级成提示词约束）。
+- **input item**：`message`（`user`/`assistant`/`system`/`developer`，内容块 `input_text`/`input_image`/`output_text`）、`function_call`、`function_call_output`（`call_id` 双向对齐）。`reasoning`/`item_reference` 这类「对上一轮的补充说明」直接跳过——宿主侧没有对应物，跳过等价。`previous_response_id` 明确返回 400：网关 `store` 恒为 `false`，不保存历史，请把完整对话放进 `input`。
+- **非流式**：返回标准 Response 对象（`id` 前缀 `resp_`、`output` 数组按「推理 → 正文 → 工具调用」排序、`output_text` 便捷字段、`usage.input_tokens/output_tokens` 与 `*_details`）。超过 `max_output_tokens` 时 `status` 为 `incomplete`、`incomplete_details.reason` 为 `max_output_tokens`（与 chat 的 `finish_reason:"length"` 同源）。
+- **流式**：SSE 事件序列与官方一致——`response.created` → `response.in_progress` → `response.output_item.added` → `response.content_part.added` / `response.output_text.delta` → `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.completed`，每帧带自增 `sequence_number`；推理内容走 `response.reasoning_text.delta`，工具入参走 `response.function_call_arguments.delta`/`.done`。**收尾不发 `data: [DONE]`**：Responses 协议以 `response.completed` 表示结束，官方 SDK 收到多余事件会当成未知类型。已出字后上游失败则补一个 `response.failed`（带 `error.code`），客户端据此进入错误分支而不是等超时。
+- **静默切换仍然成立**：响应头与 `response.created` 都推到第一个内容增量才写，所以在出字之前失败的那次候选，客户端连一个事件都看不到。
+- `GET /v1/responses/:id` 返回 404 `not_found`：本网关不存响应（`store:false`），按 id 取回没有数据可给。
+
 ## HTTP 接口
 
 宿主半在 `/api/model-failover` 下提供（界面自身使用）：
@@ -656,6 +674,16 @@ curl http://192.168.0.100:47021/v1/chat/completions \
 - **恢复失败模型**：当日失败的行在状态列直接给「恢复」按钮（只清这一个模型的失败记录）；操作条上的「恢复本组失败 (N)」只清当前分组里的失败模型——不带模型名的 `/failed/reset` 会清掉全天全部失败，跨了分组就是越权。
 - **并发上限在看板上直接改**：「并发」列的主值位置换成输入框，与「模型」页签的模型行共用同一份提交逻辑（按模型持久化、对所有分组统一生效）：正整数即写死，留空或 0 = 跟随 `defaultConcurrency`。没有单独设上限的模型跟的是数据看板标题栏那个「默认并发」（输入框就在标题栏上，改一次全表生效，存 `settings.json`）。这一格分两行：上行是输入框，下行是「进行中 / 生效上限」——有上限时是 `N/上限`，没配上限时是 `N（不限）`，两种写法都带**当前进行中**的实时值，不因为没设上限就把这一格留空；等槽时间与等槽位数（只有整组都满时才有人等）接在下行后面。并排一行放不下：76px 的列里输入框先占掉一半，剩下的读数只剩省略号。
 - **从路由移除**：模型名下方的「移除」按钮把这个模型从**它所属的那个分组**里摘掉（看板一行可能同时属于多个分组，这一行只按首个分组动，想彻底离开路由要到每个分组里各移除一次），分组里其它模型与它们的优先级都不动。与「禁用」的区别：禁用留着条目、只是不参与路由；移除连条目一起删，想加回来得从「模型」页签重新 ＋。
+
+### 临时失败：上游限流退避
+
+上游限流（billion-context 的 429/424 闸门回绝，`bili_throttle_hold` / `bili_throttle_terminal`）**不写当日失败**，而是记一条**带到期时刻的临时失败**：该模型在到期前不参与路由挑选，到点自动回来，既不用等到日界也不用点恢复。
+
+判据是报文而不是错误码：适配器会把 bili 的响应压成自己的 `RATE_LIMIT`/429，`bili_throttle_*` 通常传不到插件这一层。识别靠两条文案——`bili is holding outbound sends until <ISO>`（429，含绝对到期时刻与 `~Ns` 退避秒数）与 `bili stops amplifying after N consecutive`（424，只有探测周期）。到期时刻优先取报文里的绝对时间，取不到才用相对秒数折算，最后夹进 1 秒～1 小时的区间。
+
+同一类失败**不换账号重试**：bili 的 hold 按「账号+主机」记（`holdKey`），同渠道换号拿到的还是同一条 hold，只会白等一轮并把另一个账号也记上一次失败。
+
+临时失败与当日失败在看板上分开显示（分组页签的模型块标「限流 Ns」、失败模型页签单列一块），因为「等几分钟」和「等明天」的处置完全不同。本轮成功会立刻清掉临时失败；`POST /failed/reset` 也会一起清（用户点了恢复，就不能还卡着）。`GET /status` 的 `temporaryFailures` 与各模型条目的 `temporaryFailure` / `temporaryUntil` 是它的读出口。
 
 ## 数据文件
 
@@ -712,7 +740,7 @@ curl http://192.168.0.100:47021/v1/chat/completions \
 | --- | --- |
 | `host.mjs` | 宿主半，也是 `package.json` 的 `main`（内含并发闸门与临时切换、按模型并发上限、codearts 账号池自救、CodeArts 凭据镜像的接线、压缩旁路守卫、qoder 与 trae 两个压缩 shim 的接线、`/metrics`）。版本号写在文件内的 `HOST_VERSION`，不再用文件名区分 |
 | `provider-prefix.mjs` | provider 前缀换算（纯函数，无副作用）：六个插件各一个前缀、`bareProvider` / `providerEquals` / `liveProviderIdOf` 用的身份与等价判断、免费渠道认领算法。背景见「六个免费渠道插件的 provider 前缀」 |
-| `lan-gateway.mjs` | 局域网转发网关（纯 Node `http`，不认识任何路由规则）：OpenAI 兼容的 `/v1/models` 与 `/v1/chat/completions`、SSE 与非流式两种回包、组内候选静默切换。路由解析、候选挑选与失败记账全部由 `host.mjs` 通过 `runtime` 注入 |
+| `lan-gateway.mjs` | 局域网转发网关（纯 Node `http`，不认识任何路由规则）：OpenAI 兼容的 `/v1/models`、`/v1/chat/completions` 与 `/v1/responses`（两种方言共用同一份候选循环）、SSE 与非流式两种回包、组内候选静默切换；`/healthz` 回传 `build` 字段，便于确认端口跑的是哪一版。路由解析、候选挑选与失败记账全部由 `host.mjs` 通过 `runtime` 注入 |
 | `codearts-resign-bridge.mjs` | CodeArts 凭据镜像（原独立插件 `dsh-codearts-resign-bridge` 的功能，已并进来）：读账号库与候选 ref，把每个可用账号写成 bili 认识的字段 |
 | `qoder-compress-shim.mjs` | qoder 压缩 shim：截 `prepareInfer`、收压缩后的明文、重建 `ask` 并重新加密发上游；含 `pack.js` 注入口的自动补回、运行时加密器的延迟认领 |
 | `trae-compress-shim.mjs` | trae 压缩 shim：接管 TRAE adapter 的 `fetchImpl`，把 SOLO body 折成 OpenAI 送进 bili 压缩、再以原始 SOLO body 为底还原后直发上游，回程把 OpenAI SSE 重建为 SOLO 事件；失败一律退回原始行为 |
@@ -764,7 +792,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   outcome a user cannot fix by hand.
 - For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
-- The *LAN* tab publishes routing groups over an OpenAI-compatible API (`GET /v1/models`, `POST /v1/chat/completions`) on `0.0.0.0` (default port 47021) for other programs on the same network. The `model` field is the route name: a per-group alias, the group name when no alias is set, or the group id. A total switch plus a per-group switch decide what is exposed — a closed group disappears from `/v1/models` and answers 404, and both switches start out off. Gateway calls run through the host's own `llm.stream`, so they share the concurrency gate, the speed samples and the daily failed-model table with dialog sessions; seats already busy show up in the dashboard as in-flight. On failure the gateway silently moves to the next candidate in the group, so the client only ever sees one complete answer; once output has been committed it does not restart (a restart would duplicate content) and instead ends the SSE stream with an `error` event, a group with no selectable candidate answers 503 `no_candidate`, and a group whose candidates were all tried answers 502 `upstream_error` carrying the last candidate's failure code (for example `QUOTA_EXCEEDED`). Streams end the way OpenAI clients expect: both the success and the error path close with `data: [DONE]`, streaming `tool_calls` use `index` 0..n-1 with the id and function name sent once on the first fragment, and the model's reasoning arrives as `delta.reasoning_content`.  A client's `system`/`developer` text is sent as the first **system message** — except on `qoder` / `qodercn`, where it is sent as the first **user message**: those adapters only forward `options.system` into a top-level `systemText` payload field that their upstream ignores (an instruction stated there measured 0/4 compliance while the same text in a conversation turn measured 4/4). The form is chosen per candidate, so a request that tries a qoder route and then fails over to another channel gets each one the form it reads; the list is config's `lanSystemAsUserProviders`, default `["qoder", "qodercn"]` in bare ids. No authentication: the listener is meant for a trusted LAN and must not be port-forwarded to the internet.
+- The *LAN* tab publishes routing groups over an OpenAI-compatible API (`GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`) on `0.0.0.0` (default port 47021) for other programs on the same network. The `model` field is the route name: a per-group alias, the group name when no alias is set, or the group id. A total switch plus a per-group switch decide what is exposed — a closed group disappears from `/v1/models` and answers 404, and both switches start out off. Gateway calls run through the host's own `llm.stream`, so they share the concurrency gate, the speed samples and the daily failed-model table with dialog sessions; seats already busy show up in the dashboard as in-flight. On failure the gateway silently moves to the next candidate in the group, so the client only ever sees one complete answer; once output has been committed it does not restart (a restart would duplicate content) and instead ends the SSE stream with an `error` event, a group with no selectable candidate answers 503 `no_candidate`, and a group whose candidates were all tried answers 502 `upstream_error` carrying the last candidate's failure code (for example `QUOTA_EXCEEDED`). The same groups are also served as `POST /v1/responses`, so clients that only speak the Responses dialect work through the same candidate loop with the same silent failover; that dialect ends on `response.completed` (never `data: [DONE]`), sends a `response.failed` event if the upstream dies after output started, rejects `previous_response_id` with 400 because nothing is stored, and answers `GET /v1/responses/:id` with 404. In the chat dialect, streams end the way OpenAI clients expect: both the success and the error path close with `data: [DONE]`, streaming `tool_calls` use `index` 0..n-1 with the id and function name sent once on the first fragment, and the model's reasoning arrives as `delta.reasoning_content`.  A client's `system`/`developer` text is sent as the first **system message** — except on `qoder` / `qodercn`, where it is sent as the first **user message**: those adapters only forward `options.system` into a top-level `systemText` payload field that their upstream ignores (an instruction stated there measured 0/4 compliance while the same text in a conversation turn measured 4/4). The form is chosen per candidate, so a request that tries a qoder route and then fails over to another channel gets each one the form it reads; the list is config's `lanSystemAsUserProviders`, default `["qoder", "qodercn"]` in bare ids. No authentication: the listener is meant for a trusted LAN and must not be port-forwarded to the internet.
 - Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are unwrapped on the way back: qoder's `data:{"headers":…,"body":"…"}` envelope frames become bare OpenAI frames with the `\n\n` framing bili needs, timing-only heartbeats are dropped, envelope errors are flattened to `{code,message,type:'model_error'}`, and non-event-stream replies pass through untouched. Leaving the envelope intact is what made bili report "stream truncated" and discard its reply record. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
 - Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
 - Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. `defaultConcurrency` in `cordis.patch.yml` is the factory value: the effective one is editable from the dashboard header and stored in `settings.json` (`null` means not overridden), so one edit applies to every model without its own cap and survives a restart. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. Taking a slot is also the **count**: an uncapped model (`0`) is never judged full, but it is counted as in flight from the moment it enters — so the dashboard reports a real number for it too, written as `N (unlimited)` rather than `N/cap`. The cap and the count are two separate facts; unlimited means unlimited, not uncounted. A request that cannot get a slot does not queue: the gate skips the adapter entirely and fails it as `CAPACITY_TIMEOUT`, and routing switches the session to a free model in the group (candidate picking already skips full models). Only a group that is full end to end makes anything wait — for that model's slot, up to `concurrencyQueueTimeoutMs` (`0` waits forever); when a slot frees the session switches, and on timeout routing gives up for the turn (`all-capacity`).

@@ -80,6 +80,23 @@ const REBIND_INTERVAL_MS = 10000
 const STOP_GRACE_MS = 2000
 
 /**
+ * 正文超过这个字节数时，才去探「压缩腿是否在流里报错」。
+ *
+ * bili 的前置压缩在正文小时不会失败（实测 1 MB 以内正常压缩），探流只是白白
+ * tee 一次 SSE。线上 trae 会话正文能到 ~18 MB，那种体积几乎必然触发前置失败。
+ */
+const COMPRESSION_REFUSAL_PROBE_BYTES = 1n * 1024n * 1024n
+
+/**
+ * 单次读流的等待上限，以及整个探测过程的上限。
+ *
+ * 探针只在前几百字节内做判断，正常情况下第一次 `read()` 就有结果。给这么宽的余量
+ * 是因为上游可能先发心跳再发首帧；超出一律按「不是拒收」放行，绝不拿诊断逻辑
+ * 去赌一次正常请求。
+ */
+const STREAM_REFUSAL_PROBE_MS = 2000
+
+/**
  * SOLO 专属字段：发往 bili 前必须去掉，否则 OpenAI 协议解析会看到陌生键
  * （bili 会按 OpenAI 语义判断 max_tokens/上下文，Max 模式那几个字段会误导它）。
  */
@@ -117,14 +134,116 @@ function isPlainObject(value) {
 }
 
 /**
+ * 判断回环响应是不是「压缩腿自己拒收」，而不是上游的错误，并取出原因。
+ *
+ * bili 有两种失败形态，都表示请求**没有**发到上游，因此可以安全改走直发：
+ *
+ *   1. 还没提交响应头就失败：回 413 + `code: "preflight_compress_failed"`
+ *      （也可能是 `request_too_large` / `egress_window_fuse`）。
+ *   2. 已经提交了 200 + text/event-stream 之后才失败：在流里塞 `event: error`，
+ *      开头还会带一条 `: bili-preflight` 注释（`emitPreflightError`）。**这一种更常见**
+ *      —— 实测 0.5 MB 走 (1)，2 MB 以上走 (2)，而线上真实的 trae 会话正文达 18 MB。
+ *
+ * 上游自己的 413/400 不带这些标记，必须原样交给 adapter：对着它重发只会让同一个
+ * 错误慢一倍，还会重复计费。
+ *
+ * @param {unknown} response 回环请求拿到的 Response
+ * @returns {Promise<{refused: boolean, reason: string}>} refused 为真表示可安全回退
+ */
+async function classifyCompressionRefusal(response) {
+  if (!isPlainObject(response)) return { refused: false, reason: '' }
+  const status = response.status
+  const REFUSAL_CODES = ['preflight_compress_failed', 'request_too_large', 'egress_window_fuse']
+  if (status >= 400) {
+    let text = ''
+    try {
+      if (typeof response.clone === 'function') text = await response.clone().text()
+    } catch { /* 读不到正文就只能按状态码判断，见下 */ }
+    // 没有正文可读时不敢猜：误判会把上游错误重发一遍。
+    const hit = REFUSAL_CODES.find((code) => text.includes(code))
+    if (hit === undefined) return { refused: false, reason: '' }
+    return { refused: true, reason: 'HTTP ' + status + ' ' + text.slice(0, 180) }
+  }
+  // 形态 (2)：200 但流里是压缩腿的错误帧。只在正文够大时才值得探一眼 ——
+  // 小请求 bili 不会在前置阶段失败，探它只是白白 tee 一次流。
+  return { refused: false, reason: '' }
+}
+
+/**
+ * 用 `clone()` 探一眼响应流的前几百字节，看它是不是压缩腿的流内错误。
+ *
+ * 只在**大请求**时调用：小正文 bili 不会在前置阶段失败，每次 tee 一遍流纯属浪费。
+ *
+ * ⚠️ 必须带硬超时并**主动 abort**：`reader.cancel()` 在 tee 出来的副本上不保证
+ * 立即返回（实测会一直挂着），整个请求就卡在这里。这里用 `AbortSignal.timeout`
+ * 把探测限制在一小段时间内，超时一律按「不是拒收」处理 —— 宁可走原路径，
+ * 也不能让诊断逻辑把一次正常请求挂死。
+ *
+ * @param {unknown} response 回环请求拿到的 Response
+ * @returns {Promise<{refused: boolean, reason: string, probeError: string}>} refused 为真表示可安全回退
+ */
+async function peekStreamRefusal(response) {
+  const pass = (probeError = '') => ({ refused: false, reason: '', probeError })
+  if (!isPlainObject(response)) return pass()
+  if (response.status !== 200) return pass()
+  const headers = response.headers
+  const contentType = typeof headers?.get === 'function' ? String(headers.get('content-type') ?? '') : ''
+  if (!contentType.includes('text/event-stream')) return pass()
+  if (typeof response.clone !== 'function') return pass()
+  let text = ''
+  let reader
+  let probeError = ''
+  try {
+    reader = response.clone().body?.getReader()
+    if (reader === undefined) return pass()
+    const decoder = new TextDecoder()
+    // 探到出现完整的 SSE 帧边界就够判断，不必读完整个流。
+    const deadline = Date.now() + STREAM_REFUSAL_PROBE_MS
+    while (text.length < 2048 && Date.now() < deadline) {
+      const step = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), STREAM_REFUSAL_PROBE_MS)),
+      ])
+      if (step.timeout === true) break
+      if (step.done === true) break
+      text += decoder.decode(step.value, { stream: true })
+      if (text.includes('\n\n')) break
+    }
+  } catch (error) {
+    // 探测失败按「不是拒收」处理，绝不因诊断而让请求失败；但**必须把原因带出去**：
+    // 这里曾经吞掉一个 `ReferenceError`（常量未定义），探针永远返回 false 却毫无声响。
+    probeError = describeError(error)
+  }
+  // 取消副本**不 await**：TeedResponse 的 cancel 可能永远不 settle，等它就是之前
+  // 让自检挂死的成因。副本本身随后被 GC，不影响原流。
+  try { void reader?.cancel?.().catch?.(() => {}) } catch { /* 同步抛也忽略 */ }
+  if (text.includes('bili-preflight') || text.includes('preflight_compress_failed')) {
+    return { refused: true, reason: '流内 preflight 错误：' + text.slice(0, 180), probeError }
+  }
+  return pass(probeError)
+}
+
+/**
  * 把错误摊成一行可读文本（诊断字段用，绝不抛第二次）。
+ *
+ * 必须带上 `cause`：undici 的 `fetch failed` 只有一句无信息量的话，真正的
+ * 原因（`ECONNREFUSED` / `ECONNRESET` / `ENOTFOUND` / `UND_ERR_*`）在
+ * `error.cause` 上。丢掉它，回环失败就永远只能记成「fetch failed」，
+ * 无法区分「端口没起」和「对端把我们踹了」。
  *
  * @param {unknown} error 任意错误
  * @returns {string} 截断后的说明
  */
 function describeError(error) {
   const text = error !== null && error !== undefined && error.message !== undefined ? String(error.message) : String(error)
-  return text.slice(0, 160)
+  const cause = error !== null && typeof error === 'object' ? error.cause : undefined
+  let detail = ''
+  if (cause !== undefined && cause !== null) {
+    const code = typeof cause === 'object' && typeof cause.code === 'string' ? cause.code : ''
+    const message = typeof cause === 'object' && cause.message !== undefined ? String(cause.message) : ''
+    detail = ' | cause: ' + (code !== '' ? code : '') + (code !== '' && message !== '' ? ' ' : '') + message
+  }
+  return (text + detail).slice(0, 200)
 }
 
 /**
@@ -801,7 +920,39 @@ function createImpl(context) {
       return undefined
     }
     try {
-      return await original.call(self, loopUrl, loopInit)
+      const response = await original.call(self, loopUrl, loopInit)
+      // 拿到了响应头，但它是**压缩腿自己**的失败（不是上游的失败）。bili 在正文过大
+      // 或压缩前置检查不过时会回 413 `preflight_compress_failed`（实测：2 MB 的 SOLO
+      // 正文就会触发）。这种响应绝不能交给 adapter —— 它会当成上游 HTTP 413 直接
+      // 结束整轮，而真相是「这次没压缩成，直发本来能成」。
+      //
+      // 安全性：bili 在压缩前置阶段就失败了，请求**没有**到达上游，所以重发不会重复
+      // 计费；这正是回退直发的唯一安全窗口，与下面 catch 分支同理。
+      const refusal = await classifyCompressionRefusal(response)
+      if (refusal.refused) {
+        pending.delete(rid)
+        stats.fallback += 1
+        stats.lastError = '压缩腿拒收（已回退直发）：' + refusal.reason
+        return undefined
+      }
+      // 大正文更常见的失败形态是「200 + 流内 preflight 错误帧」。它一旦交给 adapter，
+      // 就会变成一次看起来像上游故障的失败 —— 而在它之前压缩腿根本没把请求发出去。
+      // 只在正文够大时探：小请求不会走到这条路径，每次 tee 流纯属浪费。
+      if (BigInt(loopInit.body.length) > COMPRESSION_REFUSAL_PROBE_BYTES) {
+        const streamRefusal = await peekStreamRefusal(response)
+        if (streamRefusal.refused) {
+          pending.delete(rid)
+          stats.fallback += 1
+          stats.lastError = '压缩腿流内拒收（已回退直发）：' + streamRefusal.reason
+          return undefined
+        }
+        if (streamRefusal.probeError !== '') {
+          // 探针自己坏了不改变结论（响应照常放行），但要留下痕迹：
+          // 静默失败的探针等于没有探针。
+          stats.lastProbeError = streamRefusal.probeError
+        }
+      }
+      return response
     } catch (err) {
       // 回环请求失败（还没拿到任何响应头）：这条回环**没有**出去过，所以清掉
       // pending 并让调用方回退到原始直发是安全的，也是唯一不让 TRAE 变砖的选择
@@ -1270,6 +1421,8 @@ export async function startTraeCompressShim(options) {
         // lastExchange 起步就是 null 而不是缺席：读 /status 的界面不必再判
         // 「这个键有没有出现过」，形状从第一次装载起就稳定。
         lastError: null, lastAt: null, lastExchange: null, targets: [], notes: [], pendingCount: 0,
+        // 探针自身失败的痕迹（与 lastError 分开：它不改变请求的结论）。
+        lastProbeError: null,
       }
   for (const key of ['intercepted', 'forwarded', 'compacted', 'folded', 'fallback']) {
     if (typeof stats[key] !== 'number') stats[key] = 0

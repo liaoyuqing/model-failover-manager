@@ -14,13 +14,13 @@ Seven tabs, ordered the way you actually triage:
 
 | Tab | What it does |
 | --- | --- |
-| **Models** | Providers on the left, models on the right; add one to a group with ＋. The top bar picks the routing group, the binding mode, and the new-session default. |
+| **Models** | Providers on the left, models on the right; add one to a group with ＋, and click that same entry again to drop it. The top bar picks the routing group, the binding mode, and the new-session default. |
 | **Routing groups** | Each group is an ordered model list (lower priority number goes first), with active time windows, an expiry date, and per-model failed/disabled switches. Move a model up or down in place, or remove it from the group. |
 | **Dashboard** | First-token latency, output speed, token usage, live concurrency and success rate per model; one-click speed tests and re-prioritising by the current sort. |
 | **Failed models** | Today's exhausted models with the latest failure reason; restore one or all. |
 | **Error retry** | dsh-llm-error-retry's own configuration page: rules, first-token timeout, Retry-After cap, max continuations. Saving applies immediately. |
 | **Free channels** | Six plugins that add free models — Our Free Model / CodeArts / WorkBuddy / Trae / Qoder / Providers Hub — with a copyable GitHub address and one-click install; Our Free Model comes first and Providers Hub last. |
-| **LAN** | Publishes routing groups over an OpenAI-compatible API for the local network: the `model` field is the route name, a total switch plus per-group switches decide what is exposed, and failures still fail over silently on the server. |
+| **LAN** | Publishes routing groups over an OpenAI-compatible API for the local network: the `model` field is the route name, a total switch plus per-group switches decide what is exposed, and failures still fail over silently on the server. Both `/v1/chat/completions` and `/v1/responses` are served from the same failover loop. |
 
 ![Routing groups tab](preview-routing-groups.png)
 
