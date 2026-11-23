@@ -2968,6 +2968,18 @@ ok('㊳ 市场描述点名了六个免费渠道与它们覆盖的平台，不是
 ok('㊳ 英文市场描述以句号结尾（awesome-dsh-plugin 的硬性要求）',
   typeof enMeta.description === 'string' && enMeta.description.trim().endsWith('.'),
   enMeta.description)
+// 三句话必须出现在市场文案里、且在中英两边同时出现：它们是最能决定「装不装」的三件事。
+// 本地路由转发与局域网转发是同一个功能在两种口径下的说法，只守关键词不守句式。
+// 开头那句允许改措辞（例如是否写「无限 token」），但「免费」与「失败自动切换」不得缺。
+const marketLead = { zh: '免费使用', zhKey: '请求失败自动切换', en: 'Free models', enKey: 'automatic failover' }
+ok('㊳ 中英市场描述都以「免费使用模型 + 失败自动切换」开头',
+  zhMeta.description.startsWith(marketLead.zh) && zhMeta.description.slice(0, 40).includes(marketLead.zhKey)
+  && enMeta.description.startsWith(marketLead.en) && enMeta.description.slice(0, 80).includes(marketLead.enKey),
+  JSON.stringify({ zh: zhMeta.description.slice(0, 24), en: enMeta.description.slice(0, 40) }))
+ok('㊳ 中英市场描述都写了局域网路由转发（OpenAI 兼容、两种方言、服务端切换）',
+  ['局域网路由', '/v1/chat/completions', '/v1/responses', 'OpenAI 兼容'].every(s => zhMeta.description.includes(s))
+  && ['LAN gateway', '/v1/chat/completions', '/v1/responses', 'OpenAI-compatible'].every(s => enMeta.description.includes(s)),
+  JSON.stringify({ zh: zhMeta.description.includes('/v1/responses'), en: enMeta.description.includes('/v1/responses') }))
 // ── ㊸ 局域网转发：分组以 OpenAI 兼容接口开放给局域网 ─────────────────────
 //
 // 这一段的每一条都对应需求里的一句：可开可关、model 字段＝路由名、局域网调用的
