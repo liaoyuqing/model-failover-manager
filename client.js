@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
     var API = '/api/model-failover'
     // dsh-llm-error-retry 的界面与配置 API 都挂在这个前缀上（同源，相对路径即可）。
     var RETRY_UI = '/llm-error-retry'
-    var VERSION = 'v30'
+    var VERSION = 'v31'
 
     /* ------------------------------------------------------------ styles -- */
     // 只用 ui-theme 已定义的 --dsw-alias-* token，不写硬编码兜底色：
@@ -201,7 +201,17 @@ window.__ModuleLoader__.load({
         border: '0.5px solid var(--dsw-alias-border-l2)',
         color: 'var(--dsw-alias-label-secondary)',
       },
-      chipFailed: { opacity: .5, textDecoration: 'line-through' },
+      /**
+       * 当日失败：压暗 + 删除线 + 灰字。
+       *
+       * 与「禁用」用不同的视觉语言——失败是「今天别再选它」，禁用是「永远别选它」，
+       * 两者都不参与路由，但恢复方式完全不同（等日界线/手动恢复 vs 手动启用）。
+       */
+      chipFailed: {
+        opacity: .45,
+        color: 'var(--dsw-alias-label-tertiary)',
+        textDecoration: 'line-through',
+      },
       /** 用户显式禁用的模型块：不做删除线（那不是失败），只压暗 + 虚线边 */
       chipDisabled: {
         opacity: .55,
@@ -583,6 +593,23 @@ window.__ModuleLoader__.load({
       return found && typeof found.priority === 'number' ? found.priority : 99
     }
 
+    /**
+     * 失败表的查找键：`裸渠道/model`。
+     *
+     * 失败记录里存的是记账时的裸渠道名（qodercn、modelscope），而分组条目、
+     * 模型目录、看板行用的是注册表 id（ofm-qodercn、caa-modelscope、ca-codearts）。
+     * 只按原文拼 `provider/model`，同一渠道换个前缀就查不到失败记录——分组里的
+     * 失败模型照常高亮、模型列表不出现「当日失败」、悬停也拿不到失败原因。
+     *
+     * 同名渠道的各前缀共用一条失败记录，与 Host 的 failKey（bareProvider）一致：
+     * 分组里只有一条 qodercn，ofm-qodercn 与 caa-qodercn 谁失败都是它失败。
+     */
+    function failKeyOf(provider, model) {
+      var s = String(provider == null ? '' : provider)
+      var prefix = providerPrefixOf(s)
+      return (prefix === '' ? s : s.slice(prefix.length)) + '/' + model
+    }
+
     function providerSame(a, b) {
       var x = String(a == null ? '' : a)
       var y = String(b == null ? '' : b)
@@ -700,10 +727,12 @@ window.__ModuleLoader__.load({
      */
     function poolOf(catalog, status) {
       var failedMap = {}
-      ;((status && status.failed) || []).forEach(function (f) { failedMap[keyOf(f.provider, f.model)] = true })
+      ;((status && status.failed) || []).forEach(function (f) { failedMap[failKeyOf(f.provider, f.model)] = true })
       var base = (catalog && catalog.length) ? catalog : ((status && status.allModels) || [])
       return base.map(function (m) {
-        return Object.assign({}, m, { failed: failedMap[keyOf(m.provider, m.model)] === true })
+        // 目录侧 provider 带注册表前缀（ofm-/caa-/ca-），失败表存的是裸渠道名，
+        // 所以两边都过 failKeyOf 才对得上。
+        return Object.assign({}, m, { failed: failedMap[failKeyOf(m.provider, m.model)] === true })
       })
     }
 
@@ -1070,12 +1099,12 @@ window.__ModuleLoader__.load({
 
       var failedMap = {}
       var failedList = (status && status.failed) || []
-      failedList.forEach(function (f) { failedMap[keyOf(f.provider, f.model)] = true })
+      failedList.forEach(function (f) { failedMap[failKeyOf(f.provider, f.model)] = true })
       // 当日失败的详情（错误码 + 完整报错文案）：看板上悬停要看的就是它。
       // 单独的 map，不改 failedMap 的布尔语义——模型列表只关心「失败没失败」。
       var failedDetail = {}
       failedList.forEach(function (f) {
-        failedDetail[keyOf(f.provider, f.model)] = { code: f.code || null, reason: f.reason || null }
+        failedDetail[failKeyOf(f.provider, f.model)] = { code: f.code || null, reason: f.reason || null }
       })
       var routeGroups = (status && status.groups) || []
       var boundGroup = binding ? routeGroups.find(function (g) { return g.id === binding }) : undefined
@@ -1194,7 +1223,7 @@ window.__ModuleLoader__.load({
         var out = []
         providerGroup.models.forEach(function (m) {
           var k = keyOf(providerGroup.id, m.id)
-          var failed = failedMap[k] === true
+          var failed = failedMap[failKeyOf(providerGroup.id, m.id)] === true
           var isCurrent = currentKey === k
           var style = Object.assign({}, S.modelRow, isCurrent ? S.modelCurrent : {}, failed ? S.modelFailed : {})
           var inGroups = groupsOf(providerGroup.id, m.id)
@@ -1638,7 +1667,9 @@ window.__ModuleLoader__.load({
                   e('button', { style: S.btn, onClick: function () { setEditing({ action: 'edit', id: g.id, name: g.name, models: (g.models || []).slice() }) } }, '编辑'))),
               e('div', null, sorted.map(function (m, idx) {
                 var k = keyOf(m.provider, m.model)
-                var f = failedMap[k] === true
+                // Host 已经按裸渠道算好 failed（status.groups[].models[].failed）；
+                // 失败表本身按裸名存，所以两边任一命中即可，不依赖前缀写法。
+                var f = m.failed === true || failedMap[failKeyOf(m.provider, m.model)] === true
                 var off = m.disabled === true
                 // 并发冷却：Host 因并发打满把它挡了几十秒，到期自动恢复。与「失败/禁用」
                 // 三者互不覆盖——冷却中的模型并没有坏，不该被执行线划掉。
@@ -2046,7 +2077,9 @@ window.__ModuleLoader__.load({
        * 与其显示一个空壳错误码，不如什么都不显示。
        */
       function errorDetailOf(r, k) {
-        var det = failedDetail[k]
+        // k 是看板行的 keyOf（带前缀的注册表 id），失败表按裸渠道名存，两者
+        // 必须过 failKeyOf 才对得上；这里自己换算，调用点不用关心前缀写法。
+        var det = failedDetail[typeof r.provider === 'string' ? failKeyOf(r.provider, r.model) : k]
         var code = null
         var message = null
         var source = null
@@ -3350,7 +3383,7 @@ window.__ModuleLoader__.load({
       var allModels = poolOf(catalog, status)
       var dialogMode = !!(status && status.settings && status.settings.dialogMode)
       var failedMap = {}
-      failed.forEach(function (f) { failedMap[keyOf(f.provider, f.model)] = true })
+      failed.forEach(function (f) { failedMap[failKeyOf(f.provider, f.model)] = true })
 
       function refresh() { loadStatus().then(function (d) { if (d) setStatus(d) }) }
       function toggleDialog() {
@@ -3455,7 +3488,7 @@ window.__ModuleLoader__.load({
                 onClick: function () { fetch(API + '/groups/' + encodeURIComponent(g.id), { method: 'DELETE', credentials: 'same-origin' }).then(refresh) },
               }, '删除')),
             e('div', null, sorted.map(function (m) {
-              var f = failedMap[keyOf(m.provider, m.model)] === true
+              var f = m.failed === true || failedMap[failKeyOf(m.provider, m.model)] === true
               return e('span', { key: keyOf(m.provider, m.model), style: Object.assign({}, S.chip, f ? S.chipFailed : {}) },
                 'P' + (m.priority ?? 99) + ' ' + m.provider + '/' + m.model + (f ? ' ✕' : ''))
             })))

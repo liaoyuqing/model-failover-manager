@@ -131,7 +131,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v125' // bili 限流闸门回绝记为临时失败（带到期时刻自动恢复，不写当日失败）
+const HOST_VERSION = 'v126' // 限流类失败一律记临时失败（四路判据），不换号、不写当日失败，直接换模型续跑
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -1038,40 +1038,67 @@ export function apply(ctx, config = {}) {
   const TEMPORARY_FAILURE_MAX_MS = 60 * 60_000
   /** terminal 分支不写到期时刻，只承诺「最多每 N 秒探一次」，取这个默认值。 */
   const BILI_THROTTLE_PROBE_MS = 30_000
+  /** 上游没给恢复时刻的普通限流：给一个保守的退避时长，到期自动回到候选。 */
+  const RATE_LIMIT_DEFAULT_MS = 60_000
 
   /**
-   * 这次失败是不是 bili 的限流闸门回绝，是的话返回它的到期时刻。
+   * 这次失败是不是**定时恢复**的临时错误（限流/节流），是的话返回它的到期时刻。
    *
-   * 判据必须是**文案**而不只是错误码：适配器会把 bili 的响应压成自己的
-   * `RATE_LIMIT`/`429`，`bili_throttle_*` 往往传不到插件这一层。两条文案分别是
-   * 「holding outbound sends until <ISO>」与「stops amplifying after N consecutive」。
+   * 这类失败的成因是「此刻打得太猛」，上游自己会在一段时间后放行，与「模型坏了」
+   * 的处置完全不同，三处必须一致：
+   *  · 不写当日失败——凭一条限流报文把模型停用到下一个日界是错的；
+   *  · 不换账号重试——bili 的闸门按「账号+主机」记，同渠道换号拿到的是同一条 hold；
+   *  · 换到组内其它模型并续跑——本函数返回到期时刻，路由据此把该模型排除出候选，
+   *    到期自动恢复（`temporaryFailureOf` 到期即删）。
    *
-   * 时刻优先取报文里的绝对时间（`until 2026-11-23T22:01:49.355Z`），取不到再用
-   * 相对秒数（`~591s` / `every 30s`）按收到失败的这一刻折算。
+   * 判据收四路，任一命中即算：
+   *  · 宿主给出的 `providerRetryAfterMs`（上游 `Retry-After` 解析出的毫秒数）——最准；
+   *  · HTTP 状态码 429（限流）/ 424（bili 限流闸门的终态）；
+   *  · 机器码里的限流/节流字样，与 `isRateLimitLike` 同一套判据（RATE/LIMIT/THROTTLE），
+   *    保证「插件认作限流的失败」一定走临时失败这条路；
+   *  · bili 闸门自己的两个码与那两句报文（最明确的证据，保留原判据）。
    *
-   * @param {{code?: string, status?: number, message?: string}|undefined} failure - 宿主给出的失败事实。
-   * @returns {{until: number, reason: string}|null} 到期时刻与原文；不是闸门回绝则为 null。
+   * 文案不作为唯一判据：适配器会把 bili 的响应压成自己的 `RATE_LIMIT`/`429`，
+   * `bili_throttle_*` 往往传不到插件这一层。
+   *
+   * 时刻优先取上游自己给的 `providerRetryAfterMs`，其次取 bili 报文里的绝对时间
+   * （`until 2026-11-23T22:01:49.355Z`），再取相对秒数（`~591s` / `every 30s`），
+   * 都没有则按 bili 终态用探测周期、其余限流用保守退避时长兜底。
+   *
+   * @param {{code?: string, status?: number, message?: string, providerRetryAfterMs?: number}|undefined} failure - 宿主给出的失败事实。
+   * @returns {{until: number, reason: string}|null} 到期时刻与原文；不是定时恢复类失败则为 null。
    */
-  function biliThrottleHoldOf(failure) {
+  function rateLimitHoldOf(failure) {
     if (!failure) return null
     const message = String(failure.message ?? '')
-    const byCode = BILI_THROTTLE_HOLD_CODES.has(String(failure.code ?? ''))
-    const byText = /bili is holding outbound sends until\s+\S+/i.test(message)
+    const code = String(failure.code ?? '')
+    const biliByCode = BILI_THROTTLE_HOLD_CODES.has(code)
+    const biliByText = /bili is holding outbound sends until\s+\S+/i.test(message)
       || /bili stops amplifying after\s+\d+\s+consecutive rate limits/i.test(message)
-    if (!byCode && !byText) return null
+    // 与 isRateLimitLike 同一套判据（状态码 429 或机器码里的 RATE/LIMIT/THROTTLE），
+    // 外加 bili 终态的 424：插件认作限流的失败必须走临时失败，不能落到当日失败。
+    const byRateLimit = isRateLimitLike(failure) || Number(failure.status) === 424
+    const retryAfter = Number(failure.providerRetryAfterMs)
+    const byRetryAfter = Number.isFinite(retryAfter) && retryAfter > 0
+    if (!biliByCode && !biliByText && !byRateLimit && !byRetryAfter) return null
+
     const now = Date.now()
     let until = null
-    const absolute = /holding outbound sends until\s+(\S+)/i.exec(message)
-    if (absolute !== null) {
-      const parsed = Date.parse(absolute[1].replace(/[),.;]+$/, ''))
-      if (Number.isFinite(parsed)) until = parsed
+    // 上游自己给的恢复时刻最准，优先用它。
+    if (byRetryAfter) until = now + retryAfter
+    if (until === null) {
+      const absolute = /holding outbound sends until\s+(\S+)/i.exec(message)
+      if (absolute !== null) {
+        const parsed = Date.parse(absolute[1].replace(/[),.;]+$/, ''))
+        if (Number.isFinite(parsed)) until = parsed
+      }
     }
     if (until === null) {
       const relative = /~(\d+)s\b/.exec(message) ?? /every\s+(\d+)s\b/i.exec(message)
       const seconds = relative === null ? NaN : Number(relative[1])
       if (Number.isFinite(seconds) && seconds >= 0) until = now + seconds * 1000
     }
-    if (until === null) until = now + BILI_THROTTLE_PROBE_MS
+    if (until === null) until = now + (biliByCode || biliByText ? BILI_THROTTLE_PROBE_MS : RATE_LIMIT_DEFAULT_MS)
     const clamped = Math.min(Math.max(until, now + TEMPORARY_FAILURE_MIN_MS), now + TEMPORARY_FAILURE_MAX_MS)
     return { until: clamped, reason: message.trim().slice(0, 400) }
   }
@@ -1115,7 +1142,7 @@ export function apply(ctx, config = {}) {
    *
    * @param {string} provider - provider id（裸名）。
    * @param {string} model - model id。
-   * @param {{until: number, reason: string}} hold - `biliThrottleHoldOf` 的结果。
+   * @param {{until: number, reason: string}} hold - `rateLimitHoldOf` 的结果。
    * @param {string|null} code - 上游给的错误码，仅用于展示。
    * @returns {void}
    */
@@ -2307,9 +2334,11 @@ export function apply(ctx, config = {}) {
   // accountPool 由 dsh-our-free-model 的渠道包注册（pack.js: ctx.provide('accountPool', pool)），
   // 未安装该插件时 ctx.get 返回 undefined，整段静默跳过。
   //
-  // 不论失败原因是什么（402 额度、429 限流、5xx、超时都一样），只要该模型
-  // 还有别的可用账号就先换账号重试一轮。账号总数是天然的循环上界。
+  // 账号级失败（402 额度、5xx、超时等）只要该模型还有别的可用账号，就先换账号
+  // 重试一轮。账号总数是天然的循环上界。
   //
+  // 限流/节流这类**定时恢复**的失败不在此列：它们该换模型续跑，换号拿到的是同一条
+  // hold，见 `rateLimitHoldOf` 与调用点的分支。
   // 只写入池的「冷却标记」这一件事：把刚失败的账号+模型写一个短冷却，
   // 适配器下次选号就会跳过它。绝不改凭据、绝不动账号本身的其他字段。
   //
@@ -2387,16 +2416,9 @@ export function apply(ctx, config = {}) {
     }
     if (!next || !next.entry?.id) return null
 
-    // 限流类失败（429 / RATE_LIMIT 等）：适配器自己已经写了冷却标记并换号重试，
-    // 池里刚失败的账号已被排除，`getAvailableAccount` 拿到的已是下一个账号。
-    // 此时再冷却会锁住一个本来可用的账号，故只交回账号 id 触发重跑。
-    if (isRateLimitLike(failure)) {
-      ctx.logger.info(`[model-failover] ${provider}/${model} 限流类失败（${failure?.code ?? 'unknown'}），适配器已自行冷却并换号，返回重试`)
-      return next.entry.id
-    }
-
-    // 非限流失败：给刚失败的账号写一个短冷却标记，让适配器下次选号跳过它。
-    // 这是唯一能让换号真正生效的机制（见函数顶部的排障说明）。
+    // 限流/节流类失败不会走到这里：`rateLimitHoldOf` 已经把它们判为定时恢复的临时失败，
+    // 调用方直接跳过换号、走分组路由换模型。所以到达这里的失败都是「这个账号此刻不可用
+    // 但换个账号也许能行」的一类，给刚失败的账号写一个短冷却标记，让适配器下次选号跳过它。
     try {
       await pool.updateModelRateLimit(next.entry.id, model, now + FREE_MODEL_ACCOUNT_COOLDOWN_MS)
     } catch (e) {
@@ -3179,7 +3201,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 限流类失败：适配器自己会写冷却标记并换号，无需本插件再冷却账号 */
+  /** 限流类失败：状态码 429，或机器码里带 RATE/LIMIT/THROTTLE 字样 */
   function isRateLimitLike(failure) {
     if (!failure) return false
     if (failure.status === 429) return true
@@ -3248,15 +3270,16 @@ export function apply(ctx, config = {}) {
     // 请求被拒不写当日失败：这个模型换个请求还能用，停用一整天是错的。
     // 但它必须参与「别的模型为何被跳过」的判断，所以只记 errorTurns 并继续切模型。
     //
-    // bili 的 429 限流闸门回绝（#4204）同样不能写成当日失败：报文本身就说清了到期
-    // 时刻（`holding outbound sends until <ISO>`），上游到点自己会放行。写进当日失败
-    // 等于凭一条 591 秒的限流把模型停用到下一个日界。改为「临时失败」：带到期时刻，
-    // 到期自动回到候选（temporaryFailureOf 到期即删），期间不参与路由挑选。
-    const throttleHold = biliThrottleHoldOf(failure)
+    // 限流/节流这类**定时恢复**的失败同样不能写成当日失败：上游自己会在一段时间后
+    // 放行（报文里常带 `holding outbound sends until <ISO>`，或宿主解析出的
+    // `providerRetryAfterMs`）。写进当日失败等于凭一条 591 秒的限流把模型停用到下一个
+    // 日界。改为「临时失败」：带到期时刻，到期自动回到候选（temporaryFailureOf 到期
+    // 即删），期间不参与路由挑选，本轮则换到组内其它模型续跑。
+    const throttleHold = rateLimitHoldOf(failure)
     if (throttleHold !== null) {
       markTemporaryFailure(provider, model, throttleHold, failure?.code ?? null)
       const waitSeconds = Math.max(1, Math.round((throttleHold.until - Date.now()) / 1000))
-      ctx.logger.warn(`[model-failover] ${provider}/${model} 被 bili 限流闸门回绝，临时失败 ${waitSeconds}s 后自动恢复（不写当日失败）`)
+      ctx.logger.warn(`[model-failover] ${provider}/${model} 限流/节流临时失败 ${waitSeconds}s 后自动恢复（不写当日失败），换到组内其它模型续跑`)
     }
     if (!capacityFailure && !requestRejected && throttleHold === null) {
       markFailed(provider, model, failure)
@@ -3453,17 +3476,19 @@ export function apply(ctx, config = {}) {
     // routeAfterModelFailure，这里只需要它们来决定要不要走换号分支。
     const capacityFailure = isCapacityFailure(failure)
     const requestRejected = isRequestRejectedFailure(failure)
-    // bili 的限流闸门按「账号+主机」记 hold（dsh-native.js 的 holdKey），换到同渠道另一个
-    // 账号拿到的还是同一条 hold，换号只会白等一轮、还把另一个账号也记上一次失败。
-    const throttleHold = biliThrottleHoldOf(failure)
+    // 限流/节流这类**定时恢复**的失败不换号：限流是模型/渠道层面的，同渠道换号拿到的
+    // 还是同一条 hold（bili 的 holdKey 就是「账号+主机」），换号只会白等一轮、还把另一个
+    // 账号也记上一次失败。这类失败要的是换模型续跑，交给下面的分组路由。
+    const throttleHold = rateLimitHoldOf(failure)
 
-    // Our Free Model 的模型：不论错误类型，一律先试换账号重试。
+    // Our Free Model 的模型：非临时失败一律先试换账号重试。
     // 换的是同一 provider/model 背后的凭据，selection 没变，所以同一步 retry 安全。
     // 哪些 provider 算「Our Free Model 的」由 config.ofmHandoffExcludeProviders 判定：
     // 名单内（默认 codearts）直接落到下面的分组路由。
     //
     // 并发类失败不换号：账号池打满时换号拿到的还是同一个池，换模型才有意义。
     // 请求被拒也不换号：模型上限/参数问题与凭据无关，换号只会白等一轮。
+    // 限流/节流也不换号：见上面的 throttleHold。
     const handedTo = (capacityFailure || requestRejected || throttleHold !== null)
       ? null
       : await handoffToFreeModelAccount(rawProvider, model, failure)

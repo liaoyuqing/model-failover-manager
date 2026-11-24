@@ -679,9 +679,13 @@ curl http://192.168.0.100:47021/v1/responses \
 
 上游限流（billion-context 的 429/424 闸门回绝，`bili_throttle_hold` / `bili_throttle_terminal`）**不写当日失败**，而是记一条**带到期时刻的临时失败**：该模型在到期前不参与路由挑选，到点自动回来，既不用等到日界也不用点恢复。
 
-判据是报文而不是错误码：适配器会把 bili 的响应压成自己的 `RATE_LIMIT`/429，`bili_throttle_*` 通常传不到插件这一层。识别靠两条文案——`bili is holding outbound sends until <ISO>`（429，含绝对到期时刻与 `~Ns` 退避秒数）与 `bili stops amplifying after N consecutive`（424，只有探测周期）。到期时刻优先取报文里的绝对时间，取不到才用相对秒数折算，最后夹进 1 秒～1 小时的区间。
+判据收四路，任一命中即算临时失败：宿主给的 `providerRetryAfterMs`（上游 `Retry-After` 解析出的毫秒数）、HTTP `429`/`424`、机器码里的限流字样（与 `isRateLimitLike` 同一套：状态码 429 或码含 `RATE`/`LIMIT`/`THROTTLE`）、以及 bili 那两条固定文案——`bili is holding outbound sends until <ISO>` 与 `bili stops amplifying after N consecutive`。
 
-同一类失败**不换账号重试**：bili 的 hold 按「账号+主机」记（`holdKey`），同渠道换号拿到的还是同一条 hold，只会白等一轮并把另一个账号也记上一次失败。
+只看文案是不够的：适配器会把 bili 的响应压成自己的 `RATE_LIMIT`/429，`bili_throttle_*` 通常传不到插件这一层，于是「插件认作限流的失败」在旧判据下会漏到当日失败表里，把模型停用到下一个日界。反过来也一视同仁：别的上游（非 bili）的 429 同样走这条路。
+
+到期时刻按 `providerRetryAfterMs` → 报文里的绝对时间（`until 2026-11-23T22:01:49.355Z`）→ 相对秒数（`~591s` / `every 30s`）的顺序选取；都没有时 bili 终态用探测周期 `30s`、其余限流用保守退避 `60s`。结果夹进 1 秒～1 小时的区间。
+
+同一类失败**不换账号重试**，直接换模型续跑：bili 的 hold 按「账号+主机」记（`holdKey`），同渠道换号拿到的还是同一条 hold，只会白等一轮并把另一个账号也记上一次失败；限流是「此刻打得太猛」，换号的处置方向本身就错。
 
 临时失败与当日失败在看板上分开显示（分组页签的模型块标「限流 Ns」、失败模型页签单列一块），因为「等几分钟」和「等明天」的处置完全不同。本轮成功会立刻清掉临时失败；`POST /failed/reset` 也会一起清（用户点了恢复，就不能还卡着）。`GET /status` 的 `temporaryFailures` 与各模型条目的 `temporaryFailure` / `temporaryUntil` 是它的读出口。
 

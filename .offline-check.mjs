@@ -492,6 +492,58 @@ const handoffProbe = []
 }
 await api('POST', '/failed/reset', {})
 
+// ⑨c 判定放宽：适配器把 bili 的限流报文压成自己的机器码/状态码，本层拿不到 bili 文案，
+// 也要认成定时恢复的临时错误。否则它落到 markFailed 写成当日失败 —— 用户看到的就是
+// 「临时错误被当成永久失败，模型停用一整天」，且不会切模型续跑。
+await api('POST', '/failed/reset', {})
+useModel('throttle-1', 'm2')
+throttleAgent.status = 'running'
+await errHandler(
+  { agent: throttleAgent, turn: 5, provider: 'p', failure: { code: 'RATE_LIMIT', message: 'upstream rate limited', status: 200 } },
+  () => Promise.resolve(undefined),
+)
+{
+  const s = (await api('GET', '/status')).body
+  ok('⑨c 只有机器码 RATE_LIMIT（无 bili 文案）也记临时失败、不写当日失败',
+    !s.failed.some(f => f.provider === 'p' && f.model === 'm2')
+      && (s.temporaryFailures || []).some(e => e.provider === 'p' && e.model === 'm2'),
+    JSON.stringify({ failed: s.failed.filter(f => f.model === 'm2'), temp: s.temporaryFailures }))
+  ok('⑨c 临时失败期间切到组内其它模型（换模型续跑，不是原地不动）',
+    (await runPreStep('throttle-1')) === 'm1')
+}
+
+// 只有状态码、机器码不可读时：429 本身就是限流的最强证据。
+await api('POST', '/failed/reset', {})
+useModel('throttle-1', 'm2')
+throttleAgent.status = 'running'
+await errHandler(
+  { agent: throttleAgent, turn: 6, provider: 'p', failure: { code: 'UNKNOWN', message: 'upstream rejected', status: 429 } },
+  () => Promise.resolve(undefined),
+)
+{
+  const s = (await api('GET', '/status')).body
+  ok('⑨c HTTP 429 即使机器码是 UNKNOWN 也记临时失败',
+    (s.temporaryFailures || []).some(e => e.provider === 'p' && e.model === 'm2'),
+    JSON.stringify(s.temporaryFailures))
+}
+
+// Retry-After 解析出的毫秒数是最准的到期时刻，应当优先于报文里的兜底估算。
+await api('POST', '/failed/reset', {})
+useModel('throttle-1', 'm2')
+const retryAfterAt = Date.now() + 120_000
+throttleAgent.status = 'running'
+await errHandler(
+  { agent: throttleAgent, turn: 7, provider: 'p', failure: { code: 'RATE_LIMIT', message: 'rate limited', status: 429, providerRetryAfterMs: retryAfterAt - Date.now() } },
+  () => Promise.resolve(undefined),
+)
+{
+  const e = ((await api('GET', '/status')).body.temporaryFailures || []).find(x => x.provider === 'p' && x.model === 'm2')
+  ok('⑨c providerRetryAfterMs 优先作为到期时刻',
+    !!e && Math.abs(e.until - retryAfterAt) < 2000,
+    e && `until=${new Date(e.until).toISOString()} want=${new Date(retryAfterAt).toISOString()}`)
+}
+await api('POST', '/failed/reset', {})
+
 // ⑨ 状态序列诊断：续跑投递必须落在 idle 与下一次 running 之间
 for (const fn of handlers.getAll('agent/status')) fn({ agent: failedAgent, status: 'running' })
 const logResp = await api('GET', '/debug/status-log?sessionId=sub-explicit&limit=200')
@@ -3497,6 +3549,24 @@ ok('㊸ 自检用的临时分组已清掉',
     clientText.includes('function removeFromGroup(groupId, providerId, modelId)')
     && clientText.includes("apiSend(API + '/groups', 'PUT', { id: groupId, models: rest })")
     && clientText.includes('providerSame(m.provider, providerId) && m.model === modelId'))
+
+  // ── 分组里失败模型的压暗：失败表按裸渠道名记账，分组条目按注册表 id 存，
+  // 两者必须归一成同一个键才对得上；否则分组里失败的模型会照常高亮（本次修复）。
+  ok('㊹ 失败表查找统一用 failKeyOf（裸渠道/model），不残留 keyOf 拼原文',
+    clientText.includes('function failKeyOf(provider, model)')
+    && clientText.includes('failedMap[failKeyOf(f.provider, f.model)] = true')
+    && !/failedMap\[keyOf\(/.test(clientText)
+    && !/failedDetail\[keyOf\(/.test(clientText))
+  ok('㊹ 分组页签认 Host 下发的 failed 标记（分组条目带前缀、失败表是裸名，两路都不能漏）',
+    clientText.includes('var f = m.failed === true || failedMap[failKeyOf(m.provider, m.model)] === true'))
+  ok('㊹ 模型页签与可选模型池同样按裸键比对失败（否则带前缀的渠道不显示「当日失败」）',
+    clientText.includes('var failed = failedMap[failKeyOf(providerGroup.id, m.id)] === true')
+    && clientText.includes('Object.assign({}, m, { failed: failedMap[failKeyOf(m.provider, m.model)] === true }'))
+  ok('㊹ 当日失败的块用灰字压暗（与「禁用」的虚线区分开）',
+    clientText.includes("chipFailed: {\n        opacity: .45,")
+    && clientText.includes("color: 'var(--dsw-alias-label-tertiary)',")
+    && clientText.includes("textDecoration: 'line-through'")
+    && clientText.includes("chipDisabled: {\n        opacity: .55,\n        borderStyle: 'dashed'"))
 
   await api('DELETE', '/groups/' + encodeURIComponent(toggleId))
 }
