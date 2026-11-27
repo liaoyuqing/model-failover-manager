@@ -131,7 +131,7 @@ const PLUGIN_FILE = (() => {
  *
  * 改功能时手工改这一行：没换文件名以后，「跑的是哪版」只能靠它回答。
  */
-const HOST_VERSION = 'v126' // 限流类失败一律记临时失败（四路判据），不换号、不写当日失败，直接换模型续跑
+const HOST_VERSION = 'v132' // 中断类也换模型：按取消原因区分「用户按停止」与「别处掐断」
 /**
  * 模型端点注定绕过 billion-context 压缩代理的 provider（见文件头「压缩旁路」）。
  *
@@ -275,6 +275,20 @@ function beijingDayKey() {
 function beijingHour() { return beijingParts().hour }
 
 /**
+ * 北京时间的星期几：0=周日 … 6=周六（与 `Date#getDay` 同口径）。
+ *
+ * 用 `Date.UTC` 反查而不是 `getDay()`：后者读的是机器本地日历日，机器不在
+ * UTC+8 时会在北京时间的凌晨/深夜错一天，与「所有时间口径都按北京时间」冲突。
+ *
+ * @param {number} [atMs] - 要换算的时刻；缺省为当前。
+ * @returns {number} 0..6 的星期序数。
+ */
+function beijingWeekday(atMs) {
+  const p = beijingParts(atMs)
+  return new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay()
+}
+
+/**
  * 「当日失败」的日界线小时（北京时间），默认 8 点。
  *
  * 为什么挪到早上 8 点而不是零点：上游额度多按 UTC+8 自然日在 00:00 结算，
@@ -324,7 +338,7 @@ const OFM_PROVIDER_PREFIX = 'ofm-'
  * 实现：先减去 failResetHour 小时，再按北京时间取日期。Asia/Shanghai 无
  * 夏令时，减固定小时数不会跨 DST 跳变，因此结果恰是「日界线平移后的日期」；
  * 用 `Date.UTC` 拼时间戳会引入本机时区误差，故不这么做。
- * 失败标记、当日计数、`/status` 的当日过滤都用它；截止日 `until` 仍按自然日。
+ * 失败标记、当日计数、`/status` 的当日过滤都用它。
  */
 function failDayKey(failResetHour) {
   const p = beijingParts(Date.now() - failResetHour * 3600_000)
@@ -376,6 +390,69 @@ export function apply(ctx, config = {}) {
   const ofmHandoffExcludedProviders = new Set(ofmExcludeList)
   /** 每个被排除的 provider 只提示一次，避免每次失败都刷一行日志 */
   const ofmHandoffExcludedWarned = new Set()
+
+  // 账号换号总开关（见 handoffToFreeModelAccount）。
+  //
+  // **默认关**：换号要读渠道插件的账号池、按渠道写池级冷却标记，是跨插件的兼容
+  // 路径——渠道插件自己在运行时就会换号（WorkBuddy 报「积分已耗尽，已改用池中另
+  // 一个账号回答」时，本插件从头到尾没参与），两条路径同时动手只会互相抵消：本插件
+  // 把刚失败的账号写进冷却，渠道插件那边本来还能用的号也被挡掉一整天。
+  // 关掉后失败直接交给分组路由换模型，处置单一、可预测。
+  // 打开（ofmAccountHandoff: true）即恢复旧行为，池与积分的读取逻辑仍原样保留。
+  //
+  // 这里只是**出厂值**：设置页上的开关存在 settings.json 的 ofmAccountHandoff，
+  // null 表示没覆盖过、跟随 config。生效值在 settings 读盘后算。
+  const configAccountHandoff = config.ofmAccountHandoff === true
+  /** 生效值：settings.json 里的覆盖优先，null/缺省时等于 configAccountHandoff（见下方读盘后那一段） */
+  let ofmAccountHandoff = configAccountHandoff
+
+  // 会话没跑完就收尾时也换模型（见 handleTurnEnd）。
+  //
+  // 覆盖的不是「模型坏了」，而是「这一轮没结果」：输出撞上 token 上限被截断、
+  // 思考陷入病态重复被中止、上游把这一轮中断。这些时候模型本身没错，原地重试
+  // （llm-error-retry 对病态重复配的是 5s×5）只会再烧一遍同样的思考，用户的
+  // 体感是「会话停了，得自己敲继续」。所以让分组路由换一个模型把话说完。
+  //
+  // 用户按停止不走这条路：那是人的决定，自动换模型续跑等于否决它（见 handleTurnEnd）。
+  // 出厂值只在这里；设置页的开关存 settings.json 的 ofmSwitchOnTurnEnd，null = 跟随 config。
+  const configSwitchOnTurnEnd = config.ofmSwitchOnTurnEnd !== false
+  /** 生效值：settings.json 里的覆盖优先，null/缺省时等于 configSwitchOnTurnEnd */
+  let ofmSwitchOnTurnEnd = configSwitchOnTurnEnd
+  // 退化的模型冷却多久（毫秒）：病态重复、撞输出上限的模型在这段时间里不参与路由。
+  // 不是当日失败——它们换个提示词还能用，停用到日界太重（撞一次长回答就废一天）。
+  // 0 表示只换走、不冷却（下一轮可能又选回它）。
+  const ofmDegenerateCooldownRaw = config.ofmDegenerateCooldownMs
+  const ofmDegenerateCooldownMs = (typeof ofmDegenerateCooldownRaw === 'number' && Number.isInteger(ofmDegenerateCooldownRaw)
+    && ofmDegenerateCooldownRaw >= 0 && ofmDegenerateCooldownRaw <= 86_400_000)
+    ? ofmDegenerateCooldownRaw
+    : 600_000
+  if (ofmDegenerateCooldownRaw !== undefined && ofmDegenerateCooldownMs !== ofmDegenerateCooldownRaw) {
+    ctx.logger.warn(`[model-failover] config.ofmDegenerateCooldownMs=${JSON.stringify(ofmDegenerateCooldownRaw)} 非法（需 0..86400000 的整数），回退 600000`)
+  }
+  // 换号时读渠道积分（见 handoffToFreeModelAccount 的积分段）。只在换号开着时才
+  // 有意义；换号本身关了，这里的取值不影响任何路径。默认开。
+  const ofmCreditSkip = config.ofmCreditSkip !== false
+  // 查一次积分的超时。渠道包是逐账号顺序打上游的（见 pack.js 的 collectCreditBalances），
+  // 账号多的渠道会到秒级；8s 足够覆盖实测的 minimax（5 账号 791ms），又不至于把
+  // 一次换号拖成用户可感的等待。
+  const ofmCreditProbeTimeoutRaw = config.ofmCreditProbeTimeoutMs
+  const ofmCreditProbeTimeoutMs = (typeof ofmCreditProbeTimeoutRaw === 'number' && Number.isInteger(ofmCreditProbeTimeoutRaw)
+    && ofmCreditProbeTimeoutRaw >= 1000 && ofmCreditProbeTimeoutRaw <= 60_000)
+    ? ofmCreditProbeTimeoutRaw
+    : 8000
+  if (ofmCreditProbeTimeoutRaw !== undefined && ofmCreditProbeTimeoutMs !== ofmCreditProbeTimeoutRaw) {
+    ctx.logger.warn(`[model-failover] config.ofmCreditProbeTimeoutMs=${JSON.stringify(ofmCreditProbeTimeoutRaw)} 非法（需 1000..60000 的整数），回退 8000`)
+  }
+  // 积分缓存时长：一次失败换号可能连着触发几次判定，缓存挡住重复打上游。
+  // 0 表示每次都重新查（排查用）。
+  const ofmCreditCacheRaw = config.ofmCreditCacheMs
+  const ofmCreditCacheMs = (typeof ofmCreditCacheRaw === 'number' && Number.isInteger(ofmCreditCacheRaw)
+    && ofmCreditCacheRaw >= 0 && ofmCreditCacheRaw <= 600_000)
+    ? ofmCreditCacheRaw
+    : 60_000
+  if (ofmCreditCacheRaw !== undefined && ofmCreditCacheMs !== ofmCreditCacheRaw) {
+    ctx.logger.warn(`[model-failover] config.ofmCreditCacheMs=${JSON.stringify(ofmCreditCacheRaw)} 非法（需 0..600000 的整数），回退 60000`)
+  }
 
   // 绕过压缩代理的 provider（见文件头「压缩旁路」）。非法值回退默认名单：
   // 它只决定「谁被降为兜底候选」，配错不该让插件起不来。
@@ -654,6 +731,30 @@ export function apply(ctx, config = {}) {
    * 就过期又选回同一个账号，太长会让用户想用回原账号时要等。60s 是折中。
    */
   const FREE_MODEL_ACCOUNT_COOLDOWN_MS = 60_000
+  /** 0 积分账号的跳过时长上限：再远也不越过一整天，日界线当天就会重算。 */
+  const ZERO_CREDIT_MAX_MS = 24 * 3600_000
+
+  /**
+   * 积分为 0 的账号该被跳过到什么时候：当日日界线（`failResetHour`）。
+   *
+   * 为什么用日界线而不是固定的 N 小时：渠道额度按自然日结算，用户看到的是
+   * 「今天这个号没积分了」。写成一个跨日界线还活着的标记，会在额度已经恢复后
+   * 继续挡着它；而只跳一小会儿，下一轮选号又会选回同一个空号，白烧一次上游。
+   * 复用「当日失败」的日界线，两者到期时刻就天然对齐。
+   *
+   * 下限 60s 防止日界线刚过时算出一个几乎立刻到期的标记（那等于没跳）；
+   * 上限兜住「日界线配置成很久以后」这种异常。
+   *
+   * @param {number} nowMs - 当前时刻。
+   * @returns {number} 跳过标记的到期时刻。
+   */
+  function zeroCreditSkipUntil(nowMs = Date.now()) {
+    const p = beijingParts(nowMs - failResetHour * 3600_000)
+    // 北京时间午夜（= UTC+8 当日 00:00）加一天，再挪到日界线小时。
+    const nextDayMidnightUtc = Date.UTC(p.year, p.month - 1, p.day) + 24 * 3600_000
+    const boundary = nextDayMidnightUtc - 8 * 3600_000 + failResetHour * 3600_000
+    return Math.min(Math.max(boundary, nowMs + 60_000), nowMs + ZERO_CREDIT_MAX_MS)
+  }
 
   function readJson(path, fallback) {
     try { if (!existsSync(path)) return fallback; return JSON.parse(readFileSync(path, 'utf8')) } catch { return fallback }
@@ -675,6 +776,23 @@ export function apply(ctx, config = {}) {
         m.windows = [{ from, to }]
         delete m.from; delete m.to
         changed = true
+      }
+    }
+    if (changed) writeJson(groupsFile, groups)
+  })()
+
+  // 清理：已取消的「生效区间」字段（activeFrom / activeUntil）与更早的截止日 until。
+  // 三者在装载时本来就不会被 normalizeModels 读入，但留在 groups.json 里会让
+  // 「到底哪个字段说了算」说不清——一次性从磁盘抹掉，之后只认 weekdays / windows。
+  ;(() => {
+    let changed = false
+    for (const g of groups) {
+      for (const m of g.models || []) {
+        for (const dead of ['activeFrom', 'activeUntil', 'until']) {
+          if (!(dead in m)) continue
+          delete m[dead]
+          changed = true
+        }
       }
     }
     if (changed) writeJson(groupsFile, groups)
@@ -721,7 +839,27 @@ export function apply(ctx, config = {}) {
     // 局域网网关的总开关与端口：null = 跟随 config 的出厂值（默认关闭 / 47021）。
     // 存界面上改过的值，与 CodeArts 凭据镜像同一套「null 表示没覆盖」的语义。
     lanEnabled: null, lanPort: null,
+    // 账号换号开关：null = 跟随 config 的出厂值（默认关闭），改过就以存下的值为准。
+    ofmAccountHandoff: null,
+    ofmSwitchOnTurnEnd: null,
   }, readJson(settingsFile, {}))
+
+  // 账号换号的生效值：设置页改过就用存下的，否则跟随 config。
+  // 每次失败都实时读这个变量（而不是读 settings），所以改完立刻生效、不必重启。
+  if (typeof settings.ofmAccountHandoff === 'boolean') {
+    ofmAccountHandoff = settings.ofmAccountHandoff
+  } else if (settings.ofmAccountHandoff !== null) {
+    ctx.logger.warn(`[model-failover] settings.ofmAccountHandoff=${JSON.stringify(settings.ofmAccountHandoff)} 非法（需布尔值或 null），按未覆盖处理，跟随 config 的 ${configAccountHandoff}`)
+    settings.ofmAccountHandoff = null
+  }
+
+  // 会话没跑完就换模型的生效值：同上，设置页改过就用存下的，否则跟随 config。
+  if (typeof settings.ofmSwitchOnTurnEnd === 'boolean') {
+    ofmSwitchOnTurnEnd = settings.ofmSwitchOnTurnEnd
+  } else if (settings.ofmSwitchOnTurnEnd !== null) {
+    ctx.logger.warn(`[model-failover] settings.ofmSwitchOnTurnEnd=${JSON.stringify(settings.ofmSwitchOnTurnEnd)} 非法（需布尔值或 null），按未覆盖处理，跟随 config 的 ${configSwitchOnTurnEnd}`)
+    settings.ofmSwitchOnTurnEnd = null
+  }
 
   /**
    * 看板排序列的合法键。与 client.js 的 metricsSortValue 一一对应；
@@ -1032,6 +1170,43 @@ export function apply(ctx, config = {}) {
    *  · `bili_throttle_terminal`（424）：连续次数打满，`… resend manually once the provider recovers
    *    (a background probe keeps checking at most every Ns)`。
    */
+  /** 额度耗尽类失败的机器码：渠道包把各家上游的 402/额度码统一收敛成这些名字。 */
+  const QUOTA_EXHAUSTED_CODE = /QUOTA|INSUFFICIENT_?BALANCE|INSUFFICIENT_?CREDITS/i
+  /**
+   * 额度耗尽类失败的上游文案。
+   *
+   * 覆盖面来自渠道包各自的判定（pack.js 的 isQuotaError / isLoomyQuotaError /
+   * isZcodeQuotaExhausted / TRAE 的 QUOTA_EXCEEDED_MARKERS）：中文侧是「积分不足」
+   * 「余额不足」「额度已用尽」，英文侧是 insufficient points/balance/credits 与
+   * quota exceeded。它们都指向同一件事：**这个账号的钱用完了**，不是打得太猛。
+   */
+  const QUOTA_EXHAUSTED_TEXT = /积分不足|积分已用尽|余额不足|余额已用尽|额度(?:已)?用尽|额度不足|insufficient[_\s-]*(?:points|balance|credits|quota|funds)|quota[_\s-]*(?:exceed|exhaust)|exceeded the quota/i
+  /** 明确写着「限流」的报文：与额度耗尽冲突时以它为准（见 isQuotaExhaustedFailure）。 */
+  const RATE_LIMIT_TEXT = /rate[_\s-]*limit|too many requests|均在限流中|限流中|throttl/i
+
+  /**
+   * 这个失败是不是「账号额度/积分用完了」。
+   *
+   * 与限流分开判的理由：两者的恢复方式相反。限流是等一会儿自己就好，换账号拿到的
+   * 是同一条 hold（bili 按账号+主机记，见 rateLimitHoldOf）；额度耗尽则是这个账号
+   * 短期内都不会好，换账号**正是**有效处置，而等下去毫无意义。
+   *
+   * 所以它必须压过限流判定：上游给额度耗尽配 429 是常见的（不少网关把 402 复用成
+   * 429），只看状态码会把「该换号」误判成「该退避」。反向则不能压：报文明确写着
+   * rate limit / too many requests 时按限流处理——有的渠道额度充足也照样限流。
+   *
+   * @param {{code?: string, status?: number, message?: string}|undefined} failure - 宿主给出的失败事实。
+   * @returns {boolean} 命中则为 true。
+   */
+  function isQuotaExhaustedFailure(failure) {
+    if (!failure) return false
+    const message = String(failure.message ?? '')
+    if (RATE_LIMIT_TEXT.test(message)) return false
+    if (Number(failure.status) === 402) return true
+    if (QUOTA_EXHAUSTED_CODE.test(String(failure.code ?? ''))) return true
+    return QUOTA_EXHAUSTED_TEXT.test(message)
+  }
+
   const BILI_THROTTLE_HOLD_CODES = new Set(['bili_throttle_hold', 'bili_throttle_terminal'])
   /** 临时失败的时限下限/上限：解析出的时刻越界时夹进这个区间。 */
   const TEMPORARY_FAILURE_MIN_MS = 1_000
@@ -1070,6 +1245,9 @@ export function apply(ctx, config = {}) {
    */
   function rateLimitHoldOf(failure) {
     if (!failure) return null
+    // 额度耗尽的报文有时也带 429（网关把 402 复用成 429）。那属于「换号能解决」，
+    // 按限流处理会把只有换号有效的一类失败变成干等，见 isQuotaExhaustedFailure。
+    if (isQuotaExhaustedFailure(failure)) return null
     const message = String(failure.message ?? '')
     const code = String(failure.code ?? '')
     const biliByCode = BILI_THROTTLE_HOLD_CODES.has(code)
@@ -1230,6 +1408,112 @@ export function apply(ctx, config = {}) {
     // 被上游按参数拒绝：与网络/账号/额度无关，换号无效
     if (/被上游按参数拒绝|该请求被上游(?:按参数)?拒绝/.test(message)) return true
     return false
+  }
+
+  /** 思考陷入病态重复时适配器给的机器码（dsh-providers-hub 的 sse loop guard）。 */
+  const REASONING_LOOP_CODE = 'REASONING_LOOP'
+  /**
+   * 病态重复的文案判据。
+   *
+   * 机器码认本插件自己人那条路，文案认「机器码丢了」那条路：适配器可能被再包一层
+   * （AggregateError / 别家路由的门面），failure.code 在中途被改写成 UNKNOWN，而报文
+   * 里那句「病态重复」是它带不走的证据。故两条都收。
+   *
+   * @param {{code?: string, message?: string}|undefined} failure - 宿主给出的失败事实。
+   * @returns {boolean} 命中则为 true。
+   */
+  function isReasoningLoopFailure(failure) {
+    if (!failure) return false
+    if (String(failure.code ?? '').toUpperCase() === REASONING_LOOP_CODE) return true
+    return /病态重复|思考(?:陷入|.{0,6})重复|repetitive reasoning|degenerat(?:e|ion) loop/i.test(String(failure.message ?? ''))
+  }
+
+  /** 一轮被输出上限截断时合成的失败码：走的是与病态重复同一套处置（见 isDegenerateFailure）。 */
+  const TURN_END_MAX_TOKENS_CODE = 'MAX_TOKENS_END'
+
+  /**
+   * 这个失败是不是**退化类**：思考陷入病态重复，或这一轮被输出上限截断。
+   *
+   * 两类的共同点是「模型没坏，只是这一条路走不通」：病态重复是这一段思考在空转，
+   * 输出上限是这个模型的窗口装不下这一轮的回答。原地重试都只会再烧一遍同样的思考，
+   * 所以处置必须是**换模型**，且与「真失败」分开记账——不写当日失败，只记一个带
+   * 到期时刻的临时失败（见 routeAfterModelFailure 的 degenerate 分支）。
+   *
+   * @param {{code?: string, message?: string}|undefined} failure - 宿主给出的失败事实。
+   * @returns {boolean} 命中则为 true。
+   */
+  function isDegenerateFailure(failure) {
+    if (!failure) return false
+    return isReasoningLoopFailure(failure)
+      || String(failure.code ?? '').toUpperCase() === TURN_END_MAX_TOKENS_CODE
+  }
+
+  /**
+   * 这个失败是不是**取消**（用户按停止、或上游掐断这一轮的流）。
+   *
+   * 取消与失败的处置相反：用户按停止是人的决定，自动换模型续跑等于否决它，
+   * 所以那一路必须放行、不路由；只有上游自己掐断（信号没有因停止而 abort）才算
+   * 「会话被中断」，需要换模型把话说完。
+   *
+   * @param {{code?: string, message?: string}|undefined} failure - 宿主给出的失败事实。
+   * @returns {boolean} 命中则为 true。
+   */
+  function isAbortFailure(failure) {
+    if (!failure) return false
+    if (String(failure.code ?? '').toUpperCase() === 'ABORTED') return true
+    return /abort|被中断|掐断/i.test(String(failure.message ?? ''))
+  }
+
+  /**
+   * 读出这一轮取消的**原因**（宿主 cancel(cause) 放在信号 reason 上的那个对象）。
+   *
+   * 中断必须分两种：用户按停止（以及父会话收子代理、插件卸载）是人的/生命周期的
+   * 决定，自动换模型续跑等于否决它；其余（别家插件在自己的 hook 里掐断、账户被登出后
+   * 宿主自己 cancel）算「这一轮被外面打断」，需要换模型把话说完。
+   *
+   * @param {{aborted?: boolean, reason?: unknown}|undefined} signal - 本轮或本步的 AbortSignal。
+   * @returns {{kind: string, reason: string|null}|null} 取消原因；没中止或读不出时为 null。
+   */
+  function cancelCauseOf(signal) {
+    try {
+      if (signal?.aborted !== true) return null
+      const raw = signal.reason
+      if (raw === null || typeof raw !== 'object') return null
+      const kind = typeof raw.kind === 'string' ? raw.kind : null
+      if (kind === null) return null
+      return { kind, reason: typeof raw.reason === 'string' ? raw.reason : null }
+    } catch { /* 读不到取消原因不是错误，按保守分支处理 */ }
+    return null
+  }
+
+  /**
+   * 这个取消原因是不是「人的决定」——不该被自动换模型覆盖。
+   *
+   * user 是用户按停止，parent 是父会话收掉子代理，disposed 是插件卸载/进程收尾。
+   * 其余原因（典型是别家插件在自己的 hook 里 cancel）算外部打断，可以路由。
+   *
+   * @param {{kind?: string}|null|undefined} cause - cancelCauseOf 的结果，或 turn/end 的 reason。
+   * @returns {boolean} 是人的决定则为 true。
+   */
+  function isUserStopCause(cause) {
+    const kind = cause && typeof cause.kind === 'string' ? cause.kind : null
+    return kind === 'user' || kind === 'parent' || kind === 'disposed'
+  }
+
+  /**
+   * 这一轮的取消是不是用户（或生命周期）的决定。
+   *
+   * 读不出原因时按「是」处理：信号确实被 abort 了却没有可辨认的原因，宁可放过一次
+   * 自动换模型，也不要与用户按下的停止对着干。
+   *
+   * @param {{aborted?: boolean, reason?: unknown}|undefined} signal - 本轮或本步的 AbortSignal。
+   * @returns {boolean} 不该自动换模型则为 true。
+   */
+  function isUserStopSignal(signal) {
+    if (signal?.aborted !== true) return false
+    const cause = cancelCauseOf(signal)
+    if (cause === null) return true
+    return isUserStopCause(cause)
   }
 
   /* ---- 临时换模型：谁被换走过、从哪个模型换走 ---- */
@@ -1801,14 +2085,19 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * 该条目此刻是否参与路由：未失败 + 在时间窗内 + 未过期。
+   * 该条目此刻是否参与路由：未失败 + 未禁用 + （所属星期上）在时段内。
    *
-   * 时间窗 from/to 为 0..23 的整点、两端包含；from > to 表示跨午夜窗口
-   * （如 22–6 = 22:00 到次日 6:59）；任一缺省 = 全天。
-   * 截止日 until 为 YYYY-MM-DD，北京时间当天超过它即失效（当天仍有效）。
-   * from/to 的小时按**北京时间**解释。
+   * 两道时间闸门是**作用域关系**，不是两个独立的筛选：
+   *  1. `windows`：每日时段，from/to 为 0..23 的整点、两端包含；from > to 表示跨午夜
+   *     （如 22–6 = 22:00 到次日 6:59）；空 = 全天。
+   *  2. `weekdays`：**时段只在这些星期生效**（0=周日 … 6=周六）。
+   *     · 空 = 时段每天都生效（没配星期的老配置原样工作）；
+   *     · 非空 = 列出的那几天按 `windows` 判定，**其余日期不受时段限制、全天可用**。
+   *     所以勾上几天不是「只在那几天能用」，而是「只在那几天限时」。
    *
-   * 只在“挑选”时过滤：正在使用的模型过窗后不主动切走，等它失败时
+   * 所有时间口径按**北京时间**解释（见 beijingWeekday / beijingHour）。
+   *
+   * 只在“挑选”时过滤：正在使用的模型出窗后不主动切走，等它失败时
    * 自然会被排除出候选——避免到点就抖动换模型。
    */
   function routable(m) {
@@ -1816,18 +2105,18 @@ export function apply(ctx, config = {}) {
     if (isFailed(m.provider, m.model)) return false
     // 临时失败（bili 限流闸门等）：到期就自动恢复，不用等到日界，也不用人工点恢复。
     if (temporaryFailureOf(m.provider, m.model) !== null) return false
-    if (m.until && beijingDayKey() > String(m.until)) return false
-    if (Array.isArray(m.windows) && m.windows.length > 0) {
-      const h = beijingHour()
-      const hit = m.windows.some(w => {
-        const from = Number(w.from); const to = Number(w.to)
-        if (!Number.isInteger(from) || !Number.isInteger(to)) return false
-        // 两端包含：from<=to 为同日区间；from>to 为跨午夜（如 22–6）
-        return from <= to ? (h >= from && h <= to) : (h >= from || h <= to)
-      })
-      if (!hit) return false
-    }
-    return true
+    const wins = Array.isArray(m.windows) ? m.windows : []
+    if (wins.length === 0) return true
+    // 星期只在「有配时段」时才有意义：没配时段 = 全天可用，星期不参与判定。
+    const days = Array.isArray(m.weekdays) ? m.weekdays : []
+    if (days.length > 0 && !days.includes(beijingWeekday())) return true
+    const h = beijingHour()
+    return wins.some(w => {
+      const from = Number(w.from); const to = Number(w.to)
+      if (!Number.isInteger(from) || !Number.isInteger(to)) return false
+      // 两端包含：from<=to 为同日区间；from>to 为跨午夜（如 22–6）
+      return from <= to ? (h >= from && h <= to) : (h >= from || h <= to)
+    })
   }
 
   /** 组内第一个可路由模型（未失败、在窗内、未过期；优先压缩代理看得见的） */
@@ -1842,7 +2131,7 @@ export function apply(ctx, config = {}) {
     if (!entry) return null
     // 必须用 providerEquals：currentModelOf() 优先给 agent.model.current() 的 provider，
     // 那是注册表 id（ofm-qoder），而分组条目存的是裸 'qoder'。用 === 会查出 null，
-    // 于是 routable() 的时段/截止日/禁用三项检查被整段跳过（出了时段也不换模型）。
+    // 于是 routable() 的时间闸门与禁用检查被整段跳过（出了时段也不换模型）。
     return (entry.models || []).find(m => providerEquals(m.provider, provider) && m.model === model) ?? null
   }
 
@@ -1952,6 +2241,15 @@ export function apply(ctx, config = {}) {
       const agentsService = ctx.get('agents')
       const agent = agentsService?.get?.(sessionId)
       return agent?.session
+    } catch { return undefined }
+  }
+
+  /** 按会话 id 取活着的 Agent（带 session 才算活着）；取不到返回 undefined。 */
+  function liveAgentOf(sessionId) {
+    try {
+      const agentsService = ctx.get('agents')
+      const agent = agentsService?.get?.(sessionId)
+      return agent && agent.session ? agent : undefined
     } catch { return undefined }
   }
 
@@ -2099,13 +2397,15 @@ export function apply(ctx, config = {}) {
    * @param {{provider: string, model: string}} target - 即将生效的新模型。
    * @returns {{id: string, role: 'user', content: {type: 'text', text: string}[], source: object}}
    */
-  function createContinuationMessage(fromProvider, fromModel, target) {
+  function createContinuationMessage(fromProvider, fromModel, target, kind = 'failed') {
     return {
       id: randomUUID(),
       role: 'user',
       content: [{
         type: 'text',
-        text: `[model-failover] ${fromProvider}/${fromModel} failed and every retry was exhausted. `
+        text: (kind === 'interrupted'
+          ? `[model-failover] This turn on ${fromProvider}/${fromModel} was interrupted before it finished. `
+          : `[model-failover] ${fromProvider}/${fromModel} failed and every retry was exhausted. `)
           + `The session continues on ${target.provider}/${target.model}. `
           + 'Continue the interrupted work from the current session state; do not repeat completed steps.',
       }],
@@ -2315,8 +2615,57 @@ export function apply(ctx, config = {}) {
   // 不可路由（失败/过时段/过截止日）时才按组内优先级换一个。
 
   /* ============ 用户手动选择模型 → 交还控制权，避免覆盖用户意图 ============ */
+
+  /**
+   * 一轮以「输出撞上 token 上限」收尾时换模型。
+   *
+   * 为什么必须挂在 turn/end 上：max-tokens 不是失败，宿主不会派发 agent/request-error，
+   * 单看 finish 无从判断「这一轮到底有没有说完」；turn/end 的 reason 是唯一的权威信号。
+   * 换模型走与失败同一套处置（退化类：不写当日失败，只记一段短冷却），并在本轮收尾后
+   * 排队一条续跑，让会话在新模型上把没说完的话说完。
+   *
+   * 另外接一类：这一轮以 aborted 收尾、但取消原因不是用户/父会话/卸载（典型是别家插件
+   *
+   * @param {any} session - 收尾的会话。
+   * @param {{data: {turn: number, reason: {kind: string}}}|undefined} event - turn/end 事件。
+   * @returns {void}
+   */
+  function handleTurnEndSwitch(session, event) {
+    const d = event?.data
+    if (!d || typeof d.turn !== 'number') return
+    const kind = d.reason?.kind
+    if (kind !== 'max-tokens' && kind !== 'aborted') return
+    // 中断只在「不是人的决定」时才换模型：用户按停止、父会话收子代理、插件卸载都不算。
+    if (kind === 'aborted' && isUserStopCause(d.reason.reason)) return
+    const id = String(session.id)
+    // 已经由请求失败路径处置过（aborted/error 都会先走 agent/request-error）：
+    // 那条路径已经记了 errorTurns，这里再切一次就会连跳两个模型。
+    if (errorTurns.get(id) === d.turn) return
+    // 已经有待续跑：这条轮次的收尾已被别处接住，不重复排。
+    if (pendingContinuations.has(id)) return
+    const agent = liveAgentOf(id)
+    if (!agent || !agent.session) return
+    const cur = currentModelOf(agent, id)
+    if (!cur?.provider || !cur?.model) return
+    const failure = kind === 'max-tokens'
+      ? { code: TURN_END_MAX_TOKENS_CODE, message: 'the turn ended because the model hit its output token ceiling' }
+      : { code: 'ABORTED', message: 'the turn was interrupted before it finished (cancel cause: ' + (d.reason.reason?.kind ?? 'unknown') + ').' }
+    noteFailure(agent, cur.provider, failure, kind === 'max-tokens' ? 'turn-end-max-tokens' : 'turn-end-interrupted', { model: cur.model })
+    ctx.logger.warn(kind === 'max-tokens'
+      ? `[model-failover] ${cur.provider}/${cur.model} 输出撞上限收尾，换模型（不写当日失败）`
+      : `[model-failover] ${cur.provider}/${cur.model} 本轮被外部中断，换模型续跑（不写当日失败）`)
+    void routeAfterModelFailure(agent, cur.provider, cur.model, failure, d.turn, null)
+  }
+
   const disposeSessionEvent = ctx.on('session/event', (session, event) => {
-    if (disposed || event.type !== 'model/selection') return
+    if (disposed) return
+    if (event.type === 'turn/end') {
+      // 会话没跑完就收尾的两类（输出上限 / 外部中断）：见 handleTurnEndSwitch。
+      if (!ofmSwitchOnTurnEnd) return
+      handleTurnEndSwitch(session, event)
+      return
+    }
+    if (event.type !== 'model/selection') return
     const d = event.data
     if (!d?.provider || !d?.model) return
     const id = String(session.id)
@@ -2365,6 +2714,10 @@ export function apply(ctx, config = {}) {
    * @returns {Promise<string|null>} 交回的账号 id；null 表示交给分组路由。
    */
   async function handoffToFreeModelAccount(provider, model, failure) {
+    // 账号换号默认关闭（config.ofmAccountHandoff，见 apply 里那段说明）：渠道插件
+    // 自己在运行时就会换号，本插件再按渠道写池级冷却只会把两边都挡掉。关着时这条
+    // 路径整体不参与，失败直接交给分组路由换模型。
+    if (!ofmAccountHandoff) return null
     // 换号是 dsh-our-free-model 的能力，只对它自己的渠道成立：裸 id（未打门面）或
     // ofm- 前缀。别的插件前缀下的路由一律不换号——ca-codearts 的账号由 dsh-codearts
     // 管、caa-codearts 由 dsh-providers-hub 管，池里就算留着同名历史账号，冷却的也是
@@ -2395,13 +2748,49 @@ export function apply(ctx, config = {}) {
     }
     // 该模型当前可用的账号数（停用、以及已对该模型限流的都不算）
     const now = Date.now()
-    const usable = allAccounts.filter(a => {
+    const usableAccounts = allAccounts.filter(a => {
       if (a.enabled === false) return false
       const resetAt = a.modelRateLimits && a.modelRateLimits[model]
       return !resetAt || now >= resetAt
-    }).length
+    })
     // 只有一个可用账号时没有「换号」可言，不必浪费一轮重试
-    if (usable < 2) return null
+    if (usableAccounts.length < 2) return null
+
+    // 上游报的是「积分不足/余额不足」时，0 积分账号换过去也只会再失败一次，先把它们
+    // 按当日日界线跳过。只在报出额度耗尽时才读积分：渠道包是逐账号顺序打上游的，
+    // 平时没必要为了选号付这个代价。
+    //
+    // 只认「可用账号里积分为 0 的」：渠道包返回的是该渠道全部账号（含停用、含已对本
+    // 模型冷却的），拿它和可用账号数直接比较会把「停用的 0 积分账号」误判成「可用账号
+    // 全都没钱」，从而跳过换号、白丢一次本可成功的重试。
+    const usableIds = new Set(usableAccounts.map(a => a.id))
+    const zeroCredit = (ofmCreditSkip && isQuotaExhaustedFailure(failure))
+      ? new Set([...await zeroCreditAccountIds(bareForHandoff)].filter(id => usableIds.has(id)))
+      : new Set()
+    if (zeroCredit.size > 0) {
+      // 可用的账号全都没钱，换号没有任何意义，直接交给分组路由换模型。
+      if (zeroCredit.size >= usableAccounts.length) {
+        ctx.logger.info(`[model-failover] ${provider}/${model} 上报积分不足，且该模型 ${usableAccounts.length} 个可用账号积分均为 0，改走分组路由换模型`)
+        return null
+      }
+      const until = zeroCreditSkipUntil(now)
+      const markedIds = []
+      for (const accountId of zeroCredit) {
+        const entry = usableAccounts.find(a => a.id === accountId)
+        // 已经有更靠后的标记（例如上一次已经跳过）就不再重写：池只接受更长的时限。
+        const existing = entry?.modelRateLimits?.[model]
+        if (typeof existing === 'number' && existing >= until) continue
+        try {
+          await pool.updateModelRateLimit(accountId, model, until)
+          markedIds.push(accountId)
+        } catch (e) {
+          ctx.logger.warn(`[model-failover] 跳过 0 积分账号 ${accountId} 失败：${e?.message || e}`)
+        }
+      }
+      if (markedIds.length > 0) {
+        ctx.logger.info(`[model-failover] ${provider}/${model} 上报积分不足，积分为 0 的账号 ${markedIds.join('、')} 已跳过到 ${new Date(until).toLocaleString('zh-CN')}（当日日界线），继续按失败换号`)
+      }
+    }
 
     // 池当前会选中的账号：`getAvailableAccount` 按存储顺序返回第一个
     // 「enabled + 该模型无未过期冷却标记 + 凭据能解析」的账号。刚失败的账号
@@ -2425,7 +2814,7 @@ export function apply(ctx, config = {}) {
       ctx.logger.warn(`[model-failover] 写入 ${provider} 账号 ${next.entry.id} 冷却标记失败：${e?.message || e}`)
       return null
     }
-    ctx.logger.info(`[model-failover] ${provider}/${model} 失败，已冷却账号 ${next.entry.id} ${Math.round(FREE_MODEL_ACCOUNT_COOLDOWN_MS / 1000)}s，换号重试（该模型 ${usable}/${allAccounts.length} 个账号可用）`)
+    ctx.logger.info(`[model-failover] ${provider}/${model} 失败，已冷却账号 ${next.entry.id} ${Math.round(FREE_MODEL_ACCOUNT_COOLDOWN_MS / 1000)}s，换号重试（该模型 ${usableAccounts.length}/${allAccounts.length} 个账号可用）`)
     return next.entry.id
   }
 
@@ -2581,6 +2970,104 @@ export function apply(ctx, config = {}) {
     const body = await res.json()
     const result = body && typeof body === 'object' ? body.result : undefined
     return result && result.ok === true ? (result.value ?? {}) : null
+  }
+
+  /* ---- 渠道账号积分：只在报出额度耗尽时才读 ---- */
+  /** dsh-our-free-model 的 RPC 端点（pack.js 的 CHANNEL_PACK_API_PATH） */
+  const CHANNEL_PACK_API_PATH = '/api/channel-pack'
+  /** 该端点认的 RPC 方法名（pack.js 的 CHANNEL_PACK_ENDPOINT） */
+  const CHANNEL_PACK_ENDPOINT = 'channel-pack'
+
+  /**
+   * 积分读取缓存：裸 provider -> { at, accounts }。
+   *
+   * `accounts` 为 null 表示这次没读成（凭据服务不可用、RPC 报错、超时），与「读到
+   * 0 积分」是两件事，必须分开：查询失败时绝不能把账号当成空号跳过，否则一次网络
+   * 抖动就会让所有账号被当成没钱。
+   */
+  const creditBalanceCache = new Map()
+  /** 每个 provider 只提示一次「读不到积分」，避免每轮失败都刷一行日志 */
+  const creditProbeWarned = new Set()
+
+  /**
+   * 读某个渠道全部账号的积分。
+   *
+   * 走 `/api/channel-pack` 的 `credits.balances`：账号池服务本身**不暴露积分**
+   * （AccountPool 只有账号元数据与限流标记），积分只有渠道包这个 RPC 能给。
+   * 该端点对每个账号单独打一次上游，且是**顺序**查的（渠道包刻意避开并发风控），
+   * 所以结果必须缓存，不能每次失败都现查。
+   *
+   * 单个账号查询失败时渠道包返回 `balance: null` 加一条 error 文案，这里映射成
+   * `total: null`（未知），只有真正读到数字的账号才参与「是否 0 积分」的判断。
+   *
+   * @param {string} bareProvider - 裸 provider id（渠道包按裸名存账号）。
+   * @returns {Promise<Array<{accountId: string, total: number|null}>|null>} 账号积分；读不到时为 null。
+   */
+  async function readCreditBalances(bareProvider) {
+    const cached = creditBalanceCache.get(bareProvider)
+    if (cached && Date.now() - cached.at < ofmCreditCacheMs) return cached.accounts
+
+    const fail = (reason) => {
+      creditBalanceCache.set(bareProvider, { at: Date.now(), accounts: null })
+      if (!creditProbeWarned.has(bareProvider)) {
+        creditProbeWarned.add(bareProvider)
+        ctx.logger.warn(`[model-failover] 读不到 ${bareProvider} 的账号积分（${reason}），换号时不按积分过滤`)
+      }
+      return null
+    }
+
+    const cookie = await mintLocalSessionCookie()
+    if (cookie === null) return fail('取不到浏览器会话密钥（credentials 服务不可用）')
+
+    let body
+    try {
+      const res = await fetch(`${LOCAL_API_ORIGIN}${CHANNEL_PACK_API_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie, accept: 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: `mfm-credits-${Date.now()}`,
+          method: CHANNEL_PACK_ENDPOINT,
+          payload: { method: 'credits.balances', payload: { provider: bareProvider, force: true } },
+        }),
+        signal: AbortSignal.timeout(ofmCreditProbeTimeoutMs),
+      })
+      if (!res.ok) return fail(`HTTP ${res.status}`)
+      body = await res.json()
+    } catch (e) {
+      return fail(e?.message || String(e))
+    }
+
+    const result = body && typeof body === 'object' ? body.result : undefined
+    if (!result || result.ok !== true) {
+      // 不支持的渠道（buddy、codearts 等）走这里：它们没有积分概念，按「读不到」处理。
+      const error = result && typeof result === 'object' ? result.error : undefined
+      return fail(error?.code ? `${error.code}${error.message ? ': ' + error.message : ''}` : 'RPC 未返回结果')
+    }
+    const rows = result.value && Array.isArray(result.value.accounts) ? result.value.accounts : []
+    const accounts = rows.map(row => {
+      const total = Number(row?.balance?.total)
+      // 查询失败（balance 为 null）与「读到 0」必须分开，未知一律 null。
+      const known = row?.balance != null && row?.error === undefined && Number.isFinite(total)
+      return { accountId: String(row?.accountId ?? ''), total: known ? total : null }
+    })
+    creditBalanceCache.set(bareProvider, { at: Date.now(), accounts })
+    return accounts
+  }
+
+  /**
+   * 该渠道里积分为 0 的账号 id。
+   *
+   * 读不到积分时返回空集合：调用方会退化成「按失败冷却换号」的原有行为，而不是
+   * 把一批账号当空号跳过。
+   *
+   * @param {string} bareProvider - 裸 provider id。
+   * @returns {Promise<Set<string>>} 0 积分账号 id。
+   */
+  async function zeroCreditAccountIds(bareProvider) {
+    const rows = await readCreditBalances(bareProvider)
+    if (rows === null) return new Set()
+    return new Set(rows.filter(row => row.total !== null && row.total <= 0).map(row => row.accountId))
   }
 
   /**
@@ -3248,7 +3735,7 @@ export function apply(ctx, config = {}) {
   // @param {object|null} compressionGap - noteCompressionGap 的结果，只用于诊断标注。
   // @param {{id: string, revision: number}|null} [goalRef] - 调用方在进入本函数前抓下的 goal ref；
   //   省略时在本函数内读。agent/error 那条入口必须在 await 之前抓（见下面的监听器）。
-  // @returns {Promise<string>} 处置结果：switched / capacity-switched / rejected-switched / switch-failed / no-target / all-capacity。
+  // @returns {Promise<string>} 处置结果：switched / capacity-switched / rejected-switched / degenerate-switched / switch-failed / no-target / all-capacity。
   async function routeAfterModelFailure(agent, provider, model, failure, turn, compressionGap, goalRef = null) {
     const id = String(agent.session.id)
     // 并发/容量类失败：模型没坏，只是这一刻排不上。处置方式与「真失败」完全不同——
@@ -3281,7 +3768,41 @@ export function apply(ctx, config = {}) {
       const waitSeconds = Math.max(1, Math.round((throttleHold.until - Date.now()) / 1000))
       ctx.logger.warn(`[model-failover] ${provider}/${model} 限流/节流临时失败 ${waitSeconds}s 后自动恢复（不写当日失败），换到组内其它模型续跑`)
     }
-    if (!capacityFailure && !requestRejected && throttleHold === null) {
+    // 退化类失败（思考陷入病态重复 / 这一轮被输出上限截断）：模型本身没坏，只是
+    // 这条路走不通，原地重试（llm-error-retry 对病态重复配的是 5s×5）只会再烧一遍
+    // 同样的思考。处置是**换模型**，且与「真失败」分开记账：记一个带到期时刻的
+    // 临时失败，到期自动回到候选；**不写当日失败**——换个提示词或换一轮它还能用，
+    // 停用到下一个日界太重。ofmDegenerateCooldownMs 为 0 时只换走、不冷却。
+    const degenerateFailure = isDegenerateFailure(failure)
+    if (degenerateFailure) {
+      if (ofmDegenerateCooldownMs > 0) {
+        markTemporaryFailure(provider, model, {
+          until: Date.now() + ofmDegenerateCooldownMs,
+          reason: failureTextOf(failure) ?? String(failure?.code ?? ''),
+        }, failure?.code ?? TURN_END_MAX_TOKENS_CODE)
+        const waitSeconds = Math.max(1, Math.round(ofmDegenerateCooldownMs / 1000))
+        ctx.logger.warn(`[model-failover] ${provider}/${model} 陷入重复/被截断（${failure?.code ?? 'unknown'}），临时冷却 ${waitSeconds}s 后自动恢复（不写当日失败），换到组内其它模型续跑`)
+      } else {
+        ctx.logger.warn(`[model-failover] ${provider}/${model} 陷入重复/被截断（${failure?.code ?? 'unknown'}），不写当日失败，换到组内其它模型续跑`)
+      }
+    }
+    // 被打断（不是用户按停止）：别家插件在自己的 hook 里 cancel、账户被登出后宿主自己
+    // cancel，都会让这一轮以 aborted 收尾。这不是模型坏掉，但这一轮确实没跑完——
+    // 与退化类同一套处置：换模型续跑，只打一段临时冷却，不写当日失败。
+    const interruptedFailure = !degenerateFailure && isAbortFailure(failure)
+    if (interruptedFailure) {
+      if (ofmDegenerateCooldownMs > 0) {
+        markTemporaryFailure(provider, model, {
+          until: Date.now() + ofmDegenerateCooldownMs,
+          reason: failureTextOf(failure) ?? String(failure?.code ?? 'ABORTED'),
+        }, failure?.code ?? 'ABORTED')
+        const waitSeconds = Math.max(1, Math.round(ofmDegenerateCooldownMs / 1000))
+        ctx.logger.warn(`[model-failover] ${provider}/${model} 本轮被打断（${failure?.code ?? 'unknown'}），临时冷却 ${waitSeconds}s 后自动恢复（不写当日失败），换到组内其它模型续跑`)
+      } else {
+        ctx.logger.warn(`[model-failover] ${provider}/${model} 本轮被打断（${failure?.code ?? 'unknown'}），不写当日失败，换到组内其它模型续跑`)
+      }
+    }
+    if (!capacityFailure && !requestRejected && throttleHold === null && !degenerateFailure && !interruptedFailure) {
       markFailed(provider, model, failure)
       ctx.logger.warn(`[model-failover] ${provider}/${model} 彻底失败（${failure?.code ?? 'unknown'}），已标记为当日失败`)
     }
@@ -3304,7 +3825,7 @@ export function apply(ctx, config = {}) {
     const target = pickNext(group, { provider, model }, rejectedNow)
     if (!target) {
       const why = binding
-        ? (group ? '分组内无其它可路由模型（全部当日失败/不在时段/已过期/本轮已因请求被拒跳过）' : '绑定的分组已停用或不存在')
+        ? (group ? '分组内无其它可路由模型（全部当日失败/不在时段/已过期/本轮已因请求被拒跳过/退化类冷却中）' : '绑定的分组已停用或不存在')
         : '该会话未绑定分组，且该模型不在任何启用分组内'
       ctx.logger.info(`[model-failover] ${provider}/${model} 失败后不切换：${why}`)
       noteFailure(agent, provider, failure, 'no-target', { model, detail: why, uncompressed: compressionGap !== null })
@@ -3343,7 +3864,7 @@ export function apply(ctx, config = {}) {
     // 不清会让名单无限增长，也会在用户换分组/换模型后挡住本来可用的模型。
     if (ok) rejectedBySession.delete(id)
     const outcome = ok
-      ? (capacityFailure ? 'capacity-switched' : requestRejected ? 'rejected-switched' : 'switched')
+      ? (capacityFailure ? 'capacity-switched' : requestRejected ? 'rejected-switched' : degenerateFailure ? 'degenerate-switched' : interruptedFailure ? 'interrupted-switched' : 'switched')
       : 'switch-failed'
     noteFailure(agent, provider, failure, outcome, {
       model, detail: `→ ${target.provider}/${target.model}${ok ? '' : '（切换失败）'}`,
@@ -3353,7 +3874,7 @@ export function apply(ctx, config = {}) {
     // 已经 select 了新模型，但本步 selection 已冻结：等本轮收尾后排队续跑。
     // goalRef 有值时优先用它：调用方是在 await 之前抓的，那才是切换前的真实状态；
     // agent/error 那条入口与 goal-round-driver 在同一个 emit 里，晚读会读到已 disarm 的 goal。
-    queueContinuation(agent, provider, model, target, goalRef ?? goalRevivalOf(agent))
+    queueContinuation(agent, provider, model, target, goalRef ?? goalRevivalOf(agent), interruptedFailure ? 'interrupted' : 'failed')
     return outcome
   }
 
@@ -3399,7 +3920,7 @@ export function apply(ctx, config = {}) {
   // 在 pre-step 就冻结了（agent/request 已废弃，改它直接抛错）。所以必须让本轮
   // 收尾、由下一轮重新 pre-step 才能读到新 select 的模型。followup 排队一条
   // next-turn 消息正是这个作用，且它是 durable 的（agent/inbox/spliced）。
-  const disposeError = ctx.on('agent/request-error', async ({ agent, turn, provider: eventProvider, failure }, next) => {
+  const disposeError = ctx.on('agent/request-error', async ({ agent, turn, provider: eventProvider, failure, signal: eventSignal }, next) => {
     // 内层先决定：任何重试策略表态重试，就尊重它（这才是“重试都完成之后”）
     //
     // 内层不表态时 next() 返回 undefined，这有两种含义，处置必须区分：
@@ -3409,7 +3930,10 @@ export function apply(ctx, config = {}) {
     // 又不肯放行的监听器（典型是重试插件「预算耗尽就抛出去」）都会把本插件整条跳过。
     // 所以这里不靠「自己最外层」这个前提：本插件同时守着 agent/error 那条入口，
     // 那边对「同一个 turn 尚未处置过」的失败一定会补一次路由（见 disposeAgentError）。
-    const action = await next()
+    // 退化类失败（思考病态重复 / 被输出上限截断）**不调用 next()**：内层重试对病态重复
+    // 配的是 5s×5，会把同一段思考再烧五遍、每遍都要等满延时，用户看到的就是「会话停住
+    // 要自己敲继续」。这里短路整条链，由本插件当场换模型。
+    const action = isDegenerateFailure(failure) ? undefined : await next()
     if (action?.kind === 'retry') { noteFailure(agent, eventProvider, failure, 'inner-retry'); return action }
     if (disposed || !agent || !agent.session) return action
 
@@ -3480,6 +4004,24 @@ export function apply(ctx, config = {}) {
     // 还是同一条 hold（bili 的 holdKey 就是「账号+主机」），换号只会白等一轮、还把另一个
     // 账号也记上一次失败。这类失败要的是换模型续跑，交给下面的分组路由。
     const throttleHold = rateLimitHoldOf(failure)
+    // 退化类失败同样不换号：换的是同一份凭据，模型的重复思考或输出上限一模一样，
+    // 换号只会白等一轮再撞同一次。交给分组路由换模型。
+    const degenerateFailure = isDegenerateFailure(failure)
+    // 中断类全由这里分流：判据是取消的**原因**，不是「信号 aborted」——信号被 abort
+    // 只说明这一轮被打断了，打断它的是谁才决定该不该换模型（见 isUserStopSignal）。
+    // 用户按停止、父会话收子代理、插件卸载留在原模型；其余原因与读不出原因之外的情形
+    // 交给下面的 routeAfterModelFailure 换模型。退化类失败不在此列：那段思考空转与停止无关。
+    if (!degenerateFailure && isAbortFailure(failure)) {
+      // 开关关掉时这一类一律留在原模型（与 turn/end 的 max-tokens 同属「会话没跑完」）。
+      if (!ofmSwitchOnTurnEnd) {
+        noteFailure(agent, provider, failure, 'switch-off', { model })
+        return endTurn()
+      }
+      if (isUserStopSignal(eventSignal)) {
+        noteFailure(agent, provider, failure, 'user-stop', { model })
+        return endTurn()
+      }
+    }
 
     // Our Free Model 的模型：非临时失败一律先试换账号重试。
     // 换的是同一 provider/model 背后的凭据，selection 没变，所以同一步 retry 安全。
@@ -3489,9 +4031,11 @@ export function apply(ctx, config = {}) {
     // 并发类失败不换号：账号池打满时换号拿到的还是同一个池，换模型才有意义。
     // 请求被拒也不换号：模型上限/参数问题与凭据无关，换号只会白等一轮。
     // 限流/节流也不换号：见上面的 throttleHold。
-    const handedTo = (capacityFailure || requestRejected || throttleHold !== null)
-      ? null
-      : await handoffToFreeModelAccount(rawProvider, model, failure)
+    // 换号本身默认关闭（config.ofmAccountHandoff）：这里先判开关，关着时一整段
+    // 不参与，连判定日志都不写——失败一律走下面的分组路由。
+    const handedTo = (ofmAccountHandoff && !capacityFailure && !requestRejected && throttleHold === null && !degenerateFailure)
+      ? await handoffToFreeModelAccount(rawProvider, model, failure)
+      : null
     if (handedTo) {
       noteFailure(agent, provider, failure, 'account-handoff', { model, detail: '账号 ' + handedTo })
       return { kind: 'retry' }
@@ -3675,10 +4219,11 @@ export function apply(ctx, config = {}) {
    * @param {string} fromModel - 失败请求实际用的模型。
    * @param {{provider: string, model: string}} target - 已 select 的新模型。
    * @param {{id: string, revision: number}|null} goalRevival - 切换前被 disarm 的 goal（见 goalRevivalOf）。
+   * @param {string} [kind] - 为什么换：「failed」（重试耗尽）或「interrupted」（本轮被打断）。
    */
-  function queueContinuation(agent, fromProvider, fromModel, target, goalRevival = null) {
+  function queueContinuation(agent, fromProvider, fromModel, target, goalRevival = null, kind = 'failed') {
     const id = String(agent.session.id)
-    pendingContinuations.set(id, { agent, fromProvider, fromModel, target, goalRevival })
+    pendingContinuations.set(id, { agent, fromProvider, fromModel, target, goalRevival, kind })
     armContinuationFailsafe(id)
     ctx.logger.info(`[model-failover] ${fromProvider}/${fromModel} → ${target.provider}/${target.model}，等待本轮收尾后自动续跑`)
     // 已经空闲（异常路径下可能直接是 idle）：立刻安排投递。
@@ -3734,7 +4279,7 @@ export function apply(ctx, config = {}) {
     // 把 activation 恢复回来，否则用户会看到目标被这次切换「暂停」。
     reviveGoalAfterSwitch(pending.agent, pending.goalRevival)
     try {
-      pending.agent.followup(createContinuationMessage(pending.fromProvider, pending.fromModel, pending.target))
+      pending.agent.followup(createContinuationMessage(pending.fromProvider, pending.fromModel, pending.target, pending.kind))
       pendingContinuations.delete(sessionId)
       clearContinuationFailsafe(sessionId)
       logStatus('continuation/delivered', sessionId, null)
@@ -4080,6 +4625,27 @@ export function apply(ctx, config = {}) {
     }
     return null
   }
+
+  /**
+   * 校验星期集合：0=周日 … 6=周六，去重升序。
+   *
+   * 非数组、含非整数、含越界值一律返回 null（调用方据此丢弃这一项而不是存半份）。
+   * 空数组是合法值——它表示「不按星期筛」，与缺省同义。
+   *
+   * @param {unknown} raw - 原始值。
+   * @returns {number[]|null} 规整后的星期数组，或 null。
+   */
+  function weekdaysOf(raw) {
+    if (!Array.isArray(raw)) return null
+    const out = []
+    for (const v of raw) {
+      const n = Number(v)
+      if (!Number.isInteger(n) || n < 0 || n > 6) return null
+      if (!out.includes(n)) out.push(n)
+    }
+    return out.sort((a, b) => a - b)
+  }
+
   function normalizeModels(list) {
     return (list || []).map(m => {
       const entry = {
@@ -4110,8 +4676,10 @@ export function apply(ctx, config = {}) {
         if (from !== null && to !== null) windows = [{ from, to }]
       }
       if (windows.length > 0) entry.windows = windows.slice(0, 12)
-      // 截止日 YYYY-MM-DD：北京时间当天超过它即不再参与路由；空 = 不过期
-      if (typeof m.until === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(m.until)) entry.until = m.until
+      // 可用的星期几（0=周日 … 6=周六）。缺省与空数组都表示「不按星期筛」，
+      // 所以空数组不存——存了也只是多一个恒真的判断，还会让界面摘要以为配过。
+      const weekdays = weekdaysOf(m.weekdays)
+      if (weekdays !== null && weekdays.length > 0) entry.weekdays = weekdays
       // 注意：并发上限不在这里。它是模型的属性（见 modelConcurrency 表），
       // 由 POST /model-concurrency 单独维护；旧数据里残留的 entry.concurrency 会被丢弃。
       // 禁用：用户显式把这个模型挡在路由之外，与「当日失败」互不覆盖——
@@ -4134,7 +4702,9 @@ export function apply(ctx, config = {}) {
           lanEnabled: g.lanEnabled === true,
           models: g.models.map(m => ({
             provider: m.provider, model: m.model, priority: m.priority ?? 99, effort: m.effort ?? null,
-            windows: m.windows ?? null, from: m.from ?? null, to: m.to ?? null, until: m.until ?? null,
+            windows: m.windows ?? null, from: m.from ?? null, to: m.to ?? null,
+            // 时间闸门：可用的星期几（0=周日 … 6=周六）
+            weekdays: Array.isArray(m.weekdays) && m.weekdays.length > 0 ? m.weekdays : null,
             disabled: m.disabled === true, failed: isFailed(m.provider, m.model),
             // 临时失败（bili 限流闸门等）：非 null 表示它此刻被上游要求退避，到期自动恢复
             temporaryFailure: (() => {
@@ -4167,7 +4737,20 @@ export function apply(ctx, config = {}) {
         activeModels: [...overrides.entries()].map(([sessionId, m]) => ({ sessionId, provider: m.provider, model: m.model, effort: m.effort ?? null })),
         settings,
         failResetHour,
+        // 账号换号总开关：false 时失败一律走分组路由换模型，池与积分完全不碰
+        ofmAccountHandoff,
+        // 会话没跑完就收尾时换模型（输出上限/病态重复等退化类）：开关 + 退化模型的冷却时长
+        ofmSwitchOnTurnEnd,
+        ofmDegenerateCooldownMs,
         ofmHandoffExcludeProviders: [...ofmHandoffExcludedProviders],
+        // 积分感知换号：开关、超时、缓存时长，以及最近一次读到的账号积分现场
+        ofmCreditSkip,
+        ofmCreditProbeTimeoutMs,
+        ofmCreditCacheMs,
+        creditBalances: [...creditBalanceCache.entries()].map(([provider, snap]) => ({
+          provider, at: snap.at,
+          accounts: snap.accounts === null ? null : snap.accounts.map(a => ({ accountId: a.accountId, total: a.total })),
+        })),
         // 压缩旁路现场：bili 生效时哪些模型注定拿不到压缩、哪些会话正跑在这种链路上
         compressionGuard: describeCompressionGuard(),
         // 实际加载的宿主文件名（确认改完的代码有没有生效）
@@ -4376,6 +4959,38 @@ export function apply(ctx, config = {}) {
             defaultConcurrency = n
             ctx.logger.info(`[model-failover] 默认并发设为 ${n === 0 ? '不限' : n}`)
           }
+        }
+        // 账号换号：null = 跟随 config 的出厂值（默认关闭）。改完立刻生效——
+        // 每次失败都会重读 ofmAccountHandoff，不需要重启宿主。
+        if ('ofmAccountHandoff' in body) {
+          const raw = body.ofmAccountHandoff
+          if (raw === null) {
+            settings.ofmAccountHandoff = null
+            ofmAccountHandoff = configAccountHandoff
+          } else if (typeof raw === 'boolean') {
+            settings.ofmAccountHandoff = raw
+            ofmAccountHandoff = raw
+          } else {
+            sendJson(res, 400, { ok: false, error: 'ofmAccountHandoff 需为布尔值，或 null 表示跟随 config' })
+            return
+          }
+          ctx.logger.info(`[model-failover] 账号换号：${ofmAccountHandoff ? '开' : '关'}${settings.ofmAccountHandoff === null ? '（跟随 config）' : ''}`)
+        }
+        // 会话没跑完就换模型（退化类失败：输出撞上限、病态重复）：null = 跟随 config 的出厂值
+        // （默认开）。改完立刻生效——每次收尾判定都重读这个变量。
+        if ('ofmSwitchOnTurnEnd' in body) {
+          const raw = body.ofmSwitchOnTurnEnd
+          if (raw === null) {
+            settings.ofmSwitchOnTurnEnd = null
+            ofmSwitchOnTurnEnd = configSwitchOnTurnEnd
+          } else if (typeof raw === 'boolean') {
+            settings.ofmSwitchOnTurnEnd = raw
+            ofmSwitchOnTurnEnd = raw
+          } else {
+            sendJson(res, 400, { ok: false, error: 'ofmSwitchOnTurnEnd 需为布尔值，或 null 表示跟随 config' })
+            return
+          }
+          ctx.logger.info(`[model-failover] 会话收尾换模型：${ofmSwitchOnTurnEnd ? '开' : '关'}${settings.ofmSwitchOnTurnEnd === null ? '（跟随 config）' : ''}`)
         }
         // CodeArts 凭据镜像：开关与同步间隔。null = 跟随 config 的出厂值。
         // 改完立刻 reconfigure，不必重启宿主 —— 这是「AK 轮换窗口尽量短」的前提。
@@ -5118,7 +5733,7 @@ export function apply(ctx, config = {}) {
     })()
   }
 
-  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + trae compress shim + codearts resign bridge + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe)`)
+  ctx.logger.info(`[model-failover-manager ${HOST_VERSION}] mounted from ${PLUGIN_FILE} (agent.model.select routing + microtask auto continuation + compression guard + qoder compress shim + trae compress shim + codearts resign bridge + concurrency gate with temporary capacity switching + speed board + agent/error entry + continuation failsafe + routing time gates (daily windows / weekdays) + account handoff disabled by default)`)
 
   /* ==================== 清理 ==================== */
   ctx.effect(() => () => {

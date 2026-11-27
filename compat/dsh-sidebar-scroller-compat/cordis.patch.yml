@@ -1,0 +1,7 @@
+# dsh-sidebar-scroller-compat bundle layer.
+#
+# 一行：浏览器半。它不动任何插槽的注册，只在渲染前给「接管的占用者」
+# 套一层外壳，把它已经收到的 useSectionScroller 转发进子槽渲染。
+- insert:
+    - id: sidebar-scroller-compat
+      name: dsh-sidebar-scroller-compat

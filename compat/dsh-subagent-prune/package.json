@@ -1,0 +1,21 @@
+{
+  "name": "dsh-subagent-prune",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 插件：让会话面板的「子智能体」分栏支持隐藏/清空与删除指定子代理（按父会话持久化，可恢复），不改 DSH 源码。",
+  "license": "MIT",
+  "keywords": ["dsh", "dsh-plugin", "subagent", "session-panel"],
+  "main": "./host.mjs",
+  "exports": {
+    ".": "./host.mjs",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["host.mjs", "client.js", "cordis.patch.yml", "README.md"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true }
+  }
+}

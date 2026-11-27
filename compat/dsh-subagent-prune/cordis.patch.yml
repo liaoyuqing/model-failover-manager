@@ -1,0 +1,4 @@
+# 由 ~/.dsh/cordis.patch.yml 的 insert 行挂载；这里只为包自带的 bundle 形态留位。
+- insert:
+    - id: subagent-prune
+      name: dsh-subagent-prune

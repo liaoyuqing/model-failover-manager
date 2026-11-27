@@ -1,6 +1,6 @@
 {
   "name": "model-failover-manager",
-  "version": "2.30.0",
+  "version": "2.31.0",
   "description": "免费使用模型无限token，并带请求失败自动切换。模型选择弹窗＋路由分组：模型失败后自动换到组内下一个可用模型并继续本轮；免费渠道页签一键装 Our Free Model、CodeArts、WorkBuddy、Trae、Qoder、Providers Hub 六个插件，覆盖华为云 CodeArts、腾讯 CodeBuddy、有道 LobsterAI、TRAE、Cline、MiniMax、智谱 ZCode、Gemini、Accio、讯飞 AStudio 等 23 个免费平台；另含数据看板、错误重试配置，以及把路由分组以 OpenAI 兼容接口开放给同网段其它程序的局域网路由（/v1/chat/completions 与 /v1/responses，失败仍在服务端静默切换）。",
   "license": "Apache-2.0",
   "type": "module",
@@ -8,7 +8,13 @@
     "dsh": ">=0.2.1-0 <0.3.0"
   },
   "dependencies": {
-    "dsh-llm-error-retry": "github:liaoyuqing/dsh-llm-error-retry#5543c344e926edb1b3a7c9872af92934be897deb"
+    "dsh-llm-error-retry": "github:liaoyuqing/dsh-llm-error-retry#5543c344e926edb1b3a7c9872af92934be897deb",
+    "dsh-connection-compat": "file:./compat/dsh-connection-compat",
+    "dsh-connection-admit-compat": "file:./compat/dsh-connection-admit-compat",
+    "dsh-sidebar-scroller-compat": "file:./compat/dsh-sidebar-scroller-compat",
+    "dsh-subagent-prune": "file:./compat/dsh-subagent-prune",
+    "dsh-ofm-revive-compat": "file:./compat/dsh-ofm-revive-compat",
+    "model-failover-provider-prefix": "file:./compat/model-failover-provider-prefix"
   },
   "repository": {
     "type": "git",
@@ -32,6 +38,12 @@
     "locale/en.json",
     "locale/zh.json",
     "icon.svg",
+    "compat/dsh-connection-compat",
+    "compat/dsh-connection-admit-compat",
+    "compat/dsh-sidebar-scroller-compat",
+    "compat/dsh-subagent-prune",
+    "compat/dsh-ofm-revive-compat",
+    "compat/model-failover-provider-prefix",
     "docs/preview-model-selection.png",
     "docs/preview-routing-groups.png",
     "docs/preview-dashboard.png",

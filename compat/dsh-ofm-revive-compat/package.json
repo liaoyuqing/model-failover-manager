@@ -1,0 +1,29 @@
+{
+  "name": "dsh-ofm-revive-compat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH plugin: restart a Loader entry stuck in FAILED. cordis fiber.restart() returns early while _error is set, so only fiber.update(config, noSave) clears it and re-applies; the host exposes no such entry-level control.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "compat"
+  ],
+  "main": "./host.mjs",
+  "exports": {
+    ".": "./host.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.mjs",
+    "cordis.patch.yml",
+    "package.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

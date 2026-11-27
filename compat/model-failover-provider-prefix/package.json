@@ -1,0 +1,12 @@
+{
+  "name": "model-failover-provider-prefix",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Host-only per-plugin provider-prefix llm facade (one prefix per plugin, provided inside a cordis isolate realm; no client bundle).",
+  "main": "llm-prefix-facade.mjs",
+  "exports": {
+    ".": "./llm-prefix-facade.mjs",
+    "./package.json": "./package.json"
+  }
+}

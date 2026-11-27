@@ -1,0 +1,37 @@
+{
+  "name": "dsh-sidebar-scroller-compat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 插件：把 sidebar.workspaces 占用者收到的 useSectionScroller 转发进它渲染的每个子槽，修好第三方接管左侧栏后「useSectionScroller is not a function」导致的会话列表空白。",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sidebar",
+    "compat"
+  ],
+  "main": "./host.mjs",
+  "exports": {
+    ".": "./host.mjs",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "dsh-connection-compat",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH plugin: restores the removed ctx.connection.requestRejection() at runtime (calls admit on the real service instance, not the caller-scoped traceable proxy) so plugins written for dsh <= 0.2.2-rc.1 keep working instead of answering empty-body 400s or 403 \"untrusted origin\".",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "compat"
+  ],
+  "main": "./host.v3.mjs",
+  "exports": {
+    ".": "./host.v3.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.v3.mjs",
+    "cordis.patch.yml",
+    "package.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

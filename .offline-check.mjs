@@ -40,6 +40,12 @@ const bjHour = Number(new Intl.DateTimeFormat('en-GB', {
   timeZone: 'Asia/Shanghai', hourCycle: 'h23', hour: '2-digit',
 }).format(new Date()))
 const badHour = (bjHour + 5) % 24
+// 同理：今天的星期序数，用来造一个「此刻必然不在可用星期内」的条目
+const bjWeekday = new Date(Date.UTC(
+  Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric' }).format(new Date())),
+  Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', month: '2-digit' }).format(new Date())) - 1,
+  Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', day: '2-digit' }).format(new Date())),
+)).getUTCDay()
 
 writeFileSync(join(dir, 'groups.json'), JSON.stringify([
   // g1：子代理继承链用
@@ -59,9 +65,15 @@ writeFileSync(join(dir, 'groups.json'), JSON.stringify([
     { provider: 'p', model: 'm4', priority: 1, windows: [{ from: badHour, to: badHour }] },
     { provider: 'p', model: 'm5', priority: 2 },
   ] },
-  // g5：m6 的截止日已过
+  // g5：m6 的时段只在「今天」生效，而那个时段此刻必然不命中 → 不可路由
+  // （星期是时段的作用域：今天在列，就要按时段判定）
   { id: 'g5', name: 'G5', enabled: true, models: [
-    { provider: 'p', model: 'm6', priority: 1, until: '2020-01-01' },
+    { provider: 'p', model: 'm6', priority: 1, weekdays: [bjWeekday], windows: [{ from: badHour, to: badHour }] },
+    { provider: 'p', model: 'm5', priority: 2 },
+  ] },
+  // g6：m7 的时段只在「别的日子」生效 —— 今天不在列，所以不受时段限制、全天可用
+  { id: 'g6', name: 'G6', enabled: true, models: [
+    { provider: 'p', model: 'm7', priority: 1, weekdays: [(bjWeekday + 3) % 7], windows: [{ from: badHour, to: badHour }] },
     { provider: 'p', model: 'm5', priority: 2 },
   ] },
 ]))
@@ -75,7 +87,8 @@ writeFileSync(join(dir, 'session-bindings.json'), JSON.stringify([
   { sessionId: 'keep-1', groupId: 'g2', mode: 'route' },     // 当前 m2 可用 → 保留
   { sessionId: 'out-keep', groupId: 'g2', mode: 'failover' },// 当前 m99 不在组 → 不插手
   { sessionId: 'win-sess', groupId: 'g4', mode: 'route' },    // m4 出窗 → 切 m5
-  { sessionId: 'exp-1', groupId: 'g5', mode: 'route' },       // m6 过期 → 切 m5
+  { sessionId: 'exp-1', groupId: 'g5', mode: 'route' },       // m6 今天限时且出窗 → 切 m5
+  { sessionId: 'day-scope', groupId: 'g6', mode: 'route' },   // m7 今天不限时 → 保留
   { sessionId: 'probe-1', groupId: 'g2', mode: 'route' },     // m1 被标记失败 → 切 m2
 ]))
 
@@ -130,6 +143,7 @@ const agents = [
   makeAgent('out-keep', {}, 'm99'),
   makeAgent('win-sess', {}, 'm4'),
   makeAgent('exp-1', {}, 'm6'),
+  makeAgent('day-scope', {}, 'm7'),
   // ⑤ 之后才用到：m1 被标记失败后要切的会话
   makeAgent('probe-1', {}, 'm1'),
 ]
@@ -144,25 +158,68 @@ let selectModelCalls = 0
 /**
  * 假的 Our Free Model 账号池。
  *
- * 只对 'pool-p' 报出两个可用账号——正是「池里有这个 provider 的账号」这一事实，
+ * 只对下文列出的 provider 报出两个可用账号——正是「池里有这个 provider 的账号」这一事实，
  * 而 'codearts' 明明也有历史账号：插件必须靠 config.ofmHandoffExcludeProviders
  * 而不是账号存在性来判断是否换号。
+ *
+ * 额外的 pool-zero / pool-allzero / pool-err 是 ⑩b 积分用例用的：积分按 provider
+ * 缓存同一份结果，同一个 provider 上验不了「查到 0 积分」「全部 0 积分」「查不到」
+ * 三种互斥的现场。
  */
 const poolCalls = []
+/** provider -> 账号 id 列表（每个都 enabled） */
+const POOL_PROVIDERS = {
+  'pool-p': ['pool-p-1', 'pool-p-2'],
+  'pool-zero': ['pool-zero-1', 'pool-zero-2'],
+  'pool-allzero': ['pool-allzero-1', 'pool-allzero-2'],
+  'pool-err': ['pool-err-1', 'pool-err-2'],
+  'pool-mixed': ['pool-mixed-1', 'pool-mixed-2'],
+  'pool-q429': ['pool-q429-1', 'pool-q429-2'],
+  'pool-rl': ['pool-rl-1', 'pool-rl-2'],
+  // 停用账号：真实池照样把它列给调用方（enabled: false），渠道包的余额查询也照样会
+  // 查它。⑩b 用它验「停用的 0 积分账号不能被算成可用账号没钱」。
+  'pool-disabled': ['pool-disabled-1', 'pool-disabled-2', 'pool-disabled-3'],
+}
+/** 停用的账号 id（假池在 listAccountsByProvider 里把它们的 enabled 报成 false） */
+const POOL_DISABLED = new Set(['pool-disabled-1'])
+/** 账号 id -> Map(model -> resetAt)：假池的冷却标记（updateModelRateLimit 的落点） */
+const poolMarks = new Map()
 const accountPool = {
   listAccountsByProvider(provider) {
-    if (provider !== 'pool-p') return []
-    return [
-      { id: 'pool-p-1', provider, enabled: true },
-      { id: 'pool-p-2', provider, enabled: true },
-    ]
+    const ids = POOL_PROVIDERS[provider]
+    if (ids === undefined) return []
+    return ids.map(id => {
+      const enabled = !POOL_DISABLED.has(id)
+      const marks = poolMarks.get(id)
+      // 与真实池同构：只有「还未过期」的标记才算数（过期的由 sweepExpiredRateLimits 清掉）
+      if (marks === undefined) return { id, provider, enabled }
+      const live = Object.fromEntries([...marks].filter(([, at]) => at > Date.now()))
+      return Object.keys(live).length === 0
+        ? { id, provider, enabled }
+        : { id, provider, enabled, modelRateLimits: live }
+    })
   },
   async getAvailableAccount(provider, model) {
     poolCalls.push(['getAvailableAccount', provider, model])
-    return { entry: { id: 'pool-p-1' } }
+    const ids = POOL_PROVIDERS[provider]
+    if (ids === undefined) return null
+    // 真实池按存储顺序取第一个「enabled + 该模型无未过期冷却」的账号；假池照此实现，
+    // 否则「写了标记就会换到下一个账号」这件事在自检里根本不成立。
+    const next = ids.find(id => {
+      if (POOL_DISABLED.has(id)) return false
+      const at = poolMarks.get(id)?.get(model)
+      return at === undefined || Date.now() >= at
+    })
+    return next === undefined ? null : { entry: { id: next } }
   },
   async updateModelRateLimit(accountId, model, resetAt) {
     poolCalls.push(['updateModelRateLimit', accountId, model, resetAt])
+    // 与真实池同一条约定：只接受比现值更大的解禁时刻
+    const marks = poolMarks.get(accountId) ?? new Map()
+    const current = marks.get(model)
+    if (current !== undefined && current >= resetAt) return
+    marks.set(model, resetAt)
+    poolMarks.set(accountId, marks)
   },
 }
 /** 假的 goal 服务：记录 resume 调用，并可预置某个会话的 goal 现场 */
@@ -258,7 +315,9 @@ ctx.on('agent/error', ({ agent }) => {
   if (st !== undefined && st.phase === 'active') goalState.set(sid, { ...st, activation: 'disarmed' })
 })
 
-applyTwice(ctx, { dataDir: dir })
+// 主实例把「失败时换账号」开到旧行为：⑩ / ⑩b 验的是换号机制本身（选号、写冷却、
+// 积分感知）。出厂默认关这件事由 ㊿ 用独立实例单独验，两边不互相牵连。
+applyTwice(ctx, { dataDir: dir, ofmAccountHandoff: true })
 
 // 插件在本进程只挂一次，所以直接取唯一那份监听器（下方 agent/error 的取法同理）。
 const errHandler = handlers.one('agent/request-error')
@@ -357,7 +416,8 @@ ok('④ 当前模型可用 → 保留，不切换', (await runPreStep('keep-1'))
 const outBefore = agents.find(a => a.id === 'out-keep').session.state.model
 ok('④ 当前模型不在分组内 → 不插手用户的选择', (await runPreStep('out-keep')) === outBefore)
 ok('④ 模型超出北京时间时段 → 切到组内可用模型', (await runPreStep('win-sess')) === 'm5')
-ok('④ 模型过了截止日 → 切到组内可用模型', (await runPreStep('exp-1')) === 'm5')
+ok('④ 时段今天生效且此刻出窗 → 切到组内可用模型', (await runPreStep('exp-1')) === 'm5')
+ok('④ 时段只对别的日子生效 → 今天不受时段限制，保留不切', (await runPreStep('day-scope')) === 'm7')
 
 // ⑤ 被标记当日失败的模型：新一轮必须换掉
 ok('⑤ p/m1 已被标记当日失败', (await api('GET', '/status')).body.failed.some(f => f.provider === 'p' && f.model === 'm1'))
@@ -669,6 +729,172 @@ ok('⑩ 名单外的 provider 仍先换账号重试（非限流失败也写冷�
   JSON.stringify({ action: ofmAction, calls: poolCalls }))
 ok('⑩ /status 回传生效的排除名单',
   JSON.stringify((await api('GET', '/status')).body.ofmHandoffExcludeProviders) === JSON.stringify(['codearts']))
+
+// ⑩b 积分感知换号：只在上游报「积分不足/余额不足」时读渠道积分，把 0 积分的账号跳过一整天
+//
+// 账号池服务本身没有积分：积分只能经 /api/channel-pack 的 credits.balances 读，
+// 而且要浏览器会话认证。这里把两件事都换成可控桩：credentials 给一把合法密钥，
+// fetch 按 provider 回不同的余额现场。
+{
+  const baseGetBeforeCredit = ctx.get
+  const baseFetchBeforeCredit = globalThis.fetch
+  /** provider -> credits.balances 的 accounts 数组；null 表示这个渠道不提供余额查询 */
+  const creditStub = new Map()
+  const creditRequests = []
+  const browserSecret = Buffer.alloc(32, 7).toString('base64url')
+  ctx.get = (name) => {
+    if (name === 'credentials') {
+      return { async readRecord() { return { payload: { secret: browserSecret } } } }
+    }
+    return baseGetBeforeCredit.call(ctx, name)
+  }
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/api/channel-pack')) {
+      const body = JSON.parse(init.body)
+      const provider = body.payload.payload.provider
+      creditRequests.push({ provider, cookie: /dsh-auth-[^=]+=v1\./.test(String(init.headers.cookie)) })
+      const accounts = creditStub.get(provider)
+      if (accounts === undefined) {
+        return { ok: true, async json() { return { type: 'server-response', rpcId: body.rpcId, result: { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${provider}` } } } } }
+      }
+      return { ok: true, async json() { return { type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: { accounts } } } } }
+    }
+    return baseFetchBeforeCredit(url, init)
+  }
+  /** 余额行：total 为 null 表示该账号查询失败（不是 0） */
+  const bal = (accountId, total, error) => ({
+    accountId,
+    nickname: accountId,
+    balance: total === null ? null : { total, packages: [], unit: '积分' },
+    ...(error === undefined ? {} : { error }),
+  })
+  const marksOf = (accountId, model) => poolMarks.get(accountId)?.get(model)
+  const bjHourOf = (ms) => new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', hourCycle: 'h23', hour: '2-digit', minute: '2-digit',
+  }).format(new Date(ms))
+
+  /** 在某 provider 上跑一次换号，返回插件给宿主的动作 */
+  async function handoffOn(provider, failure, sessionId) {
+    const a = makeAgent(sessionId, {}, 'm1')
+    agents.push(a)
+    await api('POST', '/session-group', { sessionId, groupId: 'g2', mode: 'route' })
+    a.status = 'running'
+    const act = await errHandler({ agent: a, turn: 1, provider, failure }, () => Promise.resolve(undefined))
+    a.status = 'idle'
+    return act
+  }
+  /** 清掉假池的冷却标记：这些用例验的是「一次换号怎么选」，不该被上一轮的标记影响 */
+  const clearMarks = (...providers) => {
+    for (const provider of providers) for (const id of POOL_PROVIDERS[provider]) poolMarks.delete(id)
+  }
+
+  // (1) 一半账号 0 积分：0 的那个跳过到当日日界线，另一个照常按失败冷却，且确实换到它
+  clearMarks('pool-zero')
+  creditStub.set('pool-zero', [
+    bal('pool-zero-1', 0),
+    bal('pool-zero-2', 500),
+  ])
+  creditRequests.length = 0
+  const zeroAction = await handoffOn('pool-zero', { code: 'QUOTA_EXCEEDED', message: '积分不足', status: 402 }, 'credit-half-1')
+  const zeroUntil = marksOf('pool-zero-1', 'm1')
+  const zeroOtherUntil = marksOf('pool-zero-2', 'm1')
+  ok('⑩b 报积分不足时读渠道积分（一次 RPC，带自签浏览器会话 cookie）',
+    creditRequests.length === 1 && creditRequests[0].provider === 'pool-zero' && creditRequests[0].cookie === true,
+    JSON.stringify(creditRequests))
+  ok('⑩b 积分为 0 的账号被跳过到当日日界线（北京时间 8 点）',
+    Number.isFinite(zeroUntil) && bjHourOf(zeroUntil) === '08:00' && zeroUntil > Date.now(),
+    `until=${Number.isFinite(zeroUntil) ? bjHourOf(zeroUntil) : String(zeroUntil)}`)
+  ok('⑩b 积分正常的账号仍按失败冷却（不是整天跳过）',
+    Number.isFinite(zeroOtherUntil) && zeroOtherUntil - Date.now() <= 90_000,
+    `until=${Number.isFinite(zeroOtherUntil) ? Math.round((zeroOtherUntil - Date.now()) / 1000) + 's' : String(zeroOtherUntil)}`)
+  ok('⑩b 换号重试落在积分正常的那个账号上（不是被跳过 0 积分的那个）',
+    zeroAction?.kind === 'retry' && marksOf('pool-zero-2', 'm1') !== undefined,
+    JSON.stringify({ action: zeroAction, marks: [...poolMarks.entries()].map(([k, v]) => [k, [...v.keys()]]) }))
+  ok('⑩b /status 回传读到的积分现场',
+    (await api('GET', '/status')).body.creditBalances.some(b => b.provider === 'pool-zero'
+      && b.accounts.some(a => a.accountId === 'pool-zero-1' && a.total === 0)),
+    JSON.stringify((await api('GET', '/status')).body.creditBalances))
+
+  // (2) 可用账号全都 0 积分：换号换不出额度来，交给分组路由换模型，且不把整池写成跳过
+  clearMarks('pool-allzero')
+  creditStub.set('pool-allzero', [
+    bal('pool-allzero-1', 0),
+    bal('pool-allzero-2', 0),
+  ])
+  const allZeroAction = await handoffOn('pool-allzero', { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 }, 'credit-allzero-1')
+  ok('⑩b 全部账号积分都是 0 时不做无意义换号（交给分组路由换模型）',
+    allZeroAction?.kind !== 'retry', JSON.stringify(allZeroAction))
+  ok('⑩b 全部 0 积分时不把整池写成跳过（否则渠道直接选不出号，看起来像池坏了）',
+    POOL_PROVIDERS['pool-allzero'].every(id => marksOf(id, 'm1') === undefined),
+    JSON.stringify(POOL_PROVIDERS['pool-allzero'].map(id => [id, marksOf(id, 'm1') ?? null])))
+
+  // (3) 渠道不提供余额查询（buddy / codearts 这类）：按「积分未知」退回纯失败换号
+  clearMarks('pool-err')
+  const errAction = await handoffOn('pool-err', { code: 'QUOTA_EXCEEDED', message: '余额不足', status: 403 }, 'credit-err-1')
+  ok('⑩b 读不到积分时退回按失败换号（不因查询失败就停手）',
+    errAction?.kind === 'retry' && marksOf('pool-err-1', 'm1') !== undefined,
+    JSON.stringify({ action: errAction, mark: marksOf('pool-err-1', 'm1') ?? null }))
+  ok('⑩b 读不到积分不会被当成 0 积分（账号不会被整天跳过）',
+    Number.isFinite(marksOf('pool-err-1', 'm1')) && marksOf('pool-err-1', 'm1') - Date.now() <= 90_000,
+    `until=${marksOf('pool-err-1', 'm1') - Date.now()}ms`)
+
+  // (4) 单账号余额查询失败不能连坐：同一渠道里失败的账号是「未知」，不是 0
+  clearMarks('pool-mixed')
+  creditStub.set('pool-mixed', [
+    bal('pool-mixed-1', null, '积分查询失败（凭据失效或响应异常）'),
+    bal('pool-mixed-2', 0),
+  ])
+  const mixedAction = await handoffOn('pool-mixed', { code: 'QUOTA_EXCEEDED', message: '积分不足', status: 402 }, 'credit-mixed-1')
+  ok('⑩b 单个账号余额查询失败不算 0 积分（凭据失效不该整天被跳过）',
+    marksOf('pool-mixed-1', 'm1') === undefined
+      || marksOf('pool-mixed-1', 'm1') - Date.now() <= 90_000,
+    `until=${marksOf('pool-mixed-1', 'm1') === undefined ? '未写' : marksOf('pool-mixed-1', 'm1') - Date.now() + 'ms'}`)
+  ok('⑩b 查询失败的那个账号仍参与换号（换到它就是成功重试）',
+    mixedAction?.kind === 'retry', JSON.stringify(mixedAction))
+
+  // (5) 积分不足压过限流判定：上游把额度用尽包成 429 时仍要换号，而不是当限流换模型
+  clearMarks('pool-q429')
+  creditStub.set('pool-q429', [bal('pool-q429-1', 0), bal('pool-q429-2', 900)])
+  const quota429Action = await handoffOn('pool-q429', { code: 'RATE_LIMIT', message: '余额不足，请充值', status: 429 }, 'credit-429-1')
+  ok('⑩b 429 + 余额不足按额度用尽处理：换号而不是记临时失败',
+    quota429Action?.kind === 'retry' && (await api('GET', '/status')).body.temporaryFailures.every(e => e.model !== 'm1' || e.provider !== 'pool-q429'),
+    JSON.stringify(quota429Action))
+
+  // (6) 对照：报文明确是限流时仍算限流，不因「积分不足」正则过宽而抢走限流处置
+  clearMarks('pool-rl')
+  creditStub.set('pool-rl', [bal('pool-rl-1', 0), bal('pool-rl-2', 900)])
+  creditRequests.length = 0
+  const rateLimitAction = await handoffOn('pool-rl', { code: 'RATE_LIMIT', message: 'upstream rate limited: too many requests', status: 429 }, 'credit-rl-1')
+  ok('⑩b 明确是限流的报文不触发积分查询（限流换模型，换号拿到的是同一条 hold）',
+    rateLimitAction?.kind !== 'retry' && creditRequests.length === 0,
+    JSON.stringify({ action: rateLimitAction, requests: creditRequests }))
+
+  // (7) 停用的 0 积分账号不能连坐：渠道包按 provider 返回全部账号（含停用），若直接拿
+  // 它和「可用账号数」比，pool-disabled 上 3 个账号里 2 个可用、其中 1 个 0 积分，
+  // 一旦把停用的那个也算进来就会凑成「全都 0 积分」而放弃换号——真实池却还有可用账号。
+  clearMarks('pool-disabled')
+  creditStub.set('pool-disabled', [
+    bal('pool-disabled-1', 0),   // 停用账号：它的积分与换号无关
+    bal('pool-disabled-2', 0),   // 可用但没钱
+    bal('pool-disabled-3', 700), // 可用且有钱：换号应该换到它
+  ])
+  const disabledAction = await handoffOn('pool-disabled', { code: 'QUOTA_EXCEEDED', message: '积分不足', status: 402 }, 'credit-disabled-1')
+  ok('⑩b 停用的 0 积分账号不算进「可用账号没钱」（照样换号，不误判成整池没钱）',
+    disabledAction?.kind === 'retry', JSON.stringify(disabledAction))
+  ok('⑩b 停用的账号不写跳过标记（它本来就不参与选号）',
+    marksOf('pool-disabled-1', 'm1') === undefined,
+    `mark=${marksOf('pool-disabled-1', 'm1') ?? '未写'}`)
+  ok('⑩b 换号换到可用且有钱的那个账号（它只按失败冷却，不像 0 积分账号那样被跳过一整天）',
+    bjHourOf(marksOf('pool-disabled-2', 'm1') ?? 0) === '08:00'
+      && Number.isFinite(marksOf('pool-disabled-3', 'm1'))
+      && marksOf('pool-disabled-3', 'm1') - Date.now() <= 90_000,
+    JSON.stringify({ zero: bjHourOf(marksOf('pool-disabled-2', 'm1') ?? 0), paid: Math.round(((marksOf('pool-disabled-3', 'm1') ?? 0) - Date.now()) / 1000) + 's' }))
+
+  clearMarks('pool-zero', 'pool-allzero', 'pool-err', 'pool-mixed', 'pool-q429', 'pool-rl', 'pool-disabled')
+  ctx.get = baseGetBeforeCredit
+  globalThis.fetch = baseFetchBeforeCredit
+}
+await api('POST', '/failed/reset', {})
 
 // ⑪ dsh-codearts：分辨「可以重建账号池」与「billion-context 拒绝转发签名请求」
 let restartCalls = 0
@@ -2195,31 +2421,34 @@ function insertRows(text) {
   let cur = null
   for (const line of text.split(/\r?\n/)) {
     const id = line.match(/^\s*- id:\s*(\S+)\s*$/)
-    const name = line.match(/^\s*name:\s*'([^']+)'\s*$/)
+    // name 在 patch 里是不带引号的相对路径；历史上也写成过单引号，两种都认。
+    const name = line.match(/^\s*name:\s*'?([^'\s]+)'?\s*$/)
     if (id) { cur = { id: id[1], name: null }; out.push(cur); continue }
     if (name && cur && !cur.name) cur.name = name[1]
   }
   return out
 }
 const rows = insertRows(patchText)
-ok('㉝ patch 插入两行：本插件 + 重试插件（裸包名，由 profile 的 node_modules 解析）',
-  rows.length === 2
-  && rows[0].id === 'model-failover-manager' && rows[0].name === 'model-failover-manager'
-  && rows[1].id === 'llm-error-retry' && rows[1].name === 'dsh-llm-error-retry',
+// 本包 + compat/ 下五个兼容子包，全部用相对路径（由 profile 组装器锚定在 patch 所在目录），
+// 这样整包可以整体搬动或整体安装，运行时不需要 node_modules 解析。
+const EXPECTED_ROWS = [
+  { id: 'model-failover-manager', name: './host.mjs' },
+  { id: 'connection-compat', name: './compat/dsh-connection-compat/host.v3.mjs' },
+  { id: 'connection-admit-compat', name: './compat/dsh-connection-admit-compat/host.mjs' },
+  { id: 'sidebar-scroller-compat', name: './compat/dsh-sidebar-scroller-compat/host.mjs' },
+  { id: 'subagent-prune', name: './compat/dsh-subagent-prune/host.mjs' },
+  { id: 'ofm-revive-compat', name: './compat/dsh-ofm-revive-compat/host.mjs' },
+]
+ok('㉝ patch 插入本插件与五个兼容子包（全部相对路径，整包可整体搬动）',
+  JSON.stringify(rows) === JSON.stringify(EXPECTED_ROWS),
   JSON.stringify(rows))
-
-// 重复安装：dsh-llm-error-retry 自己的 bundle patch 也插一行，id 与本 patch 相同、名字
-// 是相对路径。Loader 的条目按 id 存放、后写覆盖先写（EntryGroup.update 按 id 建 map），
-// 这里按同一语义走一遍，证明两个 id 相等就会收敛成一条。
-const upstreamRow = { id: 'llm-error-retry', name: './host.mjs' }
-const composed = new Map()
-for (const row of [...rows, upstreamRow]) composed.set(row.id, row)
-ok('㉝ 两条安装路径的两行同 id → 合成一个条目（不会跑两个重试实例）',
-  composed.size === 2
-  && composed.has('llm-error-retry')
-  && rows.filter(r => r.id === 'llm-error-retry').length === 1
-  && upstreamRow.name !== rows[1].name,
-  JSON.stringify([...composed.keys()]))
+ok('㉝ 每个插入的路径都指向真实存在的文件（少一个宿主就起不来）',
+  rows.every(r => r.name !== null && existsSync(new URL(r.name, import.meta.url))),
+  JSON.stringify(rows.filter(r => r.name === null || !existsSync(new URL(r.name, import.meta.url)))))
+// 刻意不插 llm-error-retry：本机部署由 $DSH_HOME 层持有该条目，两层各插一行同 id
+// 会产生两个实例、各自重试同一条请求。这条断言守住「不再插回去」。
+ok('㉝ 不在本 patch 里插 llm-error-retry 行（同 id 两行会跑出两个重试实例）',
+  rows.every(r => r.id !== 'llm-error-retry'), JSON.stringify(rows.map(r => r.id)))
 
 const clientText = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
 ok('㉝ 弹窗新增「错误重试」页签，且只在停在该页签时探测',
@@ -2642,7 +2871,10 @@ ok('㉟ 调顺序只交换相邻两条的 priority（不整体重排，没动过
 const gCreated = (await api('POST', '/groups', {
   name: 'zz-move-check',
   models: [
-    { provider: 'a', model: 'm1', priority: 5, windows: [{ from: 1, to: 2 }], until: '2027-01-01' },
+    {
+      provider: 'a', model: 'm1', priority: 5, windows: [{ from: 1, to: 2 }],
+      weekdays: [1, 3],
+    },
     { provider: 'a', model: 'm2', priority: 9 },
   ],
 })).body
@@ -2663,9 +2895,10 @@ ordered[1] = down
 const moved = await api('PUT', '/groups', { id: gId, models: ordered })
 const m1 = moved.body.group.models.find(m => m.model === 'm1')
 const m2 = moved.body.group.models.find(m => m.model === 'm2')
-ok('㉟ 上移一位：两条交换 priority，而 m1 的时段与截止日原样带过去',
+ok('㉟ 上移一位：两条交换 priority，而 m1 的时段与星期原样带过去',
   m2.priority === 5 && m1.priority === 9
-  && JSON.stringify(m1.windows) === '[{"from":1,"to":2}]' && m1.until === '2027-01-01',
+  && JSON.stringify(m1.windows) === '[{"from":1,"to":2}]'
+  && JSON.stringify(m1.weekdays) === '[1,3]',
   JSON.stringify(moved.body.group.models))
 
 const removed = await api('PUT', '/groups', { id: gId, models: moved.body.group.models.filter(m => m.model !== 'm1') })
@@ -3569,6 +3802,426 @@ ok('㊸ 自检用的临时分组已清掉',
     && clientText.includes("chipDisabled: {\n        opacity: .55,\n        borderStyle: 'dashed'"))
 
   await api('DELETE', '/groups/' + encodeURIComponent(toggleId))
+}
+
+// ── ㊿ 账号换号默认关闭 + 路由条目的星期/生效/禁用时间 ────────────────────────
+//
+// 两件事各有自己的现场：
+//  · 换号默认关是用独立 dataDir 新挂一次验的（出厂值 + settings 覆盖 + 回落到 config）；
+//  · 「关着时不碰账号池」只能在同一份实例上翻开关验，因为监听器闭包读的是同一个变量。
+//  · 时间闸门既验宿主判定（挑谁），也验 client.js 的接线（弹框与摘要是否真被用上）。
+{
+  const bjBag = (atMs) => {
+    const bag = {}
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai', hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    }).formatToParts(new Date(atMs)).forEach((p) => { if (p.type !== 'literal') bag[p.type] = p.value })
+    return bag
+  }
+  const bjWeekdayOf = (atMs) => {
+    const b = bjBag(atMs)
+    return new Date(Date.UTC(Number(b.year), Number(b.month) - 1, Number(b.day))).getUTCDay()
+  }
+  const today = bjWeekdayOf(Date.now())
+  const otherDay = (today + 3) % 7
+
+  /** 用给定 dataDir 新挂一个实例（等价于一次宿主重启），返回它的 HTTP 调用器 */
+  const mountFresh = (dataDir) => {
+    let handler = null
+    const c = Object.assign(Object.create(Object.getPrototypeOf(ctx)), ctx)
+    c.get = baseGet
+    c.on = ctx.on
+    c.inject = (_n, cb) => cb({
+      webServer: { register(spec) { handler = spec.handler; return () => {} } },
+      effect() {}, interval() { return () => {} },
+    })
+    applyTwice(c, { dataDir })
+    return (method, path, body) => {
+      const req = new EventEmitter()
+      req.method = method
+      req.url = `/api/model-failover${path}`
+      const res = { statusCode: 0, body: '', setHeader() {}, end(s) { this.body = s } }
+      const done = handler(req, res)
+      if (body !== undefined) req.emit('data', Buffer.from(JSON.stringify(body)))
+      req.emit('end')
+      return Promise.resolve(done).then(() => ({ status: res.statusCode, body: JSON.parse(res.body || 'null') }))
+    }
+  }
+
+  // ---- (一) 换号开关：出厂关、可开、可回到「跟随 config」 ----
+  const offDir = mkdtempSync(join(tmpdir(), 'mfm-handoff-off-'))
+  const offApi = mountFresh(offDir)
+  ok('㊿ 新装的插件默认不换账号（出厂 ofmAccountHandoff = false）',
+    (await offApi('GET', '/status')).body.ofmAccountHandoff === false,
+    JSON.stringify((await offApi('GET', '/status')).body.ofmAccountHandoff))
+
+  const onRes = await offApi('POST', '/settings', { ofmAccountHandoff: true })
+  ok('㊿ 设置页打开后 /status 立刻报 true（不必重启宿主）',
+    onRes.body.ok === true && (await offApi('GET', '/status')).body.ofmAccountHandoff === true,
+    JSON.stringify(onRes.body))
+  ok('㊿ 开关落进 settings.json，重启后仍然是用户选的 true',
+    JSON.parse(readFileSync(join(offDir, 'settings.json'), 'utf8')).ofmAccountHandoff === true
+    && (await mountFresh(offDir)('GET', '/status')).body.ofmAccountHandoff === true)
+
+  await offApi('POST', '/settings', { ofmAccountHandoff: null })
+  ok('㊿ 传 null 回到「跟随 config」，同样当场生效',
+    JSON.parse(readFileSync(join(offDir, 'settings.json'), 'utf8')).ofmAccountHandoff === null
+    && (await offApi('GET', '/status')).body.ofmAccountHandoff === false)
+  ok('㊿ 非法值被挡下（400），不会把开关写成半开半关',
+    (await offApi('POST', '/settings', { ofmAccountHandoff: 'yes' })).status === 400)
+
+  // ---- (二) 关着的时候真的不碰账号池 ----
+  // 主实例是按 ofmAccountHandoff: true 挂载的（⑩/⑩b 验的是换号机制本身），
+  // 这里翻成 false 再跑一次同样的失败，看账号池有没有被调用。
+  const poolProvider = 'pool-rl'
+  const callsBefore = poolCalls.length
+  await api('POST', '/settings', { ofmAccountHandoff: false })
+  const offAgent = makeAgent('handoff-off-1', {}, 'm1')
+  agents.push(offAgent)
+  await api('POST', '/session-group', { sessionId: 'handoff-off-1', groupId: 'g2', mode: 'route' })
+  offAgent.status = 'running'
+  await errHandler(
+    { agent: offAgent, turn: 1, provider: poolProvider, failure: { code: 'QUOTA_EXCEEDED', message: '额度用尽', status: 403 } },
+    () => Promise.resolve(undefined),
+  )
+  offAgent.status = 'idle'
+  const offLog = (await api('GET', '/status')).body.failureLog.find(f => f.provider === poolProvider)
+  ok('㊿ 关掉后失败完全不碰账号池（listAccountsByProvider / getAvailableAccount 都不调）',
+    !poolCalls.slice(callsBefore).some(c => c[1] === poolProvider || String(c[2]) === poolProvider),
+    JSON.stringify(poolCalls.slice(callsBefore)))
+  ok('㊿ 关掉后失败直接走分组路由换模型（不记 account-handoff）',
+    offLog !== undefined && offLog.outcome !== 'account-handoff',
+    JSON.stringify(offLog))
+  await api('POST', '/settings', { ofmAccountHandoff: null })  // 回落到 config（这里为 true）
+  ok('㊿ 恢复后开关回到 config 的出厂值',
+    (await api('GET', '/status')).body.ofmAccountHandoff === true)
+
+  // ---- (三) 路由时间闸门：星期是时段的「作用域」 ----
+  //
+  // 语义要点：勾上的日期按时段限时，没勾的日期**不受时段限制、全天可用**；
+  // 一个都不勾 = 时段每天都生效。所以「没勾」永远不等于「不可用」。
+  const gateGroup = (await api('POST', '/groups', {
+    name: 'zz-gate-check',
+    models: [
+      // 今天限时且此刻必然出窗 → 不可路由
+      { provider: 'p', model: 'g-today-window', priority: 1, weekdays: [today], windows: [{ from: badHour, to: badHour }] },
+      // 只在别的日子限时 → 今天不受时段限制，全天可用（优先级 1 抢不到时才轮到它）
+      { provider: 'p', model: 'g-other-day', priority: 2, weekdays: [otherDay], windows: [{ from: badHour, to: badHour }] },
+      // 没有任何配置 → 全天可用
+      { provider: 'p', model: 'g-always', priority: 3 },
+    ],
+  })).body
+  const gateId = gateGroup.group.id
+  // POST /groups 回的是存下来的条目本身（没有 weekdays 这个键），不是 /status 的投影，
+  // 所以这里按「有就比、没有就当 null」比对。
+  const gateOf = (m) => m.weekdays ?? null
+  ok('㊿ 星期原样落库（不做隐式换算）',
+    JSON.stringify(gateGroup.group.models.map(gateOf))
+      === JSON.stringify([[today], [otherDay], null]),
+    JSON.stringify(gateGroup.group.models))
+
+  const gateAgent = makeAgent('gate-1', {}, 'g-today-window')
+  agents.push(gateAgent)
+  await api('POST', '/session-group', { sessionId: 'gate-1', groupId: gateId, mode: 'route' })
+  ok('㊿ 今天在限时名单里且此刻出窗 → 跳过它，落到「今天不受限」那条（优先级 2）',
+    (await runPreStep('gate-1')) === 'g-other-day', switchOf('gate-1'))
+
+  // 没勾的日期不受时段限制：把「只在别的日子限时」那条钉成优先级 1 再跑一次，
+  // 它今天应当照常被选中（旧语义会把它当成「今天不可用」而跳过）。
+  await api('PUT', '/groups', {
+    id: gateId,
+    models: [
+      { provider: 'p', model: 'g-other-day', priority: 1, weekdays: [otherDay], windows: [{ from: badHour, to: badHour }] },
+      { provider: 'p', model: 'g-today-window', priority: 2, weekdays: [today], windows: [{ from: badHour, to: badHour }] },
+    ],
+  })
+  const scopeAgent = makeAgent('gate-scope', {}, 'g-today-window')
+  agents.push(scopeAgent)
+  await api('POST', '/session-group', { sessionId: 'gate-scope', groupId: gateId, mode: 'route' })
+  ok('㊿ 没勾的日期 = 不受时段限制（全天可用），不是「不可用」',
+    (await runPreStep('gate-scope')) === 'g-other-day', switchOf('gate-scope'))
+
+  // 校验：非法值丢掉这一项、重复值去重升序
+  const putRes = await api('PUT', '/groups', {
+    id: gateId,
+    models: [
+      { provider: 'p', model: 'g-wrong-weekday', priority: 1, weekdays: [3, 1, 3] },
+      { provider: 'p', model: 'g-today-ok', priority: 2, weekdays: [9] },
+    ],
+  })
+  const putModels = putRes.body.group.models
+  const byModel = (name) => putModels.find(m => m.model === name) || {}
+  ok('㊿ 星期去重并升序，越界值整项丢弃而不是存半份',
+    JSON.stringify(byModel('g-wrong-weekday').weekdays ?? null) === '[1,3]'
+    && (byModel('g-today-ok').weekdays ?? null) === null,
+    JSON.stringify(putModels))
+  await api('DELETE', '/groups/' + encodeURIComponent(gateId))
+
+  // 启动迁移：老版本把「生效区间」写进 groups.json 时折算了 until，
+  // 那两项现在已经取消；装载时要安静丢弃，不能因为残留字段报错或留下半生效状态。
+  const migDir = mkdtempSync(join(tmpdir(), 'mfm-gate-mig-'))
+  writeFileSync(join(migDir, 'groups.json'), JSON.stringify([
+    { id: 'gm', name: 'GM', enabled: true, models: [
+      { provider: 'p', model: 'm1', priority: 1, activeFrom: '2026-01-01 08:00', activeUntil: '2027-05-06 23:59', weekdays: [1] },
+      { provider: 'p', model: 'm2', priority: 2, until: '2027-05-06' },
+    ] },
+  ]))
+  const migApi = mountFresh(migDir)
+  const migModels = (await migApi('GET', '/status')).body.groups.find(g => g.id === 'gm').models
+  ok('㊿ 老配置里残留的 activeFrom / activeUntil / until 装载时被丢弃，weekdays 保留',
+    migModels.every(m => !('activeFrom' in m) && !('activeUntil' in m) && !('until' in m))
+    && JSON.stringify(migModels.find(m => m.model === 'm1').weekdays) === '[1]',
+    JSON.stringify(migModels))
+  ok('㊿ 迁移写回 groups.json，残留的生效区间不再留在磁盘上',
+    !JSON.parse(readFileSync(join(migDir, 'groups.json'), 'utf8'))[0].models[0].activeFrom,
+    readFileSync(join(migDir, 'groups.json'), 'utf8'))
+
+  // ---- (四) 界面接线 ----
+  ok('㊿ 时间闸门弹框只留两件事（时段 / 星期），不再有生效区间',
+    clientText.includes("'时段在哪些星期生效'")
+    && clientText.includes('function dayToggle(d)')
+    && !clientText.includes("'生效区间'")
+    && !clientText.includes("type: 'datetime-local'"))
+  ok('㊿ 弹框把星期讲成「时段的作用域」：没勾的日期全天可用，不是不可用',
+    clientText.includes('勾上的日期按上面的时段限时')
+    && clientText.includes('没勾的日期不受时段限制、全天可用')
+    && clientText.includes('一个都不勾 = 时段每天都生效'))
+  ok('㊿ 摘要把限时的星期写出来（7 天全勾等价于不勾，不占一行废话）',
+    clientText.includes('function timeGateSummary(entry)')
+    && clientText.includes('days.length > 0 && days.length < 7')
+    && clientText.includes("+ '限时'")
+    && clientText.includes('var summary = timeGateSummary(entry)'))
+  ok('㊿ 弹框写回时清掉旧字段 from/to/until（否则新旧两套字段会同时存在）',
+    clientText.includes('until: undefined,'))
+  ok('㊿ 设置页有「失败时换账号」开关，读 /status.ofmAccountHandoff 并写回 settings',
+    clientText.includes('var accountHandoff = !!(status && status.ofmAccountHandoff)')
+    && clientText.includes("apiSend(API + '/settings', 'POST', { ofmAccountHandoff: !accountHandoff })")
+    && clientText.includes('失败时换账号（兼容）'))
+
+  await api('POST', '/failed/reset', {})
+}
+
+// ── ㊶ 会话收尾（病态重复 / 输出上限）换模型 ────────────────────────────
+//
+// 用户报的三类「会话没跑完就收尾」都要能路由到别的模型：思考陷入病态重复、
+// 输出撞上 token 上限、会话被中断。前两类在宿主眼里不是失败（max-tokens 根本不
+// 派发 agent/request-error），只能挂在 turn/end 上，所以这里既验请求入口的短路，
+// 也验 turn/end 入口的接线。
+{
+  // 每组用独立的分组与模型，避免与前面用例的当日失败表互相污染。
+  const degGroup = async (models) => (await api('POST', '/groups', {
+    name: 'zz-deg-' + Math.random().toString(36).slice(2, 8),
+    models,
+  })).body.group.id
+  const bindDeg = async (id, groupId) =>
+    await api('POST', '/session-group', { sessionId: id, groupId, mode: 'route' })
+  const addDegAgent = (id, model) => {
+    const a = makeAgent(id, {}, model)
+    agents.push(a)
+    a.status = 'idle'
+    return a
+  }
+  const degStatus = async () => (await api('GET', '/status')).body
+
+  // ---- (一) 病态重复：机器码 ----
+  const loopG = await degGroup([
+    { provider: 'p', model: 'lo-a', priority: 1 },
+    { provider: 'p', model: 'lo-b', priority: 2 },
+    { provider: 'p', model: 'lo-c', priority: 3 },
+  ])
+  const loopAgent = addDegAgent('deg-loop', 'lo-a')
+  await bindDeg('deg-loop', loopG)
+  let loopInnerRetried = false
+  await errHandler(
+    { agent: loopAgent, turn: 121, step: 1, provider: 'p', failure: { code: 'REASONING_LOOP', message: '模型思考陷入病态重复，已中止本轮（**不是**输出 token 上限）。判据：尾部 304 行里只有 22 行不重复' } },
+    () => { loopInnerRetried = true; return Promise.resolve({ kind: 'retry' }) },
+  )
+  ok('㊶ 病态重复跳过内层重试（不再把同一段思考再烧 5 遍）', loopInnerRetried === false)
+  ok('㊶ 病态重复当场换到组内下一个模型', switchOf('deg-loop') === 'lo-b', `→ ${switchOf('deg-loop')}`)
+  ok('㊶ 病态重复不写当日失败（模型没坏，只是这条路走不通）',
+    !(await degStatus()).failed.some(f => f.model === 'lo-a'))
+  ok('㊶ 病态重复记一段短冷却，到期自动回到候选',
+    (await degStatus()).temporaryFailures.some(t => t.model === 'lo-a' && t.until > Date.now()))
+  ok('㊶ 病态重复的处置结果记为 degenerate-switched',
+    (await degStatus()).failureLog.some(f => f.model === 'lo-a' && f.outcome === 'degenerate-switched'))
+
+  // ---- (二) 病态重复：只认文案（机器码被改写）----
+  const txtG = await degGroup([
+    { provider: 'p', model: 'tx-a', priority: 1 },
+    { provider: 'p', model: 'tx-b', priority: 2 },
+  ])
+  const txtAgent = addDegAgent('deg-text', 'tx-a')
+  await bindDeg('deg-text', txtG)
+  await errHandler(
+    { agent: txtAgent, turn: 122, step: 1, provider: 'p', failure: { code: 'TRANSPORT', message: '模型思考陷入重复，已中止本轮' } },
+    () => Promise.resolve({ kind: 'retry' }),
+  )
+  ok('㊶ 机器码丢失时凭文案也能认出病态重复并换模型',
+    switchOf('deg-text') === 'tx-b', `→ ${switchOf('deg-text')}`)
+
+  // ---- (三) 对照：普通失败仍写当日失败 ----
+  const norG = await degGroup([
+    { provider: 'p', model: 'no-a', priority: 1 },
+    { provider: 'p', model: 'no-b', priority: 2 },
+  ])
+  const norAgent = addDegAgent('deg-normal', 'no-a')
+  await bindDeg('deg-normal', norG)
+  await errHandler(
+    { agent: norAgent, turn: 123, step: 1, provider: 'p', failure: { code: 'SERVER', message: '上游返回 500，重试也没有变好' } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㊶ 普通失败仍然写当日失败（退化类是豁免，不是普遍放宽）',
+    (await degStatus()).failed.some(f => f.model === 'no-a'))
+
+  // ---- (四) 输出上限：turn/end 入口 ----
+  const evHandler = handlers.getAll('session/event').find(f => String(f).includes('handleTurnEndSwitch'))
+  ok('㊶ 插件在 session/event 上注册了 turn/end 处理', typeof evHandler === 'function',
+    `listeners=${handlers.getAll('session/event').length}`)
+  const capG = await degGroup([
+    { provider: 'p', model: 'cp-a', priority: 1 },
+    { provider: 'p', model: 'cp-b', priority: 2 },
+    { provider: 'p', model: 'cp-c', priority: 3 },
+  ])
+  const capAgent = addDegAgent('deg-cap', 'cp-a')
+  await bindDeg('deg-cap', capG)
+  evHandler(capAgent.session, { type: 'turn/end', data: { turn: 124, reason: { kind: 'max-tokens' } } })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  ok('㊶ 输出撞上限的一轮收尾时换到组内下一个模型', switchOf('deg-cap') === 'cp-b', `→ ${switchOf('deg-cap')}`)
+  ok('㊶ 输出上限的处置记进 failureLog（turn-end-max-tokens）',
+    (await degStatus()).failureLog.some(f => f.model === 'cp-a' && f.outcome === 'turn-end-max-tokens'))
+  ok('㊶ 输出上限同样不写当日失败，只记短冷却',
+    !(await degStatus()).failed.some(f => f.model === 'cp-a')
+    && (await degStatus()).temporaryFailures.some(t => t.model === 'cp-a'))
+
+  // ---- (五) 同一个 turn 已由请求失败路径处置过，turn/end 不重复路由 ----
+  // 先让该轮走请求失败路径（会记 errorTurns 并切到 cp-b），再用同一个 turn 触发 turn/end。
+  const dupAgent = addDegAgent('deg-dup', 'cp-a')
+  await bindDeg('deg-dup', capG)
+  await errHandler(
+    { agent: dupAgent, turn: 125, step: 1, provider: 'p', failure: { code: 'SERVER', message: '上游 500' } },
+    () => Promise.resolve(undefined),
+  )
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const selOf = (id) => appended.filter(a => a.id === id && a.type === 'model/selection').length
+  const selBefore = selOf('deg-dup')
+  ok('㊶ 请求失败路径已经把该轮换过模型（对照基准）', selBefore > 0, `selections=${selBefore}`)
+  evHandler(dupAgent.session, { type: 'turn/end', data: { turn: 125, reason: { kind: 'max-tokens' } } })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  ok('㊶ 已经被请求失败路径处置过的同一轮，turn/end 不再切第二次',
+    selOf('deg-dup') === selBefore, `before=${selBefore} after=${selOf('deg-dup')}`)
+
+  // ---- (六) 开关关掉后，turn/end 不换模型 ----
+  const offG = await degGroup([
+    { provider: 'p', model: 'of-a', priority: 1 },
+    { provider: 'p', model: 'of-b', priority: 2 },
+  ])
+  const offAgent = addDegAgent('deg-off', 'of-a')
+  await bindDeg('deg-off', offG)
+  await api('POST', '/settings', { ofmSwitchOnTurnEnd: false })
+  evHandler(offAgent.session, { type: 'turn/end', data: { turn: 126, reason: { kind: 'max-tokens' } } })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const beforeOff = switchOf('deg-off')
+  ok('㊶ 开关关掉后，输出上限收尾不再自动换模型',
+    switchOf('deg-off') === beforeOff, `before=${beforeOff} after=${switchOf('deg-off')}`)
+  await api('POST', '/settings', { ofmSwitchOnTurnEnd: null })
+
+  // ---- (七) /status 与设置接口 ----
+  const degStatusBody = (await api('GET', '/status')).body
+  ok('㊶ /status 暴露会话收尾换模型的开关与冷却时长',
+    degStatusBody.ofmSwitchOnTurnEnd === true && degStatusBody.ofmDegenerateCooldownMs === 600000,
+    JSON.stringify({ ofmSwitchOnTurnEnd: degStatusBody.ofmSwitchOnTurnEnd, ofmDegenerateCooldownMs: degStatusBody.ofmDegenerateCooldownMs }))
+  ok('㊶ 传 false 时 /status 立刻报 false（不必重启宿主）',
+    (await api('POST', '/settings', { ofmSwitchOnTurnEnd: false })).body.ok === true
+    && (await api('GET', '/status')).body.ofmSwitchOnTurnEnd === false)
+  ok('㊶ 传 null 回到「跟随 config」（这里 config 出厂为开）',
+    (await api('POST', '/settings', { ofmSwitchOnTurnEnd: null })).body.ok === true
+    && (await api('GET', '/status')).body.ofmSwitchOnTurnEnd === true)
+  ok('㊶ 非法值被挡下（400），不会把开关写成半开半关',
+    (await api('POST', '/settings', { ofmSwitchOnTurnEnd: 'yes' })).status === 400)
+  await api('POST', '/settings', { ofmSwitchOnTurnEnd: null })
+
+  // ---- (八) 界面接线 ----
+  ok('㊶ 设置页有「会话没跑完就换模型」开关，读 /status.ofmSwitchOnTurnEnd 并写回 settings',
+    clientText.includes('var switchOnTurnEnd = !!(status && status.ofmSwitchOnTurnEnd)')
+    && clientText.includes("apiSend(API + '/settings', 'POST', { ofmSwitchOnTurnEnd: !switchOnTurnEnd })")
+    && clientText.includes('会话没跑完就换模型'))
+
+  // ---- (九) 中断会话：不是用户按停止 → 换模型续跑 ----
+  // 宿主 cancel(cause) 把原因放在信号 reason 上：user/parent/disposed 是人的或生命周期的
+  // 决定，不该被自动换模型覆盖；hook（别家插件掐断）等其余原因算外部打断，要换模型。
+  const intG = await degGroup([
+    { provider: 'p', model: 'in-a', priority: 1 },
+    { provider: 'p', model: 'in-b', priority: 2 },
+  ])
+  const intAgent = addDegAgent('deg-int', 'in-a')
+  await bindDeg('deg-int', intG)
+  await errHandler(
+    { agent: intAgent, turn: 127, step: 1, provider: 'p', signal: { aborted: true, reason: { kind: 'hook', reason: 'compaction' } }, failure: { code: 'ABORTED', message: 'the run was aborted' } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㊶ 被别处掐断（cancel 原因是 hook）时换到组内下一个模型',
+    switchOf('deg-int') === 'in-b', `→ ${switchOf('deg-int')}`)
+  ok('㊶ 中断类不写当日失败（这一轮没跑完，不是模型坏）',
+    !(await degStatus()).failed.some(f => f.model === 'in-a'))
+  ok('㊶ 中断类记一段短冷却，到期自动回到候选',
+    (await degStatus()).temporaryFailures.some(t => t.model === 'in-a' && t.until > Date.now()))
+  ok('㊶ 中断类的处置结果记为 interrupted-switched',
+    (await degStatus()).failureLog.some(f => f.model === 'in-a' && f.outcome === 'interrupted-switched'))
+
+  // ---- (十) 中断会话：用户按停止 → 留在原模型 ----
+  const stopG = await degGroup([
+    { provider: 'p', model: 'st-a', priority: 1 },
+    { provider: 'p', model: 'st-b', priority: 2 },
+  ])
+  const stopAgent = addDegAgent('deg-stop', 'st-a')
+  await bindDeg('deg-stop', stopG)
+  await errHandler(
+    { agent: stopAgent, turn: 128, step: 1, provider: 'p', signal: { aborted: true, reason: { kind: 'user' } }, failure: { code: 'ABORTED', message: 'the run was aborted' } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㊶ 用户按停止时不换模型（人的决定不该被覆盖）',
+    switchOf('deg-stop') === 'st-a', `→ ${switchOf('deg-stop')}`)
+  ok('㊶ 用户按停止记为 user-stop',
+    (await degStatus()).failureLog.some(f => f.model === 'st-a' && f.outcome === 'user-stop'))
+
+  // ---- (十一) 走 turn/end 的 aborted：同样按取消原因区分 ----
+  const abG = await degGroup([
+    { provider: 'p', model: 'ab-a', priority: 1 },
+    { provider: 'p', model: 'ab-b', priority: 2 },
+  ])
+  const abAgent = addDegAgent('deg-abort', 'ab-a')
+  await bindDeg('deg-abort', abG)
+  evHandler(abAgent.session, { type: 'turn/end', data: { turn: 129, reason: { kind: 'aborted', reason: { kind: 'hook', reason: 'plugin cancel' } } } })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  ok('㊶ turn/end 的 aborted（非用户原因）也换模型',
+    switchOf('deg-abort') === 'ab-b', `→ ${switchOf('deg-abort')}`)
+  ok('㊶ turn/end 的中断记为 turn-end-interrupted',
+    (await degStatus()).failureLog.some(f => f.model === 'ab-a' && f.outcome === 'turn-end-interrupted'))
+  const abStopG = await degGroup([
+    { provider: 'p', model: 'as-a', priority: 1 },
+    { provider: 'p', model: 'as-b', priority: 2 },
+  ])
+  const abStopAgent = addDegAgent('deg-abort-stop', 'as-a')
+  await bindDeg('deg-abort-stop', abStopG)
+  evHandler(abStopAgent.session, { type: 'turn/end', data: { turn: 130, reason: { kind: 'aborted', reason: { kind: 'user' } } } })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  ok('㊶ turn/end 的 aborted（用户按停止）不换模型',
+    switchOf('deg-abort-stop') === 'as-a', `→ ${switchOf('deg-abort-stop')}`)
+
+  // ---- (十二) 读不出取消原因时保守放过 ----
+  const ukG = await degGroup([
+    { provider: 'p', model: 'uk-a', priority: 1 },
+    { provider: 'p', model: 'uk-b', priority: 2 },
+  ])
+  const ukAgent = addDegAgent('deg-unknown', 'uk-a')
+  await bindDeg('deg-unknown', ukG)
+  await errHandler(
+    { agent: ukAgent, turn: 131, step: 1, provider: 'p', signal: { aborted: true }, failure: { code: 'ABORTED', message: 'the run was aborted' } },
+    () => Promise.resolve(undefined),
+  )
+  ok('㊶ 中断但读不出原因时按「用户停止」保守处理，不与停止对着干',
+    switchOf('deg-unknown') === 'uk-a', `→ ${switchOf('deg-unknown')}`)
 }
 
 const failed = checks.filter(c => !c.pass).length

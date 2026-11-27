@@ -11,7 +11,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 | 页签 | 做什么 |
 | --- | --- |
 | **模型** | 左栏供应商、右栏模型，点 ＋ 加进分组（已在组内的那条再点一次即剔除）；顶部选路由分组、绑定模式与「新会话默认」 |
-| **路由分组** | 每组一份有序模型清单（数字越小越先试），可配生效时段与截止日，就地用 ↑ ↓ 调优先级、✕ 移出分组，逐个开关失败/禁用 |
+| **路由分组** | 每组一份有序模型清单（数字越小越先试），可配每日时段及其生效的星期，就地用 ↑ ↓ 调优先级、✕ 移出分组，逐个开关失败/禁用 |
 | **数据看板** | 每个模型的首字延迟、输出速度、token 用量、并发现场、成功率；可一键测速、按当前排序重设优先级 |
 | **失败模型** | 当日彻底失败的模型与最近一次失败原因，逐个或一键全部恢复 |
 | **错误重试** | 内嵌 `dsh-llm-error-retry` 自己的配置页，保存即生效 |
@@ -38,21 +38,22 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
   - 「弹窗模式」为左右分区弹窗（左：供应商，右：模型），右侧含「模型」「路由分组」「数据看板」「失败模型」「错误重试」「免费渠道」「局域网」七个页签；「错误重试」整块留给重试插件自己渲染的配置页，「免费渠道」整块放推荐卡片（两者都让出左栏）。**新装默认开启**。
   - 关掉后是紧凑下拉，一屏只列十几个模型，没有分栏与页签。
   - 触发按钮显示 **供应商 · 模型名 · 思考强度**；已绑定分组时另有一个分组徽标。
-- **路由分组**：可建多个分组，每组是一份有序模型列表（`priority` 决定尝试顺序）。组内每个模型块上都可就地调顺序：**↑ ↓** 把它在清单里上移/下移一位（只交换这两个条目的 `priority`，其它模型的数字保持原样），**✕** 把它移出本分组（删掉这一条，别的分组、时段、截止日都不受影响；要加回来去「模型」页签）。
-  - 每个模型可配**生效时段**：多段，两端包含（`from` 与 `to` 都算在时段内），`from > to` 表示跨午夜（如 22 → 6）。
-  - 每个模型可配**截止日**，过期后不再参与路由。
-  - 时段未配置、为 `null` 或空字符串，一律视为「全天」。
+- **路由分组**：可建多个分组，每组是一份有序模型列表（`priority` 决定尝试顺序）。组内每个模型块上都可就地调顺序：**↑ ↓** 把它在清单里上移/下移一位（只交换这两个条目的 `priority`，其它模型的数字保持原样），**✕** 把它移出本分组（删掉这一条，别的分组、时段与星期都不受影响；要加回来去「模型」页签）。
+  - 每个模型可配**每日时段**：多段，两端包含（`from` 与 `to` 都算在时段内），`from > to` 表示跨午夜（如 22 → 6）。未配置、为 `null` 或空字符串，一律视为「全天」。
+  - 每个模型可配**时段在哪些星期生效**：勾上的日期按上面的每日时段限时，没勾的日期不受时段限制、全天可用；一个都不勾 = 时段每天都生效。所以「没勾」表示没有配置，绝不表示不可用。
+  - 星期是时段的作用域，不是独立的第二道闸门：只有当天被勾上时才判时段，其余日期直接放行。两项都不配 = 全天候参与。⏱ 按钮打开的就是这两项的设置弹框，行摘要会把已配置的内容写成一句话（例如「9–18 · 周一、周三限时」）。
 - **两种绑定模式**
   - `route`：用绑定分组里的模型（会实际改变会话当前模型）。
   - `failover`：保持会话当前模型，只有它彻底失败后才兜底切到组内下一个。
 - **失败后自动续跑**：监听 `agent/request-error`，以 prepend 注册并先 `await next()`，因此**一定是在所有重试策略都表态放弃之后**才接手。接手后标记失败、切换到组内下一个可用模型，并自动续跑，不用你重发。
   - 两条入口都接：`agent/request-error`（流开起来后以 error/aborted 结束）与 `agent/error`（请求还没发出就抛，例如 `UNKNOWN_MODEL`、适配器同步报错）。任一条处置过的轮次，另一条按 `turn` 认出并跳过，不会一次失败连跳两个模型——所以本插件不依赖「自己恰好是最外层」这个前提，内层重试插件即使短路了整条瀑布链，失败仍会从 `agent/error` 那条入口被路由出去。
   - 续跑不是「同一轮内重试」：新版 dsh 在**步骤准备（pre-step）**时就把本步用于请求的 `provider/model/effort` 固定下来，`agent/request` 已废弃，在那里改模型会让宿主直接报错并让整轮崩掉。所以失败后切换走 `agent.model.select()`（写一条 durable `model/selection`，从下一个步骤生效），并在该会话回到 `idle` 后补一条续跑消息开下一轮。
-- **每轮健康检查**：每次发消息（驱动器刚启动、尚未进入 `pre-step` 的窗口）都判定一次「这个会话此刻要用的模型现在还能不能用」——仍可用就保留（不覆盖你手选的模型），只有它此刻在分组内不可用（被标记当日失败、超出北京时间时段、过了截止日）才切到组内下一个可用模型；当前模型压根不在分组里时不插手。判据都是「此刻」的，时段与截止日随时间变化、失败标记会被重置或过期。
-- **子代理继承路由（默认行为）**：「子代理跑什么模型」由宿主在创建时决定——它把父会话请求头里的 `provider/model/effort` 复制成子代理的 AgentOptions。本插件**不写任何选择去覆盖它**，所以子代理天然继承父会话当前实际在用的模型（父会话切到组内第 2 个，子代理也跑第 2 个，不会被拽回第 1 个）。分组绑定同样沿 `session.header.parentSession` 向上继承；只有继承来的模型此刻不可路由（已失败/不在时段/过截止日）时才按组内优先级换一个。
+- **每轮健康检查**：每次发消息（驱动器刚启动、尚未进入 `pre-step` 的窗口）都判定一次「这个会话此刻要用的模型现在还能不能用」——仍可用就保留（不覆盖你手选的模型），只有它此刻在分组内不可用（被标记当日失败、此刻不在其生效的星期与时段内）才切到组内下一个可用模型；当前模型压根不在分组里时不插手。判据都是「此刻」的，时间闸门随时间变化、失败标记会被重置或过期。
+- **子代理继承路由（默认行为）**：「子代理跑什么模型」由宿主在创建时决定——它把父会话请求头里的 `provider/model/effort` 复制成子代理的 AgentOptions。本插件**不写任何选择去覆盖它**，所以子代理天然继承父会话当前实际在用的模型（父会话切到组内第 2 个，子代理也跑第 2 个，不会被拽回第 1 个）。分组绑定同样沿 `session.header.parentSession` 向上继承；只有继承来的模型此刻不可路由（已失败、被禁用、此刻超出它生效的时段）时才按组内优先级换一个。
 - **子代理可单独选模型/分组**：子代理会话的资源位里同样能换模型、绑分组，选中即只作用于该子代理（走 `agent.model.select()`，不经宿主对子代理一律拒绝的 `sessionController.selectModel`）；它的分组选择不参与「新会话默认分组」。
 - **默认分组**：新会话（startup/clear）自动沿用上次的选择（分组 + 模式）；`resume` / `compact` 不动，尊重旧会话既有选择。
 - **在分组里直接停用模型**：路由分组页签里每个模型块都带两个开关——「失败」把它标记为当日失败（与自动失败共用同一份记录：日界线到期、会话成功一轮、或点「恢复」都会解除，`code=MANUAL`），「禁用」则把它**持久**挡在所有分组之外（写进分组条目的 `disabled` 字段，不随日期恢复，只由你手动「启用」解除）。两者互不覆盖：`routable()` 先判禁用再判失败。
+- **会话没跑完就收尾也换模型**（`ofmSwitchOnTurnEnd`，默认开）：病态重复（模型陷进复读，机器码 `REASONING_LOOP`，也会认「病态重复 / 思考陷入重复」这类文案）、输出打到 token 上限（`turn/end` 的 `max-tokens` 收尾）、以及**非用户主动**的中断（`ABORTED`），都算「这一轮没跑完」，按与失败相同的路径切到组内下一个模型并续跑。中断按取消原因区分：`user`（你按的停止）、`parent`（父会话收子代理）、`disposed`（插件卸载）留在原模型收尾，其余原因——别家插件在自己的 hook 里掐断、账号被登出后宿主自己 cancel——才换模型；原因读不出来时按「是用户停止」处理。三类都只给该模型打 `ofmDegenerateCooldownMs`（默认 10 分钟）的临时冷却——不记当日失败、不算积分耗尽，避免一次复读就把模型挡掉一整天。
 - **失败模型记录**：按「使用日」记录失败模型（北京时间，日界线默认早上 8:00，见 `failResetHour`），同时保存失败原因（错误码 + 最近一次错误信息）。在弹窗的「失败模型」页签里可展开查看原因，也可逐个或一键全部恢复。到日界线自动过期；会话成功完成一轮也会立即恢复对应模型。所有时间口径固定按北京时间计算，与宿主机时区无关。
 - **压缩旁路守卫（`compactionGuard`）**：`billion-context` 生效时，`qoder` / `qodercn` 这类走 WASM 加密端点的 provider 拿不到任何上下文压缩；插件把这类 provider 降为分组里的兜底候选，并在 `/status` 里标出被降级的模型与此刻正跑在无压缩链路上的会话。见「与 billion-context 的配合」一节。
 - **交还控制权**：你手选模型、解绑分组或删除分组后，插件即不再接管该会话的模型。
@@ -60,10 +61,16 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 ## 与 Our Free Model 的配合
 
-若失败的模型属于 `dsh-our-free-model` 提供的渠道，插件会**先尝试换账号**，而不是直接换模型：
+**换账号默认关闭**（`ofmAccountHandoff`，可在 设置 → 模型故障转移 里打开）。默认关掉的缘由是它属于跨插件的兼容路径：渠道插件自己在运行时就会换号（例如 WorkBuddy 报「积分已耗尽，已改用池中另一个账号回答」时，本插件从头到尾没参与），两条路径同时动手只会互相抵消——本插件写下的池级冷却会把渠道插件本来还能用的账号一起挡掉。关掉后失败一律交给分组路由换模型，处置单一、可预测。
 
-- 不论错误类型，只要该模型还有别的可用账号，就换账号重试一轮；账号试完仍失败才交给分组路由换模型。
+打开（或 config 的 `ofmAccountHandoff: true`）后，若失败的模型属于 `dsh-our-free-model` 提供的渠道，插件会**先尝试换账号**，而不是直接换模型：
+
+- 只要该模型还有别的可用账号，就换账号重试一轮；账号试完仍失败才交给分组路由换模型。限流/节流类失败除外（见下一节）。
 - 换号通过给账号写一个**池级冷却标记**实现，让该渠道适配器下次选号时跳过刚失败的账号。
+- **积分感知**（`ofmCreditSkip`，默认开）：上游报出「积分不足 / 余额不足 / 额度已用尽」（机器码 `QUOTA_EXCEEDED`、HTTP 402，或文案命中）时，插件先读一次该渠道的账号积分，把**积分为 0 的账号跳过到当日日界线**（与「当日失败」同一口径，见 `failResetHour`），只给积分正常的账号写短冷却。读不到积分（渠道不提供余额查询、超时、凭据读不出）一律按「积分未知」处理，退回纯失败换号——**查询失败绝不当成 0 积分**，否则会把凭据临时失效的账号整天挡在路由之外。
+- **账号积分从哪来**：`accountPool` 服务本身不暴露积分（只有账号元数据与限流标记），所以走 `dsh-our-free-model` 自己的 `POST /api/channel-pack` RPC（`credits.balances`），用自签的浏览器会话 cookie 认证——与 Jet Hub 诊断链路同一套机制。该接口**逐账号顺序打上游**（30 个账号 ≈ 30 次请求），因此只在报出额度类失败时才查一次，结果按渠道缓存 `ofmCreditCacheMs`（默认 60s），并带 `ofmCreditProbeTimeoutMs`（默认 8s）超时。
+- 该渠道**全部**可用账号积分都是 0 时不做无意义换号：不写任何跳过标记（否则渠道直接选不出号，看起来像账号池坏了），直接交给分组路由换模型。
+- 只把**可用账号**里 0 积分的那些跳过：渠道包的余额接口按渠道返回**全部**账号（含已停用、已对当前模型冷却的），它们本来就不参与选号，若把停用账号的 0 积分也算进「可用账号全都没钱」，就会平白放弃一次本可成功的换号。
 - 插件**不读取也不修改**该渠道的凭据；只通过它注册的 `accountPool` 服务调用 `getAvailableAccount` / `updateModelRateLimit` / `listAccountsByProvider`。
 - 未安装该插件时，这段逻辑静默跳过。
 - 「属于哪个插件」由 `ofmHandoffExcludeProviders` 决定，而不是由池里有没有账号决定：池是按 provider 字符串存的持久表，渠道退役后账号条目仍在，只看账号会把别的插件提供的模型也卷进换号流程（例如 `codearts` 的 429 被当成换号，冷却一个本次没用到的账号，还挡掉了本该发生的分组路由）。默认排除 `codearts`。
@@ -94,11 +101,13 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
 
 每个渠道一行门面条目（在自己的 realm 里 provide llm）+ 该渠道 Loader 条目的一行 `isolate`（把它关进同一个 realm）。前五个渠道各 2 行，`codearts-auth`（Providers Hub）那条要多隔离 11 个服务名（见本节末），合计 22 行。home 层最后应用，能覆盖 profile 与插件自带的 patch：
 
+门面文件随本插件分发，位置是包内的 `compat/model-failover-provider-prefix/llm-prefix-facade.mjs`。
+
 ```yaml
 # 每个渠道：一行门面（自己的 realm）+ 一行 isolate（把自己的条目关进同一个 realm）
 - insert:
     - id: mfm-prefix-ofm
-      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      name: ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs
       isolate:
         llm: mfm-ofm
       config:
@@ -108,7 +117,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
     llm: mfm-ofm
 - insert:
     - id: mfm-prefix-ca
-      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      name: ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs
       isolate:
         llm: mfm-ca
       config:
@@ -118,7 +127,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
     llm: mfm-ca
 - insert:
     - id: mfm-prefix-cw
-      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      name: ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs
       isolate:
         llm: mfm-cw
       config:
@@ -128,7 +137,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
     llm: mfm-cw
 - insert:
     - id: mfm-prefix-ct
-      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      name: ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs
       isolate:
         llm: mfm-ct
       config:
@@ -138,7 +147,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
     llm: mfm-ct
 - insert:
     - id: mfm-prefix-cq
-      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      name: ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs
       isolate:
         llm: mfm-cq
       config:
@@ -148,7 +157,7 @@ DSH 插件：把 composer 的模型选择位换成带「路由分组」的选择
     llm: mfm-cq
 - insert:
     - id: mfm-prefix-caa
-      name: ./plugins/model-failover-provider-prefix/llm-prefix-facade.mjs
+      name: ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs
       isolate:
         llm: mfm-caa
       config:
@@ -416,7 +425,7 @@ lastExchange.diff[1] = {kind:"shrunk", role:"user", beforeLen:6003, afterLen:410
 - `enabled` / `biliActive`：守卫开没开、bili 此刻是不是唯一压缩器。任一为 `false`，下面两份名单都说明不了「此刻真的拿不到压缩」。
 - `uncompressedProviders`：生效中的名单。
 - `shimCovered`：名单里已被压缩 shim 改道的 provider。它们不再计入 `downgradedModels` / `degradedSessions`——请求已经以明文进 bili，压缩照常。
-- `downgradedModels`：所有启用分组里会被降为兜底的条目，最多 50 条。不剔除当日失败、超出时段、过了截止日的条目——它们本来也不参与路由。
+- `downgradedModels`：所有启用分组里会被降为兜底的条目，最多 50 条。不剔除当日失败、此刻超出时段或不在时段的生效星期内的条目——它们本来也不参与路由。
 - `degradedSessions`：本插件已接管、且生效模型落在名单里的会话，也就是此刻正跑在无压缩链路上的那些。
 - `lastDiagnosis`：最近一次压缩旁路失败的结论（`at` 是毫秒时间戳）；一次都没发生过时为 `null`。
 
@@ -489,7 +498,18 @@ TRAE 的推理请求走自己的 SOLO wire：`POST /api/agent/v3/llm_utils_chat`
 dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 ```
 
-这一条会连 `dsh-llm-error-retry` 一起装上：它在 `dependencies` 里，固定到 [5543c34](https://github.com/liaoyuqing/dsh-llm-error-retry/commit/5543c344e926edb1b3a7c9872af92934be897deb)（0.20.0）。它不在 npm 上，拉的是 GitHub 源，所以这一步要能连上 github.com；拉不下来时整次安装会失败并报错，不会留下半个插件。
+这一条会连 `dsh-llm-error-retry` 和 `compat/` 下的六个兼容插件一起装上：`dsh-llm-error-retry` 在 `dependencies` 里，固定到 [5543c34](https://github.com/liaoyuqing/dsh-llm-error-retry/commit/5543c344e926edb1b3a7c9872af92934be897deb)（0.20.0），它不在 npm 上，拉的是 GitHub 源，所以这一步要能连上 github.com；兼容插件用 `file:./compat/<包名>` 声明，随包一起落地，不需要网络。拉不下来时整次安装会失败并报错，不会留下半个插件。
+
+六个兼容插件是包内的子包，各自保留自己的 `package.json` 和包名（不能并进本包：浏览器半边按包名归并，同名会直接让宿主启动失败），由本包的 `cordis.patch.yml` 插入同名 Loader 条目：
+
+| 子包 | Loader 条目 | 作用 |
+| --- | --- | --- |
+| `compat/dsh-connection-compat` | `connection-compat` | 补回 dsh 0.2.2-rc.2 删掉的 `ctx.connection.requestRejection()` |
+| `compat/dsh-connection-admit-compat` | `connection-admit-compat` | 把 `admit()` 绑到真实实例，避开 `cannot get property "connection.authentication" without inject` |
+| `compat/dsh-sidebar-scroller-compat` | `sidebar-scroller-compat` | 把 `useSectionScroller` 转发进子槽，修左侧栏接管后的会话列表空白 |
+| `compat/dsh-subagent-prune` | `subagent-prune` | 子智能体分栏的隐藏/清空/删除 |
+| `compat/dsh-ofm-revive-compat` | `ofm-revive-compat` | 把卡在 FAILED 的 Loader 条目用 `fiber.update()` 拉起来 |
+| `compat/model-failover-provider-prefix` | 不插入 | provider 前缀门面，由 `$DSH_HOME` 层的四对门面/isolate 行引用 |
 
 也可以手工放置：把本仓库放进 `$DSH_HOME/plugins/model-failover-manager/`、把依赖放进 `$DSH_HOME/plugins/dsh-llm-error-retry/`，然后在 `$DSH_HOME/cordis.patch.yml` 里注册两行：
 
@@ -501,6 +521,8 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
       name: ./plugins/dsh-llm-error-retry/host.mjs
 ```
 
+手工放置时 `compat/` 下的子包不会自动登记，本包的 `cordis.patch.yml` 若生效（作为 profile bundle）会按相对路径 `./compat/<包名>/host.mjs` 直接加载它们，不依赖 `node_modules`。
+
 ### DSH 版本要求
 
 `package.json` 用 `engines.dsh` 声明兼容范围（当前 `>=0.2.1-0 <0.3.0`，含 rc/alpha 等预发布）。DSH 的插件管理与装载按它校验：运行时版本不落在范围内会拦下安装/激活并给出诊断；确需强装用 `dsh plugin allow-version` 对该 `name@version` + 精确运行时版本放行。宿主接口（`slots`、`modelDirectories`、`agent/request-error` 等）变动时同步更新此范围。
@@ -508,7 +530,7 @@ dsh plugin add https://github.com/liaoyuqing/model-failover-manager
 
 ## 使用
 
-1. 打开 **设置 → 模型故障转移**：切换弹窗模式（新装默认开启），增删改路由分组（模型优先级、生效时段、截止日），或恢复失败的模型。
+1. 打开 **设置 → 模型故障转移**：切换弹窗模式（新装默认开启），增删改路由分组（模型优先级、每日时段、时段生效的星期），或恢复失败的模型。
    重试规则不在这里改——模型弹窗的「错误重试」页签内嵌了 `dsh-llm-error-retry` 自己的配置页。CodeArts 凭据镜像的开关、同步间隔与「立即同步」也在这页（见「CodeArts 凭据镜像」）。
 2. 在会话里点模型位：选模型，并（可选）把某个分组**绑定到当前会话**，选择 `route` 或 `failover` 模式。
 3. 之后该会话按绑定策略工作；绑定会落盘，重启后继续生效。
@@ -639,8 +661,8 @@ curl http://192.168.0.100:47021/v1/responses \
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、`ofmHandoffExcludeProviders`、压缩旁路现场（`compressionGuard`）、凭据镜像现场（`resignBridge`：开关、间隔、`lastSyncAt`、`mirroredRefs`、`skipReason`、`gate` 闸门现场），以及 codearts 自救现场（`codeartsSelfHeal`：loader 条目、账号槽位、`blockedBySignature`、`gate`、`gateHealCooldownMs`），以及局域网转发现场（`lanGateway`：`enabled`/`running`/`port`/`bindHost`/`baseUrl`/`addresses`/`startError`、生效的 `systemAsUserProviders` 名单、各路由累计与最近 20 条请求 `stats.recent`）。每个分组的 `lanAlias` 与 `lanEnabled` 也在 `groups` 里 |
-| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`、凭据镜像 `resignBridgeEnabled` 与 `resignBridgeIntervalSeconds`）。`dialogMode` 出厂为 `true`（新装即弹窗），只有显式传 `false` 才落成下拉；`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
+| GET | `/status` | 分组、当日失败模型、会话绑定、默认分组、最近失败的判定日志、设置、`failResetHour`、账号换号现场（`ofmAccountHandoff` / `ofmHandoffExcludeProviders` / `ofmCreditSkip` / `ofmCreditProbeTimeoutMs` / `ofmCreditCacheMs` / `creditBalances`：每个渠道上次读到的账号积分，`accounts` 为 `null` 表示没读到）、压缩旁路现场（`compressionGuard`）、凭据镜像现场（`resignBridge`：开关、间隔、`lastSyncAt`、`mirroredRefs`、`skipReason`、`gate` 闸门现场），以及 codearts 自救现场（`codeartsSelfHeal`：loader 条目、账号槽位、`blockedBySignature`、`gate`、`gateHealCooldownMs`），以及局域网转发现场（`lanGateway`：`enabled`/`running`/`port`/`bindHost`/`baseUrl`/`addresses`/`startError`、生效的 `systemAsUserProviders` 名单、各路由累计与最近 20 条请求 `stats.recent`）。每个分组的 `lanAlias` 与 `lanEnabled` 也在 `groups` 里；分组条目的时段带 `weekdays`（时段在哪些星期生效，缺省为 `null`；非空时只有列出的那几天受时段限制，其余日期全天可用） |
+| POST | `/settings` | 保存界面设置（`dialogMode`、看板排序 `metricsSort`、默认并发 `defaultConcurrency`、账号换号 `ofmAccountHandoff`、凭据镜像 `resignBridgeEnabled` 与 `resignBridgeIntervalSeconds`）。`ofmAccountHandoff` 取布尔值（改完立刻生效），`null` 表示清除覆盖、回落到 config；其它类型返回 400。`dialogMode` 出厂为 `true`（新装即弹窗），只有显式传 `false` 才落成下拉；`defaultConcurrency` 取 0..999 的整数（`0` = 不限），`null` 或空串表示清除覆盖、回落到 config 里的出厂值；越界或非整数返回 400 |
 | GET / POST / PUT | `/groups` | 读取 / 新建 / 更新分组。`PUT` 的 `models` 是**整体替换**：看板的「移除」用它把某个模型从所属分组的清单里摘掉，其余模型与优先级保持不变 |
 | DELETE | `/groups/:id` | 删除分组并解绑其会话 |
 | GET / POST | `/session-group` | 读取 / 设置会话绑定（`groupId` + `mode`） |
@@ -687,6 +709,8 @@ curl http://192.168.0.100:47021/v1/responses \
 
 同一类失败**不换账号重试**，直接换模型续跑：bili 的 hold 按「账号+主机」记（`holdKey`），同渠道换号拿到的还是同一条 hold，只会白等一轮并把另一个账号也记上一次失败；限流是「此刻打得太猛」，换号的处置方向本身就错。
 
+**唯一的例外是「积分不足 / 余额不足」**：上游常把额度用尽包成 429 或 `QUOTA_EXCEEDED`，这两样恰好也是限流的最强判据，但两者的处置相反——限流换模型，额度用尽换账号。判据只要命中「积分不足 / 余额不足 / 额度已用尽 / `insufficient points|balance|credits` / `quota exhausted` / HTTP 402」就按额度用尽处理，压过限流判定；反过来，报文本身写着 `rate limit` / `too many requests` / 「限流中」时仍算限流，不会因为「额度」二字被抢走处置。
+
 临时失败与当日失败在看板上分开显示（分组页签的模型块标「限流 Ns」、失败模型页签单列一块），因为「等几分钟」和「等明天」的处置完全不同。本轮成功会立刻清掉临时失败；`POST /failed/reset` 也会一起清（用户点了恢复，就不能还卡着）。`GET /status` 的 `temporaryFailures` 与各模型条目的 `temporaryFailure` / `temporaryUntil` 是它的读出口。
 
 ## 数据文件
@@ -695,11 +719,11 @@ curl http://192.168.0.100:47021/v1/responses \
 
 | 文件 | 内容 |
 | --- | --- |
-| `groups.json` | 路由分组（模型、优先级、时段、截止日） |
+| `groups.json` | 路由分组（模型、优先级、每日时段、时段生效的星期） |
 | `session-bindings.json` | 会话 → 分组 + 模式的绑定 |
 | `default-binding.json` | 新会话沿用的默认绑定 |
 | `failed.json` | 按使用日（默认北京时间 8:00 为界）记录的失败模型（含错误码与原因） |
-| `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值、凭据镜像开关与间隔覆盖值（`resignBridgeEnabled` / `resignBridgeIntervalSeconds`）、局域网转发开关与端口覆盖值（`lanEnabled` / `lanPort`；`null` = 跟随 config）。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
+| `settings.json` | 界面设置：模型选择是否用弹窗（`dialogMode`）、看板排序、默认并发覆盖值、账号换号开关（`ofmAccountHandoff`）、凭据镜像开关与间隔覆盖值（`resignBridgeEnabled` / `resignBridgeIntervalSeconds`）、局域网转发开关与端口覆盖值（`lanEnabled` / `lanPort`；`null` = 跟随 config）。只记用户改过的值；没写过 `dialogMode` 时按出厂值（弹窗）运行 |
 | `model-concurrency.json` | 按模型记录的并发上限（`渠道裸 id/模型` → 上限），对所有分组生效；旧版用注册表 id 当键（`ofm-qoder/...`），启动时并到裸名键上 |
 
 重试规则不在这里：它属于 `dsh-llm-error-retry`，存在 `$DSH_HOME/llm-error-retry/`（`rules.json` 保存界面改过的规则，`status.json` 是等待与最近事件）。两个插件的目录互不读写。
@@ -714,7 +738,13 @@ curl http://192.168.0.100:47021/v1/responses \
 | --- | --- | --- |
 | `dataDir` | `$DSH_HOME/model-failover-manager` | 上述数据文件的目录 |
 | `failResetHour` | `8` | 「当日失败」的日界线小时（北京时间整点，0..23）；到点自动清除失败标记。改值后配置变化会让 Loader 重新应用，无需重启 |
+| `ofmAccountHandoff` | `false` | 账号换号总开关（**出厂值**；界面上的实际状态存 `settings.json` 的 `ofmAccountHandoff`，`null` = 跟随这里）。关着时失败一律走分组路由换模型，完全不碰渠道的账号池；打开即恢复「先换账号再换模型」，并连带启用下面的积分感知。见「与 Our Free Model 的配合」 |
 | `ofmHandoffExcludeProviders` | `["codearts"]` | 不走 Our Free Model 换号的 provider；这些 provider 失败后直接进分组路由。写成 `[]` 表示不排除任何 provider |
+| `ofmSwitchOnTurnEnd` | `true` | 会话**没跑完就被收尾**时是否也换模型（出厂值；界面上的实际状态存 `settings.json`，`null` = 跟随这里）。覆盖三类：病态重复（`REASONING_LOOP`）、输出打到 token 上限（`turn/end` 的 `max-tokens`）、非用户主动的中断（取消原因是 `hook` 等，而 `user` / `parent` / `disposed` 不算）。关掉后这些收尾一律留在原模型 |
+| `ofmDegenerateCooldownMs` | `600000` | 病态重复 / 输出上限 / 外部中断这三类收尾给该模型打的**临时冷却**（毫秒，0..86400000；`0` = 不打冷却）。它们不记当日失败、不烧积分额度——只是让它在一段时间内不抢优先位 |
+| `ofmCreditSkip` | `true` | 换号时读渠道账号积分：上游报「积分不足 / 余额不足 / 额度已用尽」时，把积分为 0 的账号跳过到当日日界线。`false` 则退回纯失败换号（每次只冷却刚失败的账号）。见「与 Our Free Model 的配合」 |
+| `ofmCreditProbeTimeoutMs` | `8000` | 读一次渠道积分的超时（毫秒，1000..60000）。超时按「积分未知」处理，照旧换号 |
+| `ofmCreditCacheMs` | `60000` | 积分查询结果的复用时长（毫秒，0 = 不缓存，上限 600000）。查询失败的结果也按同一时长缓存，避免给不支持余额查询的渠道反复打 RPC |
 | `compactionGuard` | `true` | 压缩旁路守卫总开关：bili 生效时把 `uncompressedProviders` 里、且未被 shim 接管的 provider 降为分组兜底候选，并在失败时写压缩旁路诊断 |
 | `uncompressedProviders` | `["qoder", "qodercn"]` | 端点注定绕过 bili 压缩的 provider 名单（见「与 billion-context 的配合」）。写成 `[]` 等同于关掉守卫 |
 | `defaultConcurrency` | `0` | **出厂值**：模型没在 `model-concurrency.json` 里配置上限时沿用的并发上限（`0` = 不限）。界面上的实际生效值存在 `settings.json`，可在数据看板标题栏改；清空覆盖即回到这里的出厂值。见「并发与临时切换」 |
@@ -728,7 +758,7 @@ curl http://192.168.0.100:47021/v1/responses \
 | `codeartsResignBridgeIntervalSeconds` | `10` | 镜像同步间隔（秒，下限 10、上限 3600）。界面里改过的值存 `settings.json`，优先于这里 |
 | `codeartsResignBridgeFallbackRefs` | `["CODEARTS_ACCOUNT_FFEFCE9A", "CODEARTS_ACCOUNT_8B3F0C8E"]` | `jet-hub/state.json` 里的候选 ref 不够分给每个账号时，按顺序用这些 ref 补齐 |
 
-所有时间口径固定按**北京时间**计算，与宿主机时区、`TZ`、`LANG` 无关。路由时段（`windows` 的 `from`/`to`）的小时也按北京时间解释；截止日 `until` 按自然日比较。
+所有时间口径固定按**北京时间**计算，与宿主机时区、`TZ`、`LANG` 无关。路由时段（`windows` 的 `from`/`to`）的小时与判定用到的星期（`weekdays`，0=周日…6=周六）都按北京时间解释。
 
 不配置即可正常工作。
 
@@ -750,7 +780,8 @@ curl http://192.168.0.100:47021/v1/responses \
 | `trae-compress-shim.mjs` | trae 压缩 shim：接管 TRAE adapter 的 `fetchImpl`，把 SOLO body 折成 OpenAI 送进 bili 压缩、再以原始 SOLO body 为底还原后直发上游，回程把 OpenAI SSE 重建为 SOLO 事件；失败一律退回原始行为 |
 | `trae-compress-shim.selfcheck.mjs` | trae 压缩 shim 的离线自检（不随包发布）：折/还原/回程重建的往返用例，以及端口被占时只 reject、不崩进程 |
 | `client.js` | 浏览器半（DSH dynamic client bundle），七个页签、免费渠道卡片与 GitHub 复制都在这里 |
-| `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及依赖 `dsh-llm-error-retry` 的那一行（同 `id` 保证重复安装只有一份） |
+| `cordis.patch.yml` | 安装用的 bundle patch：插入本插件的 Loader 行，以及 `compat/` 下五个兼容插件的行（`connection-compat`、`connection-admit-compat`、`sidebar-scroller-compat`、`subagent-prune`、`ofm-revive-compat`）。不插 `llm-error-retry`：本机部署把它放在 `$DSH_HOME/plugins/llm-error-retry-ui/` 并由 home 层持行，两层各插一行同 `id` 会产生两个实例 |
+| `compat/` | 六个独立子包（各有 `package.json` 与包名）：四个兼容层、子智能体分栏、provider 前缀门面。包名不能并进本包——浏览器半边按包名归并，同名多个 active Loader 源会让宿主启动失败 |
 | `locale/en.json`、`locale/zh.json` | 界面文案。`meta.detail` 指向插件市场详情页要渲染的文档（`docs/market.zh.md` / `docs/market.en.md`），图片按文档所在目录解析 |
 | `docs/` | 七个页签的界面截图（`preview-*.png`，本 README「界面」一节与市场详情文档都引用）与两份市场详情文档 |
 | `screenshots.json` | 插件市场详情页的截图清单：1 到 8 张仓库内相对路径，第一条是「模型」页签大图 |
@@ -762,8 +793,8 @@ curl http://192.168.0.100:47021/v1/responses \
 
 - 依赖 DSH 的 `slots`、`modelDirectories`、`sessions`、`remote`、`remote.session` 服务与 `agent/request-error` 事件；宿主接口变动时需同步跟进。
 - 失败状态到日界线（默认北京时间 8:00）统一过期，没有按失败原因分级退避或熔断；同一使用日内失败得越早、被挡得越久。并发类失败不进这套状态，走的是几十秒的临时冷却。
-- 与其它免费渠道插件的 provider 撞号靠**部署侧**的 `isolate` + 门面条目解决（见「门面部署」，前五个渠道各 2 行、Providers Hub 再多隔离 11 个服务名，合计 22 行），插件本身装好不会自动改 `$DSH_HOME/cordis.patch.yml`：没写那些行时，各插件仍注册撞号的裸 id，后注册的一方被 `DUPLICATE_ADAPTER` 拒掉或被静默吞掉，而本插件只能把两边都见过的 id 归一，不能让它们共存。
-- 换账号能力依赖 `dsh-our-free-model` 是否安装；未安装时只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
+- 与其它免费渠道插件的 provider 撞号靠**部署侧**的 `isolate` + 门面条目解决（见「门面部署」，前五个渠道各 2 行、Providers Hub 再多隔离 11 个服务名，合计 22 行）。门面文件随本插件分发（`compat/model-failover-provider-prefix/llm-prefix-facade.mjs`），但那 22 行必须写进 `$DSH_HOME/cordis.patch.yml`：`isolate` 只能由最后一层施加到别的插件拥有的条目上，插件装好不会自动改它。没写那些行时，各插件仍注册撞号的裸 id，后注册的一方被 `DUPLICATE_ADAPTER` 拒掉或被静默吞掉，而本插件只能把两边都见过的 id 归一，不能让它们共存。
+- 换账号能力默认关闭（`ofmAccountHandoff`），写着也不影响分组换模型。打开后它依赖 `dsh-our-free-model` 是否安装；未安装时仍只有分组换模型这一条路径。「这个 provider 是否归它管」靠 `ofmHandoffExcludeProviders` 显式声明，不自动推断。
 - qoder 压缩 shim 依赖 `dsh-our-free-model` 的 `pack.js` 里那一行注入口。该包升级会整份替换 `pack.js`，钩子随之消失；插件会自动补回并写进 `/status.qoderShim.hookRepair`，但补回要等下一次宿主启动才生效。若上游某次改动了类定义的形状导致无法唯一定位，插件只报告、不改文件，此时 qoder 会退回「无压缩直发」（`targets` 里没有 `pack:` 条目即为这种情况）。
 - 判断 qoder 到底有没有压缩，只认 `/status.qoderShim.effective` 与 `folded`，不要看 `installed`：`installed` 在「补丁挂在没人用的那份加密器上」时同样为 `true`，2026-10-26 就是这样静默失效过一整天。
 - 「免费渠道」页签只负责安装，不负责登录与账号配置：六个推荐插件各自的登录、换号、积分都在它们自己的界面里。推荐表固定六条，也只在这六个包缺失时显示「安装」按钮；已安装的渠道不提供卸载入口（用插件管理或 `dsh plugin remove`）。
@@ -786,7 +817,7 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
 - The six free-channel plugins all register providers whose ids collide — `qoder`, `qodercn`, `trae`, `cline`, `loomy`, `raccoon`, `minimax`, `zcode`, `gemini`, `codearts`, `workbuddy` — and the host keeps one adapter per provider, so whichever side registers last is either rejected with `DUPLICATE_ADAPTER` or swallowed silently. Each plugin therefore gets its own id prefix, applied on the **real registry** side by an llm facade inside a cordis `isolate` realm: `ofm-` (Our Free Model), `ca-` (`dsh-codearts`), `cw-` (WorkBuddy), `ct-` (Trae), `cq-` (Qoder), `caa-` (Providers Hub). The plugins themselves are untouched: the facade shows bare ids to its consumer and prefixed ids to the real registry, so the dialog lists `ofm-qoder` while group files, the config and the failed-model table keep saying `qoder`. Both the id and the display name are prefixed (`ca-CodeArts`): the model picker titles groups by `group.provider.name` and the settings page titles rows by `entry.displayName`, so prefixing ids alone leaves two identical "CodeArts" headings side by side. Prefixing is idempotent, and the handle returned by `registerConfigurableProviders` also translates `replace()`, because channel plugins re-send the whole directory on settings changes (`dsh-connect-workbuddy`'s `syncRegionRegistration`) and would otherwise overwrite the prefixed entries with bare ids. A plugin without the facade still registers bare ids, and both views may coexist. Deployment is a facade row plus an `isolate` row per channel in `$DSH_HOME/cordis.patch.yml` (22 rows: Providers Hub also needs the 11 cordis service names below in its isolate); each pair must use the same label, and the facade entry must live in a package directory with **no `dsh.client` declaration** — `client-modules` merges bundles by package name, so a second client bundle under the same name makes the host fail to boot (that is what broke DSH last time). Providers Hub also collides on **cordis service names**, not just provider ids: it and Our Free Model both register `lobsteraiAuth`, `qoderAuth`, `qodercnAuth`, `traeAuth`, `clineAuth`, `loomyAuth`, `raccoonAuth`, `minimaxAuth`, `zcodeAuth`, `geminiAuth` and `accountPool` through `super(ctx, `${product.id}Auth`)`, and cordis throws on a duplicate service name — aborting the later plugin's whole `apply`, so none of its channel adapters register and it vanishes from the model tabs. Its `isolate` therefore lists those 11 names next to `llm` under the same label; recheck them after either side upgrades. All conversion is centralised in `provider-prefix.mjs`: `bareProvider()` for accounting keys, `providerEquals()` for channel identity (a bare id equals its own prefixed form, two different plugins never equal), and `liveProviderIdOf()` to hand the registry the id it actually knows, trying `ofm- → ca- → cw- → ct- → cq- → caa-` in card order.
 
 - **Compression is transparent to prefixes.** Every compression-path predicate normalises to the bare name first: `compressionGapOf` (the `compactionGuard` bypass list), `qoderShimCovers` / `traeShimCovers` (plus a `status.targets` check per route, so a partially adopted trae family is not reported as fully covered), and both shims' adapter claims, which bucket by bare name and keep **every** live route with that name (`ofm-qoder` and `caa-qoder` each carry their own encryptor copy). `isCodeartsFailure` uses `providerIdentity()` and accepts only a bare `codearts` with prefix `''` or `ca-`, deliberately excluding `caa-` (Providers Hub's route). `uncompressedProviders` is therefore written in bare ids. The one place that must **not** be prefixed is the account `provider` field in `$DSH_HOME/jet-hub/state.json`: billion-context enumerates resign credentials with a literal `provider === "codearts"`, so a prefixed value blinds the resign arm and compression degrades to a refusal (400/403). That file is Jet Hub's account store, not the DSH llm registry.
-- Routing groups hold an ordered model list; each model may declare active time windows (multiple segments, inclusive ends, midnight-crossing) and an expiry date.
+- Routing groups hold an ordered model list. Each model may declare daily time windows (multiple segments, inclusive ends, midnight-crossing, unset = all day) and the weekdays those windows apply to (`weekdays`, 0=Sunday…6=Saturday). The weekdays scope the windows rather than forming a second gate: a listed day is limited by the windows, an unlisted day is not restricted at all and remains routable all day, and an empty list makes the windows apply every day. With no windows configured the model is always routable. Both are interpreted in Beijing time.
 - Two binding modes per session: `route` (use the group's models) and `failover` (keep the current model, switch only after it fails completely). Bindings persist across restarts.
 - On `agent/request-error` — prepended, and only after every inner retry policy has declined — it marks the model failed for the current day and continues the same turn on the next routable model. It also watches `agent/error` for failures that never reach a stream, and either entry recognises the turn the other one already handled, so one failure never skips two models. It therefore does not rely on being the outermost listener: an inner retry plugin that short-circuits the waterfall cannot keep the failure from being routed.
 - The switch takes effect from the next step, and the interrupted work continues on its own: the
@@ -794,11 +825,20 @@ A DSH plugin that replaces the composer's model seat with a grouped model picker
   arrives, a 30-second failsafe delivers it, and a delivery that throws keeps the message queued
   for the next window instead of dropping it — a switched model with a silent session is the one
   outcome a user cannot fix by hand.
-- For models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
+- **An interrupted turn fails over only when you did not stop it.** A cancelled run carries a
+  cause (`user`, `parent`, `disposed`, or `hook`), and auto-switching on a stop you pressed would
+  override your own decision, so `user` / `parent` / `disposed` end the turn where it is. Every
+  other cause — another plugin cancelling from its own hook, the host cancelling after an account
+  was logged out — counts as an outside interruption and switches models like a failure does. When
+  the cause cannot be read the turn is treated as a user stop: giving up one failover is cheaper
+  than fighting the stop button. Interruptions take the same short cooldown as degenerate turns
+  and never record a day-long failure.
+- **Account handoff is off by default** (`ofmAccountHandoff`; toggle it under Settings → Model failover). It is a cross-plugin compatibility path: the channel plugins already rotate accounts at runtime (WorkBuddy answers "credits exhausted, switched to another account in the pool" without this plugin being involved at all), and running both paths cancels them out — the pool-level cooldown this plugin writes blocks accounts the channel plugin could still use. With it off, a failure always goes to group routing, one predictable disposition. When it is on, for models served by `dsh-our-free-model` it first tries another account, by writing a pool-level cooldown marker through that plugin's `accountPool` service; it never reads or modifies those credentials. Providers listed in `ofmHandoffExcludeProviders` (default `codearts`, served by `dsh-codearts` with its own account pool) skip that step and go straight to group routing, because the pool keeps accounts for retired channels.
+- Credit-aware handoff (`ofmCreditSkip`, on by default, and meaningful only while account handoff is on): when the upstream reports exhausted credit or balance (`QUOTA_EXCEEDED`, HTTP 402, or matching text), it reads that channel's account credits and skips every account whose balance is zero until the daily fail-reset border. The pool service exposes no credits, so this uses channel-pack's `POST /api/channel-pack` `credits.balances` RPC with a self-signed browser-session cookie — the same authentication the Jet Hub path uses. That call queries accounts upstream one by one, so it runs only on a quota failure, is cached for `ofmCreditCacheMs` (60s) and times out at `ofmCreditProbeTimeoutMs` (8s). An account whose balance query failed is *unknown*, never zero: reading nothing falls back to the plain failure cooldown instead of blocking a channel for a whole day. Only zero-balance **usable** accounts are skipped, because that RPC returns every account of the channel including disabled ones; counting a disabled account's zero would otherwise look like "the whole pool is broke" and drop a handoff that could have worked. When every usable account is at zero it writes no markers at all and goes straight to group routing, because skipping the whole pool only makes the channel look broken. Quota evidence also outranks the rate-limit classification, since upstreams routinely wrap "insufficient credits" in a 429; text that says `rate limit` or `too many requests` still counts as throttling.
 - Failed models are recorded per day together with the error code and latest message, and can be inspected and cleared from the dialog.
 - The *LAN* tab publishes routing groups over an OpenAI-compatible API (`GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`) on `0.0.0.0` (default port 47021) for other programs on the same network. The `model` field is the route name: a per-group alias, the group name when no alias is set, or the group id. A total switch plus a per-group switch decide what is exposed — a closed group disappears from `/v1/models` and answers 404, and both switches start out off. Gateway calls run through the host's own `llm.stream`, so they share the concurrency gate, the speed samples and the daily failed-model table with dialog sessions; seats already busy show up in the dashboard as in-flight. On failure the gateway silently moves to the next candidate in the group, so the client only ever sees one complete answer; once output has been committed it does not restart (a restart would duplicate content) and instead ends the SSE stream with an `error` event, a group with no selectable candidate answers 503 `no_candidate`, and a group whose candidates were all tried answers 502 `upstream_error` carrying the last candidate's failure code (for example `QUOTA_EXCEEDED`). The same groups are also served as `POST /v1/responses`, so clients that only speak the Responses dialect work through the same candidate loop with the same silent failover; that dialect ends on `response.completed` (never `data: [DONE]`), sends a `response.failed` event if the upstream dies after output started, rejects `previous_response_id` with 400 because nothing is stored, and answers `GET /v1/responses/:id` with 404. In the chat dialect, streams end the way OpenAI clients expect: both the success and the error path close with `data: [DONE]`, streaming `tool_calls` use `index` 0..n-1 with the id and function name sent once on the first fragment, and the model's reasoning arrives as `delta.reasoning_content`.  A client's `system`/`developer` text is sent as the first **system message** — except on `qoder` / `qodercn`, where it is sent as the first **user message**: those adapters only forward `options.system` into a top-level `systemText` payload field that their upstream ignores (an instruction stated there measured 0/4 compliance while the same text in a conversation turn measured 4/4). The form is chosen per candidate, so a request that tries a qoder route and then fails over to another channel gets each one the form it reads; the list is config's `lanSystemAsUserProviders`, default `["qoder", "qodercn"]` in bare ids. No authentication: the listener is meant for a trusted LAN and must not be port-forwarded to the internet.
 - Qoder models encrypt their bodies with a WASM codec, so billion-context cannot compress them. When `qoderShim` is on, `prepareInfer` is intercepted: the request leaves as plaintext OpenAI JSON (a path bili compresses), comes back to a loopback shim with the compacted `messages`, and is re-encrypted there with the original codec before going upstream. Responses are unwrapped on the way back: qoder's `data:{"headers":…,"body":"…"}` envelope frames become bare OpenAI frames with the `\n\n` framing bili needs, timing-only heartbeats are dropped, envelope errors are flattened to `{code,message,type:'model_error'}`, and non-event-stream replies pass through untouched. Leaving the envelope intact is what made bili report "stream truncated" and discard its reply record. The encryptor that actually runs is the one inlined into `dsh-our-free-model`'s `pack.js`, not the standalone package, so the shim patches that copy through a hook line it repairs automatically when an upgrade drops it. The shim itself hot-swaps on plugin reload (port and prototype patch live in a process-level slot), and request ids stay valid for retries so a 409 resend still works.
-- Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff exclusion list through `ofmHandoffExcludeProviders`.
+- Every date and hour is computed in Beijing time (`Asia/Shanghai`), independent of the host's timezone, `TZ` and `LANG`. The fail-over day boundary defaults to 08:00 and is configurable through `failResetHour`; the account-handoff switch through `ofmAccountHandoff` (or `settings.json`), its exclusion list through `ofmHandoffExcludeProviders`, and credit-aware handoff through `ofmCreditSkip` / `ofmCreditProbeTimeoutMs` / `ofmCreditCacheMs`.
 - Each model may cap its concurrency, and the cap applies to **every** routing group: one model reached through several groups talks to the same upstream accounts, so the limit is keyed by model (`model-concurrency.json`), not stored on the group entry. An empty cap follows `defaultConcurrency`; `0` means unlimited. `defaultConcurrency` in `cordis.patch.yml` is the factory value: the effective one is editable from the dashboard header and stored in `settings.json` (`null` means not overridden), so one edit applies to every model without its own cap and survives a restart. A gate on `llm/stream` takes a slot when a stream opens and releases it when the stream ends, errors, or is cancelled. Taking a slot is also the **count**: an uncapped model (`0`) is never judged full, but it is counted as in flight from the moment it enters — so the dashboard reports a real number for it too, written as `N (unlimited)` rather than `N/cap`. The cap and the count are two separate facts; unlimited means unlimited, not uncounted. A request that cannot get a slot does not queue: the gate skips the adapter entirely and fails it as `CAPACITY_TIMEOUT`, and routing switches the session to a free model in the group (candidate picking already skips full models). Only a group that is full end to end makes anything wait — for that model's slot, up to `concurrencyQueueTimeoutMs` (`0` waits forever); when a slot frees the session switches, and on timeout routing gives up for the turn (`all-capacity`).
 - Capacity failures never mark a model failed for the day — being busy says nothing about the model's health. They take a short cooldown (`capacityCooldownMs`, 30s by default) instead, during which candidate picking skips the model; it returns automatically. Sessions moved away are remembered and switched back once the original model is idle and `capacitySwitchRevertMs` has elapsed, so two models cannot bounce a session back and forth.
 - The dashboard shows first-token latency, output speed, token usage, live concurrency, and state

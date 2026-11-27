@@ -1,0 +1,3 @@
+- insert:
+    - id: connection-compat
+      name: dsh-connection-compat

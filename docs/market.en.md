@@ -15,7 +15,7 @@ Seven tabs, ordered the way you actually triage:
 | Tab | What it does |
 | --- | --- |
 | **Models** | Providers on the left, models on the right; add one to a group with ＋, and click that same entry again to drop it. The top bar picks the routing group, the binding mode, and the new-session default. |
-| **Routing groups** | Each group is an ordered model list (lower priority number goes first), with active time windows, an expiry date, and per-model failed/disabled switches. Move a model up or down in place, or remove it from the group. |
+| **Routing groups** | Each group is an ordered model list (lower priority number goes first), with daily time windows, the weekdays those windows apply to, and per-model failed/disabled switches. Move a model up or down in place, or remove it from the group. |
 | **Dashboard** | First-token latency, output speed, token usage, live concurrency and success rate per model; one-click speed tests and re-prioritising by the current sort. |
 | **Failed models** | Today's exhausted models with the latest failure reason; restore one or all. |
 | **Error retry** | dsh-llm-error-retry's own configuration page: rules, first-token timeout, Retry-After cap, max continuations. Saving applies immediately. |
@@ -43,7 +43,8 @@ Requires DSH `>=0.2.1-0 <0.3.0` (pre-releases such as rc/alpha included).
 ## What it solves
 
 - **A failure no longer interrupts you.** Inner retry policies run first; once they all decline, the plugin records the model as failed for the day, switches to the next routable model in the group, and continues the same turn on its own — no manual resend.
-- **Accounts and models are handled separately.** Our Free Model channels try another account first and only then switch models; a CodeArts pool poisoned by 401/403 is restarted through its own loader entry.
+- **A turn that ends early also fails over.** Repetitive loops (`REASONING_LOOP`), turns cut off at the token limit (`turn/end` with `max-tokens`), and aborts you did not ask for (`ABORTED`) count as "this turn did not finish" and switch to the next routable model, continuing on it. An abort is judged by its cancel cause: one you pressed, a parent session reaping its subagent, and plugin disposal all end the turn on the current model, while another plugin cancelling from its own hook switches models; an unreadable cause is treated as your stop. All three only put a temporary cooldown on that model (`ofmDegenerateCooldownMs`, ten minutes by default) instead of recording a day-long failure, so one loop does not bench a model for the rest of the day. Switch: `ofmSwitchOnTurnEnd`, on by default.
+- **Accounts are the channel plugins' job.** Account handoff is off by default: the channel plugins already rotate accounts at runtime, and a second path writing pool-level cooldowns cancels that out. With it off, a failure always switches models within the group. A CodeArts pool poisoned by 401/403 is restarted through its own loader entry.
 - **State is visible.** Which model failed today and why, first-token latency, concurrency, success rate — all on the dashboard, no log digging.
 - **Free channels install in one click.** The six channel plugins install from the tab through the same engine the plugin market uses; each one adds a batch of free models that join your routing groups and fail over like any other.
 

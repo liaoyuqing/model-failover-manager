@@ -1,109 +1,39 @@
 # model-failover-manager bundle patch.
 #
-# `name` must resolve to this package's own name, since the Loader imports the
-# row by that specifier after `dsh plugin add` installs the package.
+# 一行一个 Loader 条目。相对路径由 Profile 组装器锚定在本文件所在目录，
+# 因此整包（含 compat/ 下的兼容插件）可以整体搬动或整体安装，运行时不需要
+# 任何额外的 node_modules 解析。
 #
-# Optional row config (all keys omitted here on purpose — the plugin's defaults
-# work with no configuration):
-#   dataDir: where groups/bindings/failure state is stored
-#            (default: $DSH_HOME/model-failover-manager)
-#   ofmHandoffExcludeProviders: providers whose failures must skip the
-#            dsh-our-free-model account handoff and go straight to group
-#            routing (default: [codearts], which dsh-codearts serves with its
-#            own account pool)
-#   compactionGuard: enable the billion-context compression guard (default:
-#            true). When billion-context is the only compressor, providers the
-#            proxy cannot see are ranked last so sessions keep their compaction.
-#   uncompressedProviders: providers whose model endpoint is not on
-#            billion-context's endpoint whitelist, so their traffic is sent
-#            uncompressed (default: [qoder, qodercn], which post to a
-#            WASM-encrypted path bili cannot parse)
-#   qoderShim: route qoder/qodercn through the loopback compression shim
-#            (default: false). The request leaves as plaintext OpenAI JSON so
-#            billion-context compacts it, then the shim re-encrypts it with the
-#            original WASM codec before the upstream call. Needs a hook line in
-#            dsh-our-free-model's pack.js, which the plugin repairs if an
-#            upgrade drops it.
-#   qoderShimPort: loopback port for that shim (default: 47001, 127.0.0.1 only)
-#   qoderShimWasmPath: explicit path to qoder-wasm.js when auto-detection under
-#            $DSH_HOME/profiles/<name>/node_modules fails
-#   defaultConcurrency: factory value of the concurrency cap used by models
-#            that do not set one in model-concurrency.json (default: 0,
-#            unlimited). The effective value can be changed from the dashboard
-#            header and is stored in settings.json; clearing the override falls
-#            back here. The cap is keyed by model rather than stored on a group
-#            entry, because one model reached through several groups shares the
-#            same upstream accounts.
-#   concurrencyQueueTimeoutMs: how long routing waits for a slot when the whole
-#            group is full and there is nowhere to switch. The gate itself never
-#            queues: a request that cannot get a slot fails as CAPACITY_TIMEOUT
-#            right away and routing moves the session to a free model in the
-#            group. (default: 180000; 0 waits forever)
-#   capacityCooldownMs: how long a model that hit a capacity failure is skipped
-#            while the router picks candidates (default: 30000). Capacity
-#            failures deliberately do not mark a model failed for the day.
-#   capacitySwitchRevertMs: minimum time a session stays on the substitute model
-#            before it may switch back to the original one (default: 30000), so
-#            two busy models cannot bounce a session back and forth.
-#   lanGateway: factory state of the LAN forwarding switch (default: false);
-#            the live value is settings.json's lanEnabled, null meaning "follow
-#            this". Listening on 0.0.0.0 is what exposes the machine, so it is
-#            off until the user turns it on.
-#   lanGatewayPort: LAN forwarding port (default: 47021; the UI override lives
-#            in settings.json as lanPort). Same block as the qoder shim (47001)
-#            and the trae shim (47011).
-#   lanSystemAsUserProviders: providers whose system prompt is sent as the
-#            first user message rather than the first system message when the
-#            LAN gateway forwards a request (default: [qoder, qodercn]). Their
-#            adapters only forward options.system into a top-level systemText
-#            payload field that the upstream ignores, so an instruction stated
-#            there is dropped; the same text in a conversation turn is obeyed.
-#            Bare ids: candidates are matched after stripping the plugin prefix.
-
-# Installing this bundle also installs dsh-llm-error-retry (declared under
-# "dependencies") and mounts its row here, so one install gives both plugins.
-# The row reuses the id dsh-llm-error-retry's own bundle patch uses: loader
-# entries are kept by id, so a profile that also selected that bundle composes
-# two rows with this id and the loader mounts one entry from the later row —
-# never two retry instances that would each retry the same request.
-
-# Optional, and deliberately NOT enabled here: the six free-channel plugins all
-# register providers whose ids collide (qoder, qodercn, trae, cline, loomy,
-# raccoon, minimax, zcode, gemini, codearts, workbuddy, ...) and the host keeps
-# one adapter per provider, so whichever side registers last is either rejected
-# with DUPLICATE_ADAPTER or silently swallowed.
+# compat/ 下每个子目录都是一个独立包（各自有 package.json 与包名），不能合并进
+# 本包：client-modules 按包名归并浏览器半边，同名的多个 active Loader 源会直接
+# 抛 "resolves from multiple active Loader sources" 让宿主启动失败；而
+# dsh-sidebar-scroller-compat / dsh-subagent-prune 自带 ./client，门面所在的
+# model-failover-provider-prefix 则必须**没有** dsh.client 声明。
 #
-# The fix is a per-plugin provider prefix — ofm- (dsh-our-free-model), ca-
-# (dsh-codearts), cw- (dsh-connect-workbuddy), ct- (dsh-connect-trae), cq-
-# (@dmh2002/dsh-connect-qoder), caa- (dsh-providers-hub) — applied on the real
-# registry side by an llm facade inside a cordis isolate realm. It must be
-# deployed in $DSH_HOME's own cordis.patch.yml (the home layer applies last, so
-# it can isolate an entry this bundle does not own): one facade row plus one
-# isolate row per channel (22 rows in all — codearts-auth needs a wider isolate,
-# see below). See "门面部署" in README.md.
+# 本包的 package.json 用 dependencies 的 file:./compat/<包名> 声明这些子包，
+# 所以它们随本包一起安装、一起升级。
 #
-# The prefix alone does not make dsh-providers-hub coexist with dsh-our-free-model:
-# both also register the SAME cordis services (lobsteraiAuth, qoderAuth,
-# qodercnAuth, traeAuth, clineAuth, loomyAuth, raccoonAuth, minimaxAuth,
-# zcodeAuth, geminiAuth, accountPool) via super(ctx, `${product.id}Auth`), and
-# cordis provide throws on a duplicate service name, aborting the later plugin's
-# whole apply — its channel adapters never register and it vanishes from the
-# model tabs. codearts-auth's isolate therefore also lists those 11 names under
-# the same label. Recheck them after either side upgrades.
+# 刻意**不**在这里插入 llm-error-retry 行：本机部署把该插件放在
+# $DSH_HOME/plugins/llm-error-retry-ui/ 并由 $DSH_HOME/cordis.patch.yml 的
+# id: llm-error-retry 持有。Loader 条目按 id 存放，两层各插一行同 id 会产生两个
+# 实例、各自重试同一条请求。只装本包而不装 llm-error-retry 时，错误重试功能缺席
+# 但不会报错。
 #
-# Two rows must always share a label, and a facade entry must live in a package
-# directory with NO dsh.client declaration: client-modules merges bundles by
-# package name, so a second client bundle under the same name makes the host
-# fail to boot (that is what broke DSH last time). Adding the rows here would
-# point the facade at every profile — including ones without those channels —
-# and would collide with a home patch that already inserts the same entry ids.
-#
-# This plugin needs none of that to work: it converts between bare ids and
-# prefixed registry ids itself (provider-prefix.mjs), so a plugin without the
-# facade keeps registering bare ids and both views may coexist.
+# provider 前缀门面不在这里插入：它必须与「给某个渠道条目加 isolate」的那一行成对
+# 出现，而 isolate 只能由最后一层（$DSH_HOME/cordis.patch.yml）施加到别的插件
+# 拥有的条目上，因此四对门面/isolate 行留在 $DSH_HOME 层，name 指向
+# ./plugins/model-failover-manager/compat/model-failover-provider-prefix/llm-prefix-facade.mjs。
 
 - insert:
     - id: model-failover-manager
-      name: 'model-failover-manager'
-    - id: llm-error-retry
-      name: 'dsh-llm-error-retry'
+      name: ./host.mjs
+    - id: connection-compat
+      name: ./compat/dsh-connection-compat/host.v3.mjs
+    - id: connection-admit-compat
+      name: ./compat/dsh-connection-admit-compat/host.mjs
+    - id: sidebar-scroller-compat
+      name: ./compat/dsh-sidebar-scroller-compat/host.mjs
+    - id: subagent-prune
+      name: ./compat/dsh-subagent-prune/host.mjs
+    - id: ofm-revive-compat
+      name: ./compat/dsh-ofm-revive-compat/host.mjs

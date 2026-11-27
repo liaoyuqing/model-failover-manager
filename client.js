@@ -720,6 +720,37 @@ window.__ModuleLoader__.load({
       }).format(new Date(Date.now() - n * 86_400_000))
     }
 
+    /** 星期标签：0=周日 … 6=周六，与 Host 的 beijingWeekday 同口径 */
+    var WEEKDAY_LABELS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
+    /**
+     * 把条目的两道时间闸门写成一句话摘要（时段 / 星期）。
+     *
+     * 空白摘要表示「全天候参与」——界面据此把摘要整块藏掉，只留 ⏱ 按钮。
+     *
+     * @param {object} entry - 分组里的模型条目。
+     * @returns {string} 摘要文本；两项都没配时为空串。
+     */
+    function timeGateSummary(entry) {
+      if (!entry) return ''
+      var wins = Array.isArray(entry.windows) ? entry.windows : []
+      if (wins.length === 0 && entry.from !== undefined && entry.from !== null
+        && entry.to !== undefined && entry.to !== null) wins = [{ from: entry.from, to: entry.to }]
+      var out = []
+      if (wins.length > 0) {
+        out.push(wins.map(function (w) {
+          return w.from + '–' + w.to + (Number(w.from) > Number(w.to) ? '(跨)' : '')
+        }).join('、'))
+      }
+      var days = Array.isArray(entry.weekdays) ? entry.weekdays : []
+      // 星期是时段的作用域：只有「有配时段」且「不是每天」时才值得写出来。
+      // 七天全勾等价于不勾（时段每天生效），摘要里不占一行废话。
+      if (wins.length > 0 && days.length > 0 && days.length < 7) {
+        out.push(days.slice().sort(function (a, b) { return a - b }).map(function (d) { return WEEKDAY_LABELS[d] || ('周' + d) }).join('、') + '限时')
+      }
+      return out.join(' · ')
+    }
+
     /**
      * 可选模型池：优先用完整模型目录（与内置选择器同源），
      * 目录不可用时回落到 status.allModels；失败标记取自 status.failed。
@@ -1490,7 +1521,7 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 把一个模型移出本分组：只删这一条，组里其它条目的顺序、时段、截止日都不动。
+       * 把一个模型移出本分组：只删这一条，组里其它条目的顺序、时段与星期都不动。
        * 与「禁用」的区别：禁用留着条目、只是不参与路由；移除后要加回来得去「模型」页签。
        * 同一模型在别的分组里还有条目时只会少掉这一处。
        */
@@ -3139,14 +3170,10 @@ window.__ModuleLoader__.load({
         var info = infoOf[keyOf(entry.provider, entry.model)]
         var efforts = info && info.efforts
         var rowKey = keyOf(entry.provider, entry.model)
-        var wins = Array.isArray(entry.windows) ? entry.windows : []
-        // 兼容尚未迁移的旧数据（单 from/to）
-        if (wins.length === 0 && entry.from !== undefined && entry.from !== null
-          && entry.to !== undefined && entry.to !== null) wins = [{ from: entry.from, to: entry.to }]
-        var configured = wins.length > 0 || !!entry.until
-        var summary = wins.map(function (w) {
-          return w.from + '–' + w.to + (Number(w.from) > Number(w.to) ? '(跨)' : '')
-        }).join('、') + (entry.until ? ' 止' + String(entry.until).slice(5) : '')
+        // 摘要把两段时间闸门一起写出来：时段、可用的星期几。
+        // 两项都没配时为空串，下面据此把摘要整块藏掉。
+        var summary = timeGateSummary(entry)
+        var configured = summary !== ''
         return e('div', { key: rowKey },
           e('div', { style: S.row },
             e('input', {
@@ -3174,12 +3201,12 @@ window.__ModuleLoader__.load({
                 })
               )),
             configured && e('span', {
-              style: { fontSize: '10px', opacity: .75, whiteSpace: 'nowrap', maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis' },
-              title: '已配置：' + (wins.length ? summary.replace(/、/g, '、') + ' 时' : '全天') + (entry.until ? '，截止 ' + entry.until : ''),
-            }, summary || '全天'),
+              style: { fontSize: '10px', opacity: .75, whiteSpace: 'nowrap', maxWidth: '190px', overflow: 'hidden', textOverflow: 'ellipsis' },
+              title: '已配置（北京时间）：' + summary,
+            }, summary),
             e('button', {
               style: Object.assign({}, S.btn, { padding: '1px 6px', fontSize: '11px' }),
-              title: '设置该模型参与路由的时段与截止日期',
+              title: '设置该模型参与路由的时段与星期',
               onClick: function () { setScheduleFor({ index: index, key: rowKey }) },
             }, '⏱'),
             e('button', {
@@ -3190,7 +3217,17 @@ window.__ModuleLoader__.load({
             }, '移除')))
       }
 
-      /** 时段/截止弹框：一个模型可配多段，每段两端包含，from>to 表示跨午夜 */
+      /**
+       * 时间闸门弹框：一个模型可配两件事。
+       *
+       *  1. 每日时段（windows）：多段，两端包含，from>to 表示跨午夜。
+       *  2. 这些时段在哪些星期生效（weekdays）：0=周日 … 6=周六。
+       *
+       * 星期是时段的**作用域**，不是另一个筛选：列出来的那天按时段判定，
+       * 没列出来的日期不受时段限制、全天可用；一个都不勾 = 时段每天都生效。
+       * 所以「不勾」永远不等于「不可用」。弹框只管写值，判定全在宿主
+       * （routable），这里不做任何时间比较，避免两处口径漂移。
+       */
       function scheduleDialog() {
         if (!scheduleFor) return null
         var index = scheduleFor.index
@@ -3201,17 +3238,24 @@ window.__ModuleLoader__.load({
         if (rawWins.length === 0 && live.from !== undefined && live.from !== null
           && live.to !== undefined && live.to !== null) rawWins = [{ from: live.from, to: live.to }]
         var wins = rawWins.filter(function (w) { return w && w.from !== undefined && w.to !== undefined })
-        var until = typeof live.until === 'string' ? live.until : ''
+        var days = Array.isArray(live.weekdays) ? live.weekdays.slice() : []
         var hourOptions = []
         for (var h = 0; h < 24; h++) hourOptions.push(e('option', { key: h, value: String(h) }, String(h) + ' 时'))
         var winStyle = Object.assign({}, S.select, { flex: '0 0 auto', width: '76px' })
 
-        function commit(nextWins, nextUntil) {
+        /**
+         * 把两组值一起写回条目。undefined 表示「这一项不配」，宿主不会存它；
+         * 旧字段 from/to/until 一律清掉——单时段写法已折算进 windows。
+         */
+        function commit(next) {
+          var nextWins = next.windows !== undefined ? next.windows : wins
+          var nextDays = next.weekdays !== undefined ? next.weekdays : days
           patchModelAt(index, {
             windows: (nextWins && nextWins.length) ? nextWins : undefined,
+            weekdays: (nextDays && nextDays.length) ? nextDays.slice().sort(function (a, b) { return a - b }) : undefined,
             from: undefined,
             to: undefined,
-            until: (typeof nextUntil === 'string' && nextUntil !== '') ? nextUntil : undefined,
+            until: undefined,
           })
         }
         function row(w, i) {
@@ -3220,44 +3264,84 @@ window.__ModuleLoader__.load({
             e('span', { style: { fontSize: '11px', opacity: .55, width: '18px' } }, String(i + 1)),
             e('select', {
               style: winStyle, value: String(w.from),
-              onChange: function (ev) { var n = wins.slice(); n[i] = { from: Number(ev.target.value), to: w.to }; commit(n, until) },
+              onChange: function (ev) { var n = wins.slice(); n[i] = { from: Number(ev.target.value), to: w.to }; commit({ windows: n }) },
             }, hourOptions),
             e('span', { style: { opacity: .5 } }, '—'),
             e('select', {
               style: winStyle, value: String(w.to),
-              onChange: function (ev) { var n = wins.slice(); n[i] = { from: w.from, to: Number(ev.target.value) }; commit(n, until) },
+              onChange: function (ev) { var n = wins.slice(); n[i] = { from: w.from, to: Number(ev.target.value) }; commit({ windows: n }) },
             }, hourOptions),
             cross && e('span', { style: { fontSize: '10px', opacity: .6 } }, '跨午夜'),
             e('button', {
               style: S.btnDanger,
-              onClick: function () { var n = wins.slice(); n.splice(i, 1); commit(n, until) },
+              onClick: function () { var n = wins.slice(); n.splice(i, 1); commit({ windows: n }) },
             }, '删除'))
         }
+        /** 星期开关：点一下加入/移出。勾上 = 「这一天按时段限时」，没勾 = 全天可用 */
+        function dayToggle(d) {
+          var on = days.indexOf(d) !== -1
+          return e('button', {
+            key: d,
+            style: Object.assign({}, S.btn, {
+              padding: '2px 7px', fontSize: '11px',
+              opacity: on ? 1 : .55,
+              fontWeight: on ? 600 : 400,
+              borderColor: on ? 'var(--dsw-alias-brand-primary)' : undefined,
+            }),
+            'aria-pressed': on,
+            title: on
+              ? '点一下：' + WEEKDAY_LABELS[d] + '恢复全天可用（不再受时段限制）'
+              : '点一下：' + WEEKDAY_LABELS[d] + '也按上面的时段限时',
+            onClick: function () {
+              var n = days.slice()
+              var at = n.indexOf(d)
+              if (at === -1) n.push(d); else n.splice(at, 1)
+              commit({ weekdays: n })
+            },
+          }, WEEKDAY_LABELS[d])
+        }
+        var sectionHead = { fontSize: '11px', opacity: .7, marginTop: '10px', paddingTop: '8px', borderTop: '0.5px solid var(--dsw-alias-border-l2)' }
 
         return createPortal(
           e('div', { style: Object.assign({}, S.modalBg, { zIndex: 2001 }), onClick: function (ev) { if (ev.target === ev.currentTarget) setScheduleFor(null) } },
-            e('div', { style: Object.assign({}, S.modal, { maxWidth: '420px', zIndex: 2001 }) },
-            e('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '6px' } }, '参与路由的时段'),
+            e('div', { style: Object.assign({}, S.modal, { maxWidth: '460px', zIndex: 2001 }) },
+            e('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '6px' } }, '参与路由的时间闸门'),
             e('div', { style: { fontSize: '11px', opacity: .65, marginBottom: '8px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } },
               ((infoOf[keyOf(live.provider, live.model)] || {}).name || (live.provider + '/' + live.model)) + ''),
             e('div', { style: { fontSize: '11px', opacity: .6, marginBottom: '6px' } },
-              '可添加多段，命中任意一段即参与路由。时刻为整点、两端包含；开始大于结束表示跨午夜（如 22–6）。不添加任何时段 = 全天参与。'),
+              '每日时段默认每天生效；勾上某些星期，就只在那几天限制时段，其余日期全天可用。两项都不配 = 全天候参与。全部按北京时间。'),
+
+            e('div', { style: { fontSize: '11px', opacity: .7, fontWeight: 600 } }, '每日时段'),
+            e('div', { style: { fontSize: '10px', opacity: .55, margin: '2px 0 4px' } },
+              '可添加多段，命中任意一段即可。整点、两端包含；开始大于结束表示跨午夜（如 22–6）。不添加 = 全天。'),
             wins.map(row),
-            wins.length === 0 && e('div', { style: S.hint }, '未设置时段，当前为全天参与。'),
+            wins.length === 0 && e('div', { style: S.hint }, '未设置时段，全天参与。'),
             e('button', {
               style: Object.assign({}, S.btn, { marginTop: '4px' }),
-              onClick: function () { commit(wins.concat([{ from: 9, to: 18 }]), until) },
+              onClick: function () { commit({ windows: wins.concat([{ from: 9, to: 18 }]) }) },
             }, '＋ 添加时段'),
-            e('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', marginTop: '10px', paddingTop: '8px', borderTop: '0.5px solid var(--dsw-alias-border-l2)' } },
-              e('span', { style: { fontSize: '11px', opacity: .7 } }, '截止日期'),
-              e('input', {
-                type: 'date', style: Object.assign({}, S.input, { flex: 1, padding: '2px 6px', fontSize: '11px' }),
-                title: '设置后，当前日期超过它该模型不再参与路由；留空 = 不过期',
-                value: until,
-                onChange: function (ev) { commit(wins, ev.target.value) },
-              })),
-            e('div', { style: { fontSize: '10px', opacity: .5, marginTop: '4px' } }, '当天仍参与，次日（本地日期）起失效。'),
+
+            e('div', { style: sectionHead }, '时段在哪些星期生效'),
+            e('div', { style: { fontSize: '10px', opacity: .55, margin: '2px 0 4px' } },
+              '勾上的日期按上面的时段限时；没勾的日期不受时段限制、全天可用。一个都不勾 = 时段每天都生效。'),
+            e('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } },
+              [1, 2, 3, 4, 5, 6, 0].map(dayToggle),
+              e('button', {
+                style: Object.assign({}, S.btn, { padding: '2px 7px', fontSize: '11px', marginLeft: 'auto' }),
+                title: '只在周一到周五限时，周末全天可用',
+                onClick: function () { commit({ weekdays: [1, 2, 3, 4, 5] }) },
+              }, '仅工作日限时'),
+              e('button', {
+                style: Object.assign({}, S.btn, { padding: '2px 7px', fontSize: '11px' }),
+                title: '清空勾选：时段对每天都生效',
+                onClick: function () { commit({ weekdays: [] }) },
+              }, '每天生效')),
             e('div', { style: S.foot },
+              e('button', {
+                style: Object.assign({}, S.btn, { marginRight: 'auto', fontSize: '11px' }),
+                title: '清空时段与星期，回到全天候参与',
+                onClick: function () { commit({ windows: [], weekdays: [] }) },
+              }, '全部清除'),
               e('button', { style: S.btn, onClick: function () { setScheduleFor(null) } }, '关闭')))),
           document.body)
       }
@@ -3389,7 +3473,20 @@ window.__ModuleLoader__.load({
       function toggleDialog() {
         apiSend(API + '/settings', 'POST', { dialogMode: !dialogMode }).then(refresh)
       }
+      // 账号换号（跨插件的兼容路径）：默认关闭，见 Host 里 configAccountHandoff 那段说明。
+      // 开关值写 settings.json 的 ofmAccountHandoff，改完立刻生效，不必重启宿主。
+      var accountHandoff = !!(status && status.ofmAccountHandoff)
+      function toggleAccountHandoff() {
+        apiSend(API + '/settings', 'POST', { ofmAccountHandoff: !accountHandoff }).then(refresh)
+      }
 
+      // 会话没跑完就收尾时换模型（输出撞上限 / 思考陷入病态重复 / 会话被中断）：
+      // 这些情况在宿主眼里不是「模型坏了」，原地重试只会再烧一遍同样的思考或再撞同一次上限。
+      // 开关写 settings.json 的 ofmSwitchOnTurnEnd，改完立刻生效，不必重启宿主。
+      var switchOnTurnEnd = !!(status && status.ofmSwitchOnTurnEnd)
+      function toggleSwitchOnTurnEnd() {
+        apiSend(API + '/settings', 'POST', { ofmSwitchOnTurnEnd: !switchOnTurnEnd }).then(refresh)
+      }
       // CodeArts 凭据镜像（原独立插件 dsh-codearts-resign-bridge，已并入本插件）：
       // 开关与间隔写 settings.json，落点/最近结果来自 /status.resignBridge。
       var resign = (status && status.resignBridge) || {}
@@ -3436,6 +3533,39 @@ window.__ModuleLoader__.load({
             e('div', { style: { fontSize: '13px', fontWeight: 600 } }, '模型选择使用弹窗'),
             e('div', { style: { fontSize: '11px', opacity: .6 } }, '开启后会话输入框的模型选择改为左右分区弹窗（左：提供商，右：模型）；关闭时使用紧凑下拉列表。新装默认开启。'))),
 
+        e('div', { style: S.toggleRow },
+          e('button', {
+            style: Object.assign({}, S.toggle, accountHandoff ? S.toggleOn : {}),
+            'aria-pressed': accountHandoff, 'aria-label': '失败时换账号',
+            onClick: toggleAccountHandoff,
+          }, e('span', { style: Object.assign({}, S.toggleKnob, accountHandoff ? S.toggleKnobOn : {}) })),
+          e('div', { style: { flex: 1, minWidth: 0 } },
+            e('div', { style: { fontSize: '13px', fontWeight: 600 } }, '失败时换账号（兼容）'),
+            e('div', { style: { fontSize: '11px', opacity: .6 } },
+              '开启后，本插件会在模型失败时直接调用渠道插件的账号池，换一个账号重试，并按积分过滤掉 0 积分账号。'
+              + '默认关闭：渠道插件自己就会在运行时换号，两条路径同时动手会互相抵消——本插件写下的池级冷却会把渠道插件本来还能用的账号一起挡掉。'
+              + '关闭时失败一律走分组路由换模型，处置单一、可预测。'),
+            e('div', { style: { fontSize: '11px', marginTop: '2px', color: 'var(--dsw-alias-label-tertiary)' } },
+              accountHandoff
+                ? '当前：开。失败先尝试换账号，换不到再换模型。'
+                : '当前：关。失败直接换下一个模型。'))),
+
+        e('div', { style: S.toggleRow },
+          e('button', {
+            style: Object.assign({}, S.toggle, switchOnTurnEnd ? S.toggleOn : {}),
+            'aria-pressed': switchOnTurnEnd, 'aria-label': '会话没跑完就换模型',
+            onClick: toggleSwitchOnTurnEnd,
+          }, e('span', { style: Object.assign({}, S.toggleKnob, switchOnTurnEnd ? S.toggleKnobOn : {}) })),
+          e('div', { style: { flex: 1, minWidth: 0 } },
+            e('div', { style: { fontSize: '13px', fontWeight: 600 } }, '会话没跑完就换模型'),
+            e('div', { style: { fontSize: '11px', opacity: .6 } },
+              '一轮没跑完就收尾时（输出撞上 token 上限、思考陷入病态重复、会话被中断），换组内另一个模型把没说完的话说完，并排队自动续跑。'
+              + '这些情况模型本身没坏，所以只记一段短冷却、不写当日失败，到点自动回到候选。'
+              + '中断按取消原因区分：你按的停止、父会话收子代理、插件卸载都不换模型，别家插件在自己的 hook 里掐断才换。'),
+            e('div', { style: { fontSize: '11px', marginTop: '2px', color: 'var(--dsw-alias-label-tertiary)' } },
+              switchOnTurnEnd
+                ? '当前：开。会话没跑完时自动换模型续跑。'
+                : '当前：关。会话没跑完时保持原模型，等人工继续。'))),
         e('div', { style: S.toggleRow },
           e('button', {
             style: Object.assign({}, S.toggle, resignEnabled ? S.toggleOn : {}),
